@@ -1,0 +1,31 @@
+# Local dev / single-host deploy.
+#
+#   docker compose up --build
+#
+# Opens the dashboard at http://localhost:8000
+# Persists data (SQLite + parquet cache) to ./data on the host.
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: stock-predictor
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      # SQLite + parquet caches survive container restarts.
+      - ./data:/app/data
+      - ./logs:/app/logs
+    environment:
+      # Disable the in-process scheduler if you'd rather trigger refreshes
+      # manually (set to "1") or via a separate cron on the host.
+      STOCKPRED_DISABLE_SCHEDULER: "0"
+      STOCKPRED_CORS: "*"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s

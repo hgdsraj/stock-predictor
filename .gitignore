@@ -38,3 +38,9 @@ models/*.lgb
 # Logs
 *.log
 logs/
+
+# Frontend
+web/node_modules/
+web/dist/
+web/.vite/
+web/*.tsbuildinfo

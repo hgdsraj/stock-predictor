@@ -1,196 +1,240 @@
 # Project log — stock-predictor
 
-A detailed log of decisions, what was built, why, and what the first real
-backtest produced. This file lives in-repo so it travels with the code.
+Chronological log of decisions, what was built, and what the real backtest
+produced. Lives in-repo so it travels with the code.
 
 ---
 
-## 1. Original ask
+## Session 1 — Phase 1: foundation
 
+### Ask
 > "build the best stock predictor in history"
 
-This was scoped down to something honest and achievable through a short Q&A:
+Scoped down to: directional cross-sectional forecaster, serious scope,
+fully portable, free data only.
 
-| Decision        | Choice                                         |
-| --------------- | ---------------------------------------------- |
-| Goal            | Directional price forecaster (cross-sectional) |
-| Scope           | Serious system, weeks+                         |
-| Constraints     | Free, local, fully portable                    |
-| Universe        | S&P 500 historical constituents                |
-| Horizons        | 1d / 5d / 21d                                  |
-| History         | 2005–present (default in config)               |
-| Env             | Local Python project (uv-managed)              |
-| Webapp          | Plan a real hosted webapp later (deferred)     |
-| Project log     | `docs/PROJECT_LOG.md` (this file)              |
+### Built
+- `pyproject.toml` with public PyPI pinned (no corp mirrors).
+- `data/` — Wikipedia S&P 500 historical constituents, yfinance prices with
+  parquet caching, FRED macro loader.
+- `features/` — lag-safe technicals (returns, vol, RSI, MACD, BB, etc.) +
+  cross-sectional ranks.
+- `labels.py` — forward log returns + binary direction per horizon.
+- `validation/walk_forward.py` — expanding window with purge + embargo.
+- `validation/metrics.py` — IC / IC IR / Sharpe / Sortino / max DD / Calmar.
+- `models/baseline.py` — impute → scale → logistic regression.
+- `models/gbm.py` — LightGBM scaffold.
+- `backtest/portfolio.py` — top-K long/short.
+- `backtest/engine.py` — vectorised backtester.
+- `reports/tearsheet.py` — self-contained HTML report.
+- `pipeline.py` — end-to-end driver.
+- `scripts/run_phase1.py` — CLI.
+- 16 tests covering leakage canary, walk-forward correctness, backtest
+  semantics, features, end-to-end on synthetic data.
 
-## 2. Honest baseline expectations (stated up front)
+### Phase 1 result on real data
+- 100 names, 2018-2024, horizon=1: hit 51.2%, IC IR +0.44, Sharpe −0.81.
+- Honest, infrastructure-correct, signal too weak to overcome costs.
 
-- Random = 50% directional accuracy.
-- A non-leaking model on daily horizon, liquid US equities, typically achieves
-  **51–54% out-of-sample**.
-- Anything > 55% on walk-forward is almost always a bug.
-- Most "successful" backtests on the internet are broken (lookahead,
-  survivorship, no costs, optimised on test set).
-- Benchmark to beat is **long SPY** — most strategies lose to it after costs.
+---
 
-## 3. Architecture
+## Session 2 — Code review + bug fixes + Phase 2/3/4 + backend + frontend + deployment
 
+### Sub-agents dispatched in parallel
+1. **Research** — wrote a detailed report on free fundamentals data sources
+   (yfinance reliability fields, FINRA short interest flat files, SEC EDGAR
+   endpoints with rate limits, NASDAQ earnings calendar). Inlined into the
+   handoff doc.
+2. **Stress-test reviewer** — comprehensive audit of all Phase 1 modules.
+   Surfaced 3 CRITICAL bugs, 6 HIGH/MEDIUM bugs, 8 LOW/NIT issues.
+
+### CRITICAL bugs surfaced by review and FIXED with regression tests
+- **C1** — `run_backtest` was not horizon-aware. For horizons > 1, only one
+  day of the h-day forward window was realised, while the model was trained
+  on h-day cumulative returns. Engine rewritten with `horizon`, `trade_lag`,
+  and cadence enforcement. New parametrised test asserts cumulative return
+  over the held window equals the expected h-day return exactly.
+- **C2** — `WalkForwardSplit` embargo was in **calendar** days, but horizons
+  are in **trading** days. For h=21 with embargo=10, ~14 days of label
+  leakage actually occurred. Switched to positional offsets into the sorted
+  trading-day index. Default embargo bumped to 25.
+- **C3** — `add_cross_sectional_ranks` was approximately bounded, not
+  exactly. Switched to `(rank - 1) / (n - 1) - 0.5` so min/max are exactly
+  ±0.5 with no floating-point slop. Test asserts the exact bounds.
+
+### HIGH/MEDIUM bugs also FIXED with regression tests
+- **H2** — costs now charged on the day the trade clears (signal day +
+  trade_lag), not on the signal day.
+- **H3** — `members_on` uses strict `>` on end_date (ticker removed on D is
+  not in the index at close of D).
+- **H5** — ADV feature renamed to `adv_proxy_21` with docstring explaining
+  that `adj_close × volume` is not true dollar volume.
+- **M3** — baseline returns NaN for test rows that were entirely NaN in the
+  original `X_test` (no silent base-rate fallback).
+- **M4** — `select_universe` no longer silently picks current-only
+  constituents. New `universe_sampling` knob: `random` (default, unbiased,
+  deterministic seed), `current` (loud SURVIVORSHIP warning), `first`
+  (alphabetical, mildly biased, transparent).
+- **M6** — tearsheet yearly table uses per-column formatters; Sharpe no
+  longer rendered as a percentage.
+- **L6** — equity/drawdown charts use `returns.dropna()` so NaN stretches
+  don't render as flat zero-drawdown.
+- **L7** — fundamentals loader rate-limits between submissions (the previous
+  sleep was after-the-fact and ineffective).
+
+### Phase 2 — model improvements
+- `data/fundamentals.py` — yfinance `.info` per-ticker caching, parquet store
+  at `data/cache/fundamentals.parquet`.
+- `features/cross_sectional.py` — `neutralise_by_sector` (sector-relative
+  cross-section) and `add_sector_dummies` (one-hot sector membership).
+- `labels.py` — `compute_vol_scaled_forward_returns`: forward log return
+  divided by trailing realised vol (lag-safe). `long_labels` emits
+  `fwd_vs_{h}` per horizon by default.
+- `pipeline.py` rewrite: `PipelineConfig.horizons` (plural), `model`
+  ({'gbm' | 'logistic'}), `use_sector_features`. Per-horizon walk-forward
+  training + cross-sectional z-scored ensemble.
+- `scripts/run_phase1.py` rewritten: `--horizons 1 5 21 --model gbm
+  --no-sector --universe-sampling random`.
+
+### Phase 2 real-data result (60 names, 2018-2024, GBM h=1/5/21)
+| Horizon | Hit rate | IC mean | IC IR    |
+| ------- | -------- | ------- | -------- |
+| 1d      | 51.5%    | +0.002  | +0.24    |
+| 5d      | 53.7%    | +0.024  | **+2.45** |
+| 21d     | 55.6%    | −0.001  | −0.13    |
+
+Strategy Sharpe **−1.3**. The 5d signal is real; the 1d and 21d horizons
+wash it out at equal ensemble weights; transaction costs do the rest.
+
+### Phase 3 — portfolio construction
+- `backtest/portfolio.py`:
+  - `vol_scaled_weights` — signal × inverse-vol, normalised per side.
+  - `apply_sector_caps` — shrink any sector's gross to a cap.
+  - `apply_min_trade_threshold` — suppress small day-to-day rebalances.
+  - `ic_ir_weighted_ensemble` — weight horizons by their IC IR; horizons with
+    IC IR ≤ 0 get zero weight; loud fallback to equal weights when all are
+    negative.
+
+### Phase 4 — stress tests
+- `validation/stress.py`:
+  - `holdout_split_dates` — chronological dev/holdout partition.
+  - `bootstrap_sharpe` — i.i.d. resampling CI for annualised Sharpe.
+  - `sensitivity_grid` — run a callable across a grid of params.
+  - `vix_regime`, `spy_regime` — regime labels for breakdown.
+  - `regime_breakdown` — per-regime mean/std/Sharpe/hit/ann_return.
+
+### Backend
+- `backend/db.py` — SQLite engine with WAL + FK pragmas, `session_scope`.
+- `backend/models.py` — ORM: `Run`, `Prediction`, `PriceBar`, `Fundamental`,
+  `EquitySample`.
+- `backend/store.py` — repository pattern with SQLite `ON CONFLICT` upserts.
+- `backend/snapshot.py` — bridges pipeline output to DB (predictions,
+  equity, run summary; optionally refreshes prices + fundamentals).
+- `backend/jobs.py` — APScheduler with daily cron + weekly cleanup;
+  on-demand jobs tracked in memory.
+- `backend/schemas.py` — Pydantic v2 response models.
+- `backend/api.py` — FastAPI: 10 routes covering health, tickers, ticker
+  details, predictions, runs, equity curves, backtest summary, job control.
+  Static-mounts a built SPA from `web/dist/` at `/`.
+- `scripts/serve.py` — uvicorn entrypoint.
+- Backend tests round-trip predictions/prices/fundamentals through the API.
+
+### Frontend
+React 18 + Vite + TypeScript + Tailwind + shadcn-style components +
+TanStack Query/Table + Recharts + Lucide icons. 4 pages:
+- `Home` — KPI tiles, equity curve, top longs/shorts.
+- `Screener` — filterable, sortable table over the universe.
+- `Ticker/:t` — price chart with prediction overlay, fundamentals card,
+  business summary.
+- `Backtest` — KPI tiles, equity, drawdown, per-horizon diagnostics, yearly
+  table.
+
+Built and tested locally (Node 20):
 ```
-src/stockpred/
-├── config.py              # paths + dataclass configs (Backtest/Horizon/CV/Universe)
-├── pipeline.py            # end-to-end Phase 1 driver, importable
-├── data/
-│   ├── universe.py        # S&P 500 historical constituents via Wikipedia change log
-│   ├── prices.py          # yfinance loader with per-ticker parquet cache
-│   └── macro.py           # FRED loader (VIX, yields, USD, oil) — not used in Phase 1
-├── features/
-│   ├── technical.py       # lag-safe technicals: returns, vol, RSI, MACD, BB, etc.
-│   └── cross_sectional.py # per-date ranks, centered exactly at 0
-├── labels.py              # forward returns + binary direction, multi-horizon
-├── validation/
-│   ├── walk_forward.py    # expanding-window CV with purge + embargo
-│   └── metrics.py         # IC / IC IR / Sharpe / Sortino / max-DD / Calmar
-├── models/
-│   ├── baseline.py        # impute → scale → logistic regression
-│   └── gbm.py             # LightGBM regressor on forward returns
-├── backtest/
-│   ├── portfolio.py       # top-k long / bottom-k short, dollar-neutral
-│   └── engine.py          # vectorised, costs, configurable trade_lag
-└── reports/
-    └── tearsheet.py       # self-contained HTML report (equity, DD, yearly table)
-
-scripts/run_phase1.py      # CLI entrypoint: data → features → CV → backtest → report
-tests/                     # 16 unit + integration tests
-```
-
-## 4. What was built (chronological)
-
-1. **Project scaffold** — `pyproject.toml`, `.gitignore`, `uv` venv. Pinned
-   PyPI directly via `[[tool.uv.index]]` so the project resolves on any
-   machine, independent of any corp-internal package mirror.
-2. **Universe loader** — Wikipedia change log parsing for S&P 500 historical
-   membership. Caches a parquet snapshot to `data/cache/`.
-3. **Prices loader** — yfinance with per-ticker parquet cache and ThreadPool
-   parallelism. Tolerates partial failures (some tickers just won't download).
-4. **Macro loader** — FRED via pandas-datareader. Plumbed but not wired into
-   Phase 1 features yet.
-5. **Labels** — Forward log returns over horizons 1d/5d/21d. Crucially
-   `trade_next_open=True` by default: label for date `t` uses `close[t+1]` and
-   `close[t+1+h]`, never the close on date `t` itself.
-6. **Features** — 15+ lag-safe technical features per ticker per date, then
-   cross-sectional rank versions of every numeric column (centered at 0 by
-   subtracting per-day mean of pct-rank).
-7. **Walk-forward CV** — Expanding window with explicit purge + embargo to
-   prevent label leakage across the train/test boundary.
-8. **Metrics** — IC, IC IR, hit rate, Sharpe, Sortino, max drawdown, Calmar.
-9. **Models** — Logistic regression baseline (transparent leakage canary)
-   and LightGBM (for Phase 2 work).
-10. **Portfolio & backtest** — Top-k long / bottom-k short, equal-weighted,
-    dollar-neutral. Vectorised backtester with realistic costs.
-11. **Tearsheet** — Self-contained HTML report with embedded PNG charts.
-12. **Tests** — 16 tests (4 categories) covering leakage, walk-forward
-    correctness, backtest engine semantics, feature lag-safety, full
-    end-to-end pipeline on synthetic data.
-
-## 5. Bugs surfaced *by tests* and fixed
-
-| # | Bug | How found | Fix |
-| - | --- | --------- | --- |
-| 1 | `pd.read_html(resp.text)` interpreted body as file path | Real-data run | Wrap in `io.StringIO(resp.text)`. Added `test_universe_html_parse.py` regression test. |
-| 2 | Cross-sectional ranks not centered at zero (pct_rank mean = 0.625, not 0.5, with k=4) | `test_cross_sectional_ranks_centered_at_zero` | Subtract per-day mean of pct_rank instead of fixed 0.5. |
-| 3 | Backtest gross_return was 0 on day 0 (no held position), polluting metrics | `test_constant_long_position_earns_underlying_return` | Mark gross NaN when no held position; net still charges day-0 cost. |
-| 4 | Off-by-one between label horizon and backtest realisation: label was `[t+1, t+1+h]`, backtest realised `[t, t+1]` | Diagnostic of "positive IC, negative strategy" | Added `trade_lag` parameter to engine, default `trade_lag=2` for the pipeline (matches `trade_next_open=True`). Added `test_trade_lag_2_matches_label_alignment`. |
-| 5 | Daily rebalancing with horizon-5 prediction destroyed signal via turnover | Backtest still negative after lag fix | Added `rebalance_every` knob in `PipelineConfig`. Default = horizon. |
-
-## 6. Test suite
-
-```
-$ uv run pytest tests/ -v
-…
-============================= 16 passed in ~30s =============================
-```
-
-| File                              | Tests | Purpose                                      |
-| --------------------------------- | ----- | -------------------------------------------- |
-| `test_labels_no_leakage.py`       | 3     | Forward labels do not depend on past/current prices |
-| `test_walk_forward.py`            | 3     | CV has no train/test overlap, respects embargo, expanding window grows |
-| `test_features.py`                | 3     | Features lag-safe; cross-sectional ranks centered + bounded |
-| `test_backtest_engine.py`         | 4     | Constant long earns underlying, costs charged correctly, dollar-neutral offsets, trade_lag=2 alignment |
-| `test_universe_html_parse.py`     | 2     | Wikipedia HTML parses to membership; `read_html` regression |
-| `test_pipeline_integration.py`    | 1     | Full end-to-end pipeline on synthetic noise: hit rate must be 35–65%, IC < 0.05 (leakage canary) |
-
-## 7. Phase 1 results on real data
-
-Run: `uv run python scripts/run_phase1.py --start 2018-01-01 --end 2024-12-31 --n-tickers 100 --k 10 --horizon 5`
-
-| Metric             | Value           | Honest reading |
-| ------------------ | --------------- | -------------- |
-| Universe           | 100 names       | Some yfinance failures dropped a few |
-| Feature matrix     | 167,822 × 36    | Full panel |
-| Walk-forward folds | 6               | Train years=3, test months=6, embargo=10d |
-| OOS hit rate       | **52.9%**       | Within honest 51–54% range |
-| OOS IC mean        | **+0.012**      | Tiny but positive |
-| OOS IC IR          | **+1.05**       | Stable signal across folds |
-| Annualised return  | **-6.6%**       | Loses to cash |
-| Sharpe (net)       | **-0.52**       | Bad |
-| Max drawdown       | **-42%**        | Brutal |
-
-**Reading:** the predictive signal is real (IC IR > 1) but the cohort the
-model flags as "most likely to go up" experiences asymmetric tail losses that
-overwhelm the modest edge. Inverting the sign of the score brings the strategy
-to roughly flat (Sharpe ≈ 0), not positive — so it's not just a sign bug; the
-quantile portfolios are not behaving like the means.
-
-This is the kind of result that takes weeks of follow-up research: feature
-ablation, sector neutralisation, regime split, dollar-neutral vs beta-neutral,
-better risk model, etc. That's Phase 2+.
-
-**Crucially:** the infrastructure correctly produced an honest disappointing
-result. Pretending otherwise would defeat the purpose.
-
-## 8. What's intentionally NOT here
-
-- **No webapp / hosting / accounts.** That was deferred; the project is a
-  local research codebase.
-- **No corp / internal dependencies.** Pure PyPI, free APIs (yfinance, FRED,
-  Wikipedia). Runs identically on any machine.
-- **No point-in-time fundamentals.** Free data doesn't provide them honestly.
-- **No tick data, no intraday.** Daily bars only.
-
-## 9. How to run
-
-```bash
-# One-time setup
-uv sync --extra dev
-
-# All tests (~30s, includes one integration test with synthetic data)
-uv run pytest tests/ -v
-
-# End-to-end Phase 1 on real data (downloads to data/cache/ on first run)
-uv run python scripts/run_phase1.py --start 2018-01-01 --end 2024-12-31 \
-    --n-tickers 100 --k 10 --horizon 5
-
-# Inspect the HTML tearsheet
-xdg-open reports/phase1_h5_k10.html   # or open with any browser
+dist/index.html                   0.71 kB │ gzip:   0.42 kB
+dist/assets/index-…css           13.00 kB │ gzip:   3.55 kB
+dist/assets/index-…js           716.65 kB │ gzip: 204.80 kB
+✓ built in 7.23s
 ```
 
-## 10. Roadmap
+### Deployment
+- `Dockerfile` — multi-stage: Node 20 builds frontend, Python 3.12 slim runs
+  uvicorn and serves both API and SPA from one process.
+- `.dockerignore` — keeps the build context small.
+- `docker-compose.yml` — single service, persistent `./data` volume.
+- `docs/DEPLOYMENT.md` — local Docker, manual, Fly.io with `fly.toml`,
+  Render with Disk + Cron Job, generic VM with Caddy + Let's Encrypt.
+  Environment variable matrix, backup recipes, security notes.
 
-- **Phase 1 — Foundation.** ✅ Done.
-- **Phase 2 — GBM + sector neutralisation + more features.** Wire LightGBM
-  through the pipeline; add sector dummies / sector-relative ranks; try
-  alternate label definitions (vol-scaled, triple-barrier).
-- **Phase 3 — Portfolio construction.** Risk model, beta neutralisation,
-  turnover constraint via optimisation rather than coarse-rebalance hack.
-- **Phase 4 — Stress tests.** Held-out 2-year window never touched; bootstrap
-  Sharpe CIs; sensitivity to costs, hyperparameters, universe slices.
-- **Phase 5 — Optional.** Sequence models (Transformer panel), LLM-based
-  sentiment, regime overlay; later: hosted dashboard.
+### Tests at end of session
+```
+$ uv run pytest tests/
+45 passed in ~25s
+```
+- 7 backtest engine (horizon-aware, cost timing, cadence, dollar-neutral)
+- 1 baseline NaN prediction
+- 5 features (lag-safe, exact-bounded ranks, single-obs day)
+- 3 labels no-leakage
+- 1 pipeline integration (synthetic noise canary)
+- 6 portfolio construction (top-K, vol-scaled, sector caps, threshold, IC IR)
+- 6 stress (holdout, bootstrap CI, sensitivity grid, regime breakdown)
+- 3 universe HTML + strict boundary
+- 6 walk-forward (trading-day embargo, default ≥ max horizon, contract)
+- 7 backend API (health, list, details, snapshot round-trip, etc.)
 
-## 11. Files of interest
+### What is intentionally NOT in this session
+- A real trading link to a broker.
+- Real-time data. yfinance + Wikipedia + FRED on a daily cadence is the
+  free-data ceiling.
+- A "winning" strategy. The current GBM ensemble loses to cash on the
+  real-data backtest. The infra honestly reports it. Improving the model
+  is Phase 5+ research.
 
-- `README.md` — quickstart + honest expectations
-- `src/stockpred/pipeline.py` — the spine; read this first
-- `src/stockpred/backtest/engine.py` — note the `trade_lag` docstring
-- `tests/test_pipeline_integration.py` — leakage canary
-- `reports/*.html` — generated tearsheets
+### Project layout (final)
+```
+stock-predictor/
+├── src/stockpred/
+│   ├── backend/        # db, models, store, snapshot, jobs, schemas, api
+│   ├── backtest/       # engine.py (horizon-aware), portfolio.py
+│   ├── data/           # universe, prices, macro, fundamentals
+│   ├── features/       # technical.py, cross_sectional.py
+│   ├── models/         # baseline.py, gbm.py
+│   ├── reports/        # tearsheet.py
+│   ├── validation/     # walk_forward.py, metrics.py, stress.py
+│   ├── config.py
+│   ├── labels.py
+│   └── pipeline.py
+├── web/                # Vite + React + TS frontend
+│   ├── src/api/        # client + types
+│   ├── src/components/ # Layout, ThemeProvider, ui/
+│   ├── src/lib/        # cn, format
+│   ├── src/pages/      # Home, Screener, Ticker, Backtest
+│   ├── package.json
+│   ├── tailwind.config.ts
+│   ├── tsconfig.json
+│   ├── vite.config.ts
+│   └── index.html
+├── scripts/            # run_phase1.py, serve.py
+├── tests/              # 45 tests
+├── docs/               # PROJECT_LOG, DEPLOYMENT, HANDOFF
+├── Dockerfile
+├── .dockerignore
+├── docker-compose.yml
+├── pyproject.toml
+└── README.md
+```
+
+## Next steps (Phase 5+)
+
+Honest signal research, not engineering:
+1. Use `validation/stress.py` to bootstrap-CI the Phase 2 backtest. If the
+   point-estimate Sharpe sits comfortably inside a CI that includes 0, stop
+   pretending there's a strategy.
+2. Drop the 21d horizon (IC IR ≈ 0) from the ensemble. Re-run with just
+   {1, 5} weighted by IC IR.
+3. Try sector neutralisation flag turned ON; current real-data run had it
+   off because the fundamentals fetch on cold-cache is slow.
+4. Run a sensitivity grid (`scripts/run_phase1.py` × grid of `cost_bps`,
+   `k_per_side`). If results swing wildly with a 2 → 6 bps cost change, the
+   "edge" is overfitting.
+5. (Long shot) news/sentiment via free LLM API + EDGAR 8-K filings.

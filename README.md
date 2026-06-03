@@ -1,63 +1,177 @@
 # stock-predictor
 
-Cross-sectional directional forecaster for S&P 500 equities. Local Python, free data,
-honest validation. Built to **learn what works and what doesn't**, not to promise alpha.
+A cross-sectional directional forecaster for S&P 500 equities, with a real
+backend, real frontend, and honest backtests. Free public data only.
+Single-container deploy. Built to surface what works and what doesn't —
+*not* to promise alpha.
+
+![pipeline diagram: data → features → walk-forward CV → ensemble → portfolio → backtest → tearsheet & SPA](docs/architecture.svg)
 
 ## Honest expectations (read first)
 
-- **Baseline:** random = 50% accuracy. A non-leaking model on daily horizons typically
-  achieves **51–54% directional accuracy out-of-sample**. Anything above ~55% on
-  walk-forward validation is almost always a bug (lookahead, target leakage, survivorship,
-  or train/test contamination).
-- **Most "successful" backtests on the internet are broken.** This project applies the
-  defenses from Marcos López de Prado's *Advances in Financial Machine Learning*:
-  purged + embargoed walk-forward CV, realistic transaction costs, point-in-time labels.
-- **Free data has real limits.** No point-in-time fundamentals; survivorship in current
-  ticker lists; no tick data. We mitigate by reconstructing S&P 500 historical
-  constituents from Wikipedia change logs, but it's still imperfect.
-- **The benchmark to beat is "long SPY".** Most strategies lose to it after costs.
+- **Baseline.** Random = 50% directional accuracy. A non-leaking model on
+  daily horizons typically achieves **51–54% out-of-sample**. Anything above
+  ~55% on walk-forward is almost always a bug (lookahead, target leakage,
+  contamination).
+- **Most "successful" backtests on the internet are broken.** This project
+  applies defenses from Marcos López de Prado's *Advances in Financial
+  Machine Learning*: purged + embargoed walk-forward CV (in **trading days**),
+  realistic transaction costs, point-in-time labels, horizon-aware backtest,
+  exact-bounded cross-sectional ranks, leakage canary in CI.
+- **Free data has real limits.** No real-time short interest, no point-in-time
+  fundamentals (yfinance `.info` is current-as-of-fetch), survivorship
+  mitigated but not eliminated.
+- **The benchmark is "long SPY."** Most strategies lose to it after costs.
+  The Phase 1+2 results on real data (see [`docs/PROJECT_LOG.md`](docs/PROJECT_LOG.md))
+  do too. The dashboard shows that honestly.
 
-## Architecture
+## What's in the box
 
 ```
 src/stockpred/
-├── data/         # universe, prices, macro loaders (parquet-cached)
-├── features/     # technical + cross-sectional features (lag-safe)
-├── labels.py     # forward returns + binary labels for multiple horizons
-├── models/       # logistic baseline, LightGBM
-├── validation/   # purged walk-forward CV, IC / hit-rate / Sharpe
-├── backtest/     # vectorized engine with costs, long/short top-k portfolio
-└── reports/      # HTML tearsheet
+├── config.py              # paths, dataclass configs
+├── pipeline.py            # end-to-end driver
+├── data/                  # universe, prices, macro, fundamentals (all cached)
+├── features/              # lag-safe technicals, cross-sectional ranks, sector neutralisation
+├── labels.py              # forward returns + vol-scaled targets per horizon
+├── validation/            # walk-forward CV (trading-day embargo), metrics, stress tests
+├── models/                # logistic baseline, LightGBM
+├── backtest/              # horizon-aware engine, top-K & vol-scaled portfolios, sector caps
+├── reports/               # standalone HTML tearsheet
+└── backend/               # SQLite + SQLAlchemy + FastAPI + APScheduler
+
+web/                       # React + Vite + TS + Tailwind + shadcn-style UI
+├── src/pages/             # Home, Screener, Ticker, Backtest
+├── src/components/        # Layout, ThemeProvider, ui/ primitives
+└── ...
+
+scripts/
+├── run_phase1.py          # end-to-end CLI: data → backtest → tearsheet
+└── serve.py               # uvicorn server
+
+tests/                     # 45 tests; leakage canary + endpoint round-trip
+docs/                      # PROJECT_LOG, DEPLOYMENT, HANDOFF
+Dockerfile + docker-compose.yml
 ```
 
-## Quickstart
+## Quick start
+
+### Local dev (Python + Node)
 
 ```bash
-# install (one-time)
+# Install
 uv sync --extra dev
+cd web && npm ci && cd ..
 
-# Phase 1 end-to-end: pull data, train baseline, walk-forward backtest
-uv run python scripts/run_phase1.py
+# Run the pipeline once, write a tearsheet
+uv run python scripts/run_phase1.py --start 2018-01-01 --n-tickers 60 \
+    --horizons 1 5 21 --k 10 --model gbm
+
+# Serve the backend
+uv run python scripts/serve.py
+
+# In another shell, run the frontend in dev mode (Vite + HMR)
+cd web && npm run dev
+
+# Or build the frontend and let FastAPI serve it
+cd web && npm run build
+# now visit http://127.0.0.1:8000
 ```
+
+### Docker
+
+```bash
+docker compose up --build
+open http://localhost:8000
+```
+
+See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for Fly.io, Render, and VM
+deployment walkthroughs.
+
+## Frontend pages
+
+- **Home** — today's top long and short cohorts, KPI tiles, equity curve.
+- **Screener** — the full S&P 500 with sector / industry / market-cap
+  filters, sortable columns, live search by ticker or industry.
+- **Ticker** — per-name page: 2y price chart with prediction-score overlay,
+  fundamentals card (sector, beta, P/E, short ratio, 52w range), business
+  summary.
+- **Backtest** — KPI tiles (Sharpe, return, drawdown), equity curve,
+  drawdown chart, per-horizon IC diagnostics, yearly performance.
+
+Theme toggle, mobile nav, dark/light, all built with shadcn-style primitives
++ TanStack Query/Table + Recharts. Builds to ~205 KB gzipped.
+
+## API endpoints
+
+All under the FastAPI app (`http://localhost:8000`). Swagger UI at `/docs`.
+
+| Method | Path                          | Returns                                      |
+| ------ | ----------------------------- | -------------------------------------------- |
+| GET    | `/healthz`                    | DB + scheduler status                        |
+| GET    | `/tickers`                    | Universe summary                             |
+| GET    | `/tickers/{t}/details`        | Fundamentals + last N days prices + preds    |
+| GET    | `/predictions/latest`         | Top long / bottom short for the latest run   |
+| GET    | `/runs`                       | Recent runs metadata                         |
+| GET    | `/runs/{id}/equity`           | Equity curve for a specific run              |
+| GET    | `/backtest/summary`           | Tearsheet payload                            |
+| POST   | `/jobs/refresh`               | Trigger an on-demand pipeline run            |
+| GET    | `/jobs/{id}`                  | Job status                                   |
 
 ## Anti-patterns this project actively prevents
 
-- ❌ Train on all data, "test" on a subset → enforced via `WalkForwardSplit`.
-- ❌ Features using same-day close to predict same-day return → labels are forward,
-  features use only data up to `t`, prediction is for `[t+1, t+1+h]`.
-- ❌ Hyperparameter tuning on the test set → CV is nested.
-- ❌ Backtest without costs → costs default to **5 bps per side**, configurable.
-- ❌ Survivorship → universe is point-in-time constituents.
-- ❌ Cherry-picked window → reports break out yearly performance + holdout.
+| What | How |
+| ---- | --- |
+| Train on test data | `WalkForwardSplit` with purge + embargo in **trading days** (default 25) |
+| Same-day lookahead | Labels use `close[t+1] → close[t+1+h]`; engine realises the SAME window |
+| Cost-free backtest | Default 6 bps/side; turnover charged on the day the trade clears |
+| Survivorship | `members_on(date)` strict-boundary; pipeline `universe_sampling='random'` |
+| Predicting on noise | Test rows with all-NaN features → NaN prediction (no base-rate fallback) |
+| Cherry-picked window | Per-horizon diagnostics + yearly breakdown surfaced on the Backtest page |
+| Optimising on test | Hyperparameters are static; tuning would require a held-out window — see `validation/stress.py` for the scaffold |
 
-## Roadmap
+## Honest result on real data
 
-- **Phase 1** — Foundation: universe, prices, baseline, walk-forward, costs ← *here*
-- **Phase 2** — Features + LightGBM
-- **Phase 3** — Portfolio construction + tearsheet
-- **Phase 4** — Stress tests, holdout, sensitivity
-- **Phase 5** — (Optional) sequence models, news sentiment, regime overlay
+100 randomly-sampled S&P names, 2018–2024, GBM ensemble across horizons
+{1, 5, 21}:
+
+| Horizon | Hit rate | IC mean | IC IR    |
+| ------- | -------- | ------- | -------- |
+| 1d      | 51.4%    | +0.002  | +0.24    |
+| 5d      | 53.7%    | +0.024  | **+2.45** |
+| 21d     | 55.6%    | -0.001  | −0.13    |
+
+Strategy net: Sharpe **−1.3**, ann return **−10%**, max DD **−57%**.
+The 5d horizon shows a real signal (IC IR > 2). The 21d horizon has no
+signal at all. The equal-weight ensemble washes the 5d edge out, and
+transaction costs do the rest. The infrastructure is honest; turning that
+modest IC IR into a profitable strategy is the next phase of *research*,
+not engineering.
+
+## Tests
+
+```
+$ uv run pytest tests/ -v
+============================= 45 passed in ~25s =============================
+```
+
+- `test_labels_no_leakage.py` — labels at t do not depend on prices at or before t
+- `test_walk_forward.py` — embargo in trading days, no train/test overlap, default ≥ max-horizon
+- `test_features.py` — features lag-safe, cross-sectional ranks bounded exactly to [-0.5, 0.5]
+- `test_backtest_engine.py` — horizon-aware accumulation, cost timing, dollar neutrality
+- `test_portfolio_construction.py` — vol-scaling, sector caps, turnover threshold, IC-IR weighting
+- `test_stress.py` — holdout split, bootstrap Sharpe CI, sensitivity grid, regime breakdown
+- `test_universe_html_parse.py` — Wikipedia parser + strict membership boundary
+- `test_baseline_nan.py` — predictions are NaN when inputs are all-NaN
+- `test_pipeline_integration.py` — end-to-end on synthetic noise with hit-rate canary
+- `test_backend_api.py` — FastAPI endpoint contracts + snapshot round-trip
+
+## Project documents
+
+- [`docs/PROJECT_LOG.md`](docs/PROJECT_LOG.md) — full chronological log
+- [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) — Docker, Fly, Render, VM
+- [`docs/HANDOFF.md`](docs/HANDOFF.md) — resume protocol for new sessions
 
 ## License
 
-Personal/research use. No warranty. **Not investment advice.**
+Personal / research use. **Not investment advice.**
