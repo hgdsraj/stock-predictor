@@ -42,33 +42,40 @@ So: phases 2-4, FastAPI backend, React+Vite+TS+Tailwind+shadcn frontend, Dockerf
 1. **Research sub-agent** — produced a detailed free-fundamentals report covering yfinance reliability, FINRA short-interest flat files (`https://cdn.finra.org/equity/regsho/monthly/shrt<YYYYMMDD>.txt`), SEC EDGAR endpoints, earnings calendars, sector classification. **Action**: this report should be inlined verbatim or summarised into `docs/PROJECT_LOG.md` ("Data sources" section) and used as the spec for `src/stockpred/data/short_interest.py` and `src/stockpred/data/edgar.py` you will write in Phase 2/backend.
 2. **Stress-test sub-agent** — found **3 CRITICAL bugs in Phase 1 code** that must be fixed before Phase 2 runs, plus HIGH/MEDIUM findings. Bugs are documented in `docs/PROJECT_LOG.md` as well as below.
 
-### Bugs found by stress-test (status)
-- **C1** — `run_backtest` was not horizon-aware; for horizons > 1, it only realised one day of the h-day forward window. **FIX IN PROGRESS** — `src/stockpred/backtest/engine.py` was rewritten to accept `horizon` and `trade_lag` and enforce cadence. Tests in `tests/test_backtest_engine.py` were rewritten too. **State at handoff**: the rewrite is done but **NOT yet test-verified**; the LSP shows a typing nit in the test file (numpy assert on pandas series with nullable dtype); the engine likely needs minor follow-ups. **First thing to do: run the tests and fix anything that breaks.**
-- **C2** — embargo was in *calendar* days; horizons are *trading* days. For h=21 with embargo=10, label leakage actually happens. **NOT FIXED.** Need to: (a) make `WalkForwardSplit` embargo use trading-day positions in the sorted `dates` index, (b) bump default embargo to `max_horizon + buffer` (e.g. 25), (c) add a regression test that for `horizon=21, embargo=10` (old) the last training label window overlaps test; and for the fix, it does not.
-- **C3** — cross-sectional ranks not bounded exactly to [-0.5, 0.5]; current centring is approximate. **NOT FIXED.** Change `add_cross_sectional_ranks` to `(rank - 1) / (n - 1) - 0.5` so bounds are exact. Strengthen `test_cross_sectional_ranks_centered_at_zero` to also assert min==-0.5 and max==0.5 exactly.
-- **H2** — turnover/cost timing was on signal day, not clearing day. **FIXED** in the engine rewrite; cost now charged on `held` (shifted) deltas.
-- **H3** — `members_on` uses `>=` and `>=`; should be strict `>` for end_date. **NOT FIXED.**
-- **H5** — ADV computed from `adj_close * volume`; both have been split-adjusted, so the product is wrong. **NOT FIXED.** Either rename feature to `adv_proxy_21` or carry raw close through.
-- **M3** — `fit_predict_proba` doesn't NaN out test rows that were all-NaN in the original Xs. **NOT FIXED.**
-- **M4** — `select_universe` silently biases to current constituents when n_tickers < |universe|. **NOT FIXED.** Either rename, or pick a random historical sample, or surface a giant warning.
-- **M6** — tearsheet yearly-table formatter conflates Sharpe (~1.2) with returns (%); needs per-column formatting. **NOT FIXED.**
-- **L6** — equity chart uses `returns.fillna(0).cumprod()`, making NaN stretches look flat (no drawdown). Use `returns.dropna()`. **NOT FIXED.**
-- **L7** — fundamentals rate-limit sleep is after futures are already in flight; ineffective. **NOT FIXED.**
+### Bugs found by stress-test (status — all FIXED + regression-tested)
+- **C1** horizon-aware engine ✅ (commit 4a70af0)
+- **C2** trading-day embargo, default 25 ✅
+- **C3** exact-bounded cross-sectional ranks ✅
+- **H2** turnover/cost timing on clearing day ✅
+- **H3** members_on strict end_date ✅
+- **H5** ADV renamed to adv_proxy_21 ✅
+- **M3** baseline returns NaN on all-NaN test rows ✅
+- **M4** universe sampling: random default; current/first opt-in with loud warning ✅
+- **M6** tearsheet per-column formatters ✅
+- **L6** equity/dd charts use returns.dropna() ✅
+- **L7** fundamentals rate-limit before submit ✅
 
-### Phase 2 work already started
-- `src/stockpred/data/fundamentals.py` — yfinance `.info` per-ticker caching, parquet store at `data/cache/fundamentals.parquet`.
-- `src/stockpred/features/cross_sectional.py` — added `neutralise_by_sector` (sector-relative cross-section) and `add_sector_dummies` (one-hot sector membership).
-- pyproject now includes: `fastapi`, `uvicorn[standard]`, `pydantic`, `apscheduler`, `sqlalchemy`, `httpx`.
+### Phase 2 — DONE (commit de4b478)
+- `src/stockpred/data/fundamentals.py` — yfinance .info caching, parquet store.
+- `src/stockpred/features/cross_sectional.py` — `neutralise_by_sector` + `add_sector_dummies`.
+- `src/stockpred/labels.py` — `compute_vol_scaled_forward_returns`; `long_labels` emits `fwd_vs_{h}` by default.
+- `src/stockpred/pipeline.py` — rewritten: `PipelineConfig.horizons` (plural), `model={'gbm'|'logistic'}`, `use_sector_features`. Per-horizon walk-forward training, cross-sectional z-scored ensemble.
+- `scripts/run_phase1.py` — supports `--horizons 1 5 21 --model gbm --no-sector --universe-sampling random`.
 
-### Stuff staged but not yet wired
-- LightGBM through pipeline.
-- Vol-scaled / triple-barrier labels.
-- Multi-horizon ensemble.
-- Position sizing, sector caps, turnover threshold.
-- Held-out window, bootstrap Sharpe CI, sensitivity grid, regime breakdown.
-- Backend (SQLite + FastAPI + APScheduler).
-- Frontend (Vite + React + TS + Tailwind + shadcn + Recharts + TanStack).
-- Dockerfile / compose / `docs/DEPLOYMENT.md`.
+### Real-data Phase 2 result (60 names, 2018-2024, h={1,5,21} GBM ensemble)
+- h=1d  IC IR +0.24  hit 51.5%
+- h=5d  IC IR **+2.45**  hit 53.7%   ← actual signal
+- h=21d IC IR -0.13  hit 55.6%       ← no signal / sign-flipped
+- Strategy: Sharpe -1.3, ann_return -10.5%, max DD -57%.
+- Conclusion: 5d signal is real; 1d and 21d wash it out at equal ensemble weights. Cost drag is meaningful. Phase 3 should: weight horizons by their IC IR or just drop 21d, add vol-scaled position sizing, cap sector exposure.
+
+### Stuff still to do
+- Phase 3: position sizing (signal × inv-vol), sector caps, turnover threshold, IC-IR-weighted ensemble.
+- Phase 4: held-out window, bootstrap Sharpe CI, sensitivity grid, regime breakdown.
+- Backend (SQLite + FastAPI + APScheduler + snapshot writer).
+- Frontend (Vite + React + TS + Tailwind + shadcn + Recharts + TanStack — 4 pages).
+- Dockerfile / docker-compose / `docs/DEPLOYMENT.md`.
+- README + PROJECT_LOG update.
 
 ## Resume protocol
 

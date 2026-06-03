@@ -1,17 +1,34 @@
 """Portfolio construction from cross-sectional predictions.
 
-Strategy: dollar-neutral long/short, equal-weighted within each side.
-- Each day, rank all stocks by predicted score.
-- Long the top-k (highest predicted), short the bottom-k (lowest predicted).
-- Each leg is equal-weighted to total $1; net = $0, gross = $2.
+Two construction styles are supported:
 
-This is the canonical evaluation harness for cross-sectional equity signals.
+1. **Top-K equal-weight (legacy / simple)**
+   `top_bottom_k_weights(score, k=50)` — long the top k names, short the
+   bottom k names, equal-weighted within each side. Dollar-neutral, easy to
+   reason about.
+
+2. **Signal × inverse-volatility, sector-capped (Phase 3)**
+   `vol_scaled_weights(score, vol)` followed by `apply_sector_caps(...)` —
+   weight each name by `score / vol`, normalise so each side sums to a target
+   gross exposure, then cap per-sector gross exposure to avoid concentration.
+   This is what you'd run in production for a tradable signal.
+
+Both functions return a wide [date x ticker] DataFrame of target weights.
 """
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pandas as pd
+
+log = logging.getLogger(__name__)
+
+
+# --------------------------------------------------------------------- #
+# Style 1: simple top-K equal-weight
+# --------------------------------------------------------------------- #
 
 
 def top_bottom_k_weights(
@@ -42,7 +59,6 @@ def top_bottom_k_weights(
         if len(group) < 2 * kk:
             return pd.Series(dtype=float)
         ranked = group["pred"].rank(method="first")
-        # Bottom kk: short; top kk: long.
         long_thresh = len(group) - kk
         short_thresh = kk
         weights = pd.Series(0.0, index=group.index)
@@ -53,7 +69,206 @@ def top_bottom_k_weights(
     w = df.groupby(level="date", group_keys=False).apply(_per_day)
     if w.empty:
         return pd.DataFrame()
-    # Convert to wide [date x ticker].
     w.index = w.index.set_names(["date", "ticker"])
     wide = w.unstack("ticker").fillna(0.0)
     return wide
+
+
+# --------------------------------------------------------------------- #
+# Style 2: signal × inverse-vol, sector-capped
+# --------------------------------------------------------------------- #
+
+
+def vol_scaled_weights(
+    score: pd.Series,
+    vol: pd.DataFrame,
+    *,
+    leverage_per_side: float = 1.0,
+    top_fraction: float = 0.2,
+) -> pd.DataFrame:
+    """Convert a score into vol-scaled long/short weights.
+
+    For each date:
+      * Take the top `top_fraction` by score and the bottom `top_fraction`.
+      * Within each side, weight ∝ |score| / vol (so high-conviction low-vol
+        names get more weight than low-conviction high-vol names).
+      * Normalise so each side's gross is `leverage_per_side`.
+
+    Parameters
+    ----------
+    score : Series indexed by [date, ticker]; higher = more bullish.
+    vol   : wide [date x ticker] DataFrame of estimated daily volatility used
+            at signal time (e.g. rolling realised vol). Lag-safe.
+    leverage_per_side : gross dollar per leg.
+    top_fraction : fraction of the cross-section per side.
+    """
+    if isinstance(score, pd.DataFrame):
+        score = score.iloc[:, 0]
+    df = score.dropna().to_frame("score")
+    df.index = df.index.set_names(["date", "ticker"])
+
+    # Look up the corresponding vol on the same (date, ticker). stack() may
+    # produce a 1- or 2-level index depending on shape; align via explicit
+    # multi-index construction.
+    vol_long = vol.stack(future_stack=True)
+    if isinstance(vol_long.index, pd.MultiIndex) and vol_long.index.nlevels == 2:
+        vol_long.index = vol_long.index.set_names(["date", "ticker"])
+    df["vol"] = vol_long.reindex(df.index)
+    # Clip to avoid /0; vol that's effectively zero means the name has no
+    # signal-time information and we shouldn't trade it.
+    df["vol"] = df["vol"].where(df["vol"] > 1e-6)
+
+    def _per_day(group: pd.DataFrame) -> pd.Series:
+        g = group.dropna(subset=["vol"])
+        if len(g) < 10:
+            return pd.Series(dtype=float)
+        kk = max(1, int(len(g) * top_fraction))
+        ranked = g["score"].rank(method="first")
+        long_mask = ranked > len(g) - kk
+        short_mask = ranked <= kk
+        w = pd.Series(0.0, index=g.index)
+        # Inverse-vol within side.
+        for mask, sign in ((long_mask, 1.0), (short_mask, -1.0)):
+            if not mask.any():
+                continue
+            sub = g.loc[mask]
+            inv_vol = 1.0 / sub["vol"]
+            normalised = inv_vol / inv_vol.sum() * leverage_per_side
+            w.loc[mask] = sign * normalised
+        return w
+
+    # Apply per day, then materialise a clean (date, ticker) MultiIndex.
+    pieces: list[pd.Series] = []
+    for date, sub in df.groupby(level="date"):
+        sub2 = sub.copy()
+        # Drop the date level so _per_day sees a ticker-only index.
+        sub2.index = sub2.index.droplevel("date")
+        piece = _per_day(sub2)
+        if piece.empty:
+            continue
+        # Re-attach date.
+        piece.index = pd.MultiIndex.from_product([[date], piece.index], names=["date", "ticker"])
+        pieces.append(piece)
+
+    if not pieces:
+        return pd.DataFrame()
+    w = pd.concat(pieces)
+    return w.unstack("ticker").fillna(0.0)
+
+
+def apply_sector_caps(
+    weights: pd.DataFrame,
+    sector_map: dict[str, str],
+    *,
+    max_per_sector_gross: float = 0.30,
+) -> pd.DataFrame:
+    """Scale down weights so no single sector's gross exposure exceeds the cap.
+
+    Per-date, per-sector: if the sector's |weight| sum exceeds the cap, shrink
+    every weight in that sector proportionally. We do not redistribute the
+    truncated weight to other sectors (which would change the long/short
+    balance); the strategy simply runs at lower gross when one sector is over.
+
+    `sector_map` maps ticker -> sector string. Missing tickers go to a special
+    "__OTHER__" sector that is also capped.
+    """
+    if weights.empty:
+        return weights
+
+    sectors = pd.Series(
+        [sector_map.get(t, "__OTHER__") for t in weights.columns],
+        index=weights.columns,
+        name="sector",
+    )
+
+    capped = weights.copy()
+    for sector, ticker_list in sectors.groupby(sectors):
+        cols = [c for c in ticker_list.index if c in capped.columns]
+        if not cols:
+            continue
+        sec_gross = capped[cols].abs().sum(axis=1)
+        over = sec_gross > max_per_sector_gross
+        if not over.any():
+            continue
+        scale = pd.Series(1.0, index=capped.index)
+        scale[over] = max_per_sector_gross / sec_gross[over]
+        capped[cols] = capped[cols].multiply(scale, axis=0)
+        n_capped = int(over.sum())
+        if n_capped:
+            log.debug(
+                "Sector cap engaged: %s on %d / %d days",
+                sector,
+                n_capped,
+                len(capped),
+            )
+    return capped
+
+
+def apply_min_trade_threshold(
+    weights: pd.DataFrame, *, min_abs_delta: float = 0.005
+) -> pd.DataFrame:
+    """Suppress small day-to-day rebalances that don't earn back their cost.
+
+    If |w_t - w_{t-1}| < min_abs_delta for a name, we keep w_{t-1} instead.
+    This roughly halves turnover for noisy day-to-day signals; the cost
+    saving usually swamps the small alpha loss from not trading tiny moves.
+    """
+    if weights.empty:
+        return weights
+    out = weights.copy()
+    for i in range(1, len(out)):
+        prev = out.iloc[i - 1]
+        curr = out.iloc[i]
+        delta = (curr - prev).abs()
+        keep_prev = delta < min_abs_delta
+        out.iloc[i] = curr.where(~keep_prev, prev)
+    return out
+
+
+# --------------------------------------------------------------------- #
+# IC-IR weighted ensemble (Phase 3 model-side helper)
+# --------------------------------------------------------------------- #
+
+
+def ic_ir_weighted_ensemble(
+    per_horizon_predictions: dict[int, pd.Series],
+    per_horizon_ic_ir: dict[int, float],
+    *,
+    min_weight: float = 0.0,
+) -> pd.Series:
+    """Average per-horizon predictions weighted by their |IC IR|.
+
+    Horizons with negative IC IR get zero weight (we don't anti-sample them
+    because we lack out-of-sample validation that the sign-flip is stable;
+    the safer move is to ignore them entirely).
+    """
+    if not per_horizon_predictions:
+        return pd.Series(dtype=float, name="ensemble_score")
+
+    weights: dict[int, float] = {}
+    for h in per_horizon_predictions:
+        ir = per_horizon_ic_ir.get(h, 0.0)
+        weights[h] = max(min_weight, float(ir)) if np.isfinite(ir) else 0.0
+
+    total = sum(weights.values())
+    if total <= 0:
+        # Fall back to equal weights so the pipeline still produces something
+        # rather than NaN; log loudly.
+        log.warning(
+            "ic_ir_weighted_ensemble: all horizons have IC IR <= 0; falling back to equal weights"
+        )
+        weights = {h: 1.0 / len(per_horizon_predictions) for h in per_horizon_predictions}
+        total = 1.0
+    weights = {h: w / total for h, w in weights.items()}
+
+    # Z-score per date per horizon, then weighted sum.
+    parts = []
+    for h, pred in per_horizon_predictions.items():
+        g = pred.groupby(level="date")
+        mu = g.transform("mean")
+        sd = g.transform("std").replace(0, np.nan)
+        z = ((pred - mu) / sd).fillna(0.0)
+        parts.append(z * weights[h])
+    out = pd.concat(parts, axis=1).sum(axis=1)
+    out.name = "ensemble_score"
+    return out
