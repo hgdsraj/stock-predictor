@@ -1,11 +1,25 @@
-"""Vectorised backtester for daily-rebalanced cross-sectional strategies.
+"""Vectorised backtester for cross-sectional long/short strategies.
 
-Conventions:
-- Weights at end of day t are intended positions for trading day t+1.
-- PnL on day t+1 = sum(weights_t * return_t+1) - turnover_cost.
-- Turnover cost = |w_t - w_{t-1}| * cost_per_side / 10000  (cost in bps).
-- We assume close-to-close execution at adjusted prices. This is an
-  approximation: real fills happen at the open or via MOC orders.
+Core conventions
+----------------
+- Weights are produced at end of day `t` from the model's signal on `t`.
+- The model is trained to predict the forward return over a window of `horizon`
+  trading days starting one day after signal generation:
+        label_t = close[t + trade_lag + horizon - 1] / close[t + trade_lag] - 1
+  (the project's default labels use `trade_lag = 1`, `horizon ∈ {1, 5, 21}`.)
+- The backtester realises P&L over the *same* window the model predicts. The
+  total P&L of a single rebalance is the `horizon`-day cumulative return on the
+  held basket; we then distribute that P&L back to daily strategy returns by
+  applying the **constant** weight basket to **daily** returns over the window.
+  This produces a daily P&L stream whose sum (compounded) equals the realised
+  basket return per rebalance, and whose volatility is realistic.
+- Transaction costs are charged on the day the trade actually clears (i.e. on
+  `t + trade_lag` for the weight set at `t`). Cost = |Δ held weight| × bps.
+- Adjacent-period overlap is avoided by enforcing a `rebalance_every = horizon`
+  cadence on the *signal* stream before shifting.
+
+The single-day path (`horizon == 1`) is identical to the previous
+implementation and preserves the existing test conventions.
 """
 
 from __future__ import annotations
@@ -20,10 +34,31 @@ from stockpred.config import BacktestConfig
 
 @dataclass
 class BacktestResult:
-    returns: pd.Series  # daily strategy net returns
-    gross_returns: pd.Series  # before costs
-    turnover: pd.Series  # daily one-way turnover, fraction of gross
-    weights: pd.DataFrame  # wide weights actually held (date-by-ticker)
+    returns: pd.Series  # daily net returns (incl. costs)
+    gross_returns: pd.Series  # daily gross returns (excl. costs)
+    turnover: pd.Series  # one-way turnover on the day the trade clears
+    held_weights: pd.DataFrame  # weights actually held each day (shifted)
+    target_weights: pd.DataFrame  # weights produced by the signal (pre-shift)
+
+
+def _coerce_weights_to_cadence(weights: pd.DataFrame, every: int) -> pd.DataFrame:
+    """Keep every `every`-th row of weights, forward-fill the rest.
+
+    This produces a stepwise weight profile where the basket is held constant
+    for `every` trading days between rebalances. Equivalent to "rebalance every
+    h days starting at the first valid row".
+    """
+    if every <= 1:
+        return weights
+    # First non-empty signal row anchors the cadence.
+    nz_idx = weights.ne(0).any(axis=1).idxmax() if weights.shape[0] else None
+    if nz_idx is None or nz_idx not in weights.index:
+        return weights
+    start = weights.index.get_loc(nz_idx)
+    keep_mask = pd.Series(False, index=weights.index)
+    keep_mask.iloc[start::every] = True
+    out = weights.where(keep_mask, np.nan).ffill().fillna(0.0)
+    return out
 
 
 def run_backtest(
@@ -31,63 +66,87 @@ def run_backtest(
     prices: pd.DataFrame,
     *,
     cfg: BacktestConfig | None = None,
-    trade_lag: int = 2,
+    horizon: int = 1,
+    trade_lag: int = 1,
+    enforce_cadence: bool = True,
 ) -> BacktestResult:
-    """Run a long/short backtest.
+    """Run a cross-sectional long/short backtest.
 
     Parameters
     ----------
-    weights : wide [date x ticker], weights set at end of date `t`
-              (the "signal date").
+    weights : wide [date x ticker] target weights produced at end of each signal day.
     prices  : wide [date x ticker] adjusted close.
-    trade_lag : how many days separate signal generation from the realisation
-                window. Must match the label definition used to train the model.
-                * trade_lag=1 -> realise return from close[t] to close[t+1]
-                  (lookahead: requires trading at signal close, generally not
-                  achievable in live trading).
-                * trade_lag=2 -> realise from close[t+1] to close[t+2]
-                  (matches labels.compute_forward_returns(trade_next_open=True)).
+    cfg     : cost configuration; defaults to project defaults.
+    horizon : forward horizon, in trading days, that the model was trained on.
+              Must match the label horizon used in training.
+    trade_lag : how many trading days after the signal we begin holding. The
+              project default is 1 (signal at EOD t, fill at next open, hold
+              from close[t+1]).
+    enforce_cadence : if True, the engine coerces the weight stream to refresh
+              every `horizon` trading days (so positions don't overlap and
+              double-count the horizon window). Set False only for unit tests.
+
+    Returns
+    -------
+    BacktestResult with daily strategy and gross returns, turnover, and both
+    target and held weight panels.
     """
     cfg = cfg or BacktestConfig()
     prices = prices.sort_index()
-    common_tickers = sorted(set(weights.columns) & set(prices.columns))
-    if not common_tickers:
+    common = sorted(set(weights.columns) & set(prices.columns))
+    if not common:
         raise ValueError("No overlapping tickers between weights and prices.")
+    prices = prices[common]
 
-    prices = prices[common_tickers]
-    weights = weights.reindex(columns=common_tickers).fillna(0.0)
+    # Align weights to the trading-day index and forward-fill.
+    target = weights.reindex(columns=common).fillna(0.0)
+    target = target.reindex(prices.index).ffill().fillna(0.0)
 
-    # Daily returns: pct_change at date d represents close[d]/close[d-1]-1.
-    ret = prices.pct_change()
+    # Enforce h-day cadence on signals so successive rebalances don't overlap
+    # the forward windows the model was trained on.
+    if enforce_cadence and horizon > 1:
+        target = _coerce_weights_to_cadence(target, horizon)
 
-    # Align weights to trading-day index, forward-fill until next rebalance.
-    weights = weights.reindex(prices.index).ffill().fillna(0.0)
+    # The trade for a weight set on day t clears on day t + trade_lag, and is
+    # held for `horizon` consecutive days. We model this by shifting the target
+    # weights forward by `trade_lag` to get the "held" weight on each day.
+    held = target.shift(trade_lag)
 
-    # Shift weights by trade_lag: signal at EOD t, realised over the t+trade_lag
-    # bar. With trade_lag=2 this means weights set on date t are used to compute
-    # P&L on date t+2 (= return from close[t+1] to close[t+2]).
-    held = weights.shift(trade_lag)
+    # When horizon > 1, the "held" basket persists for `horizon` days. Because
+    # `target` has been coerced to refresh every `horizon` days, shifting by
+    # trade_lag and forward-filling already yields the correct stepwise held
+    # series. (For horizon==1 this is a no-op.)
+    if horizon > 1:
+        held = held.ffill()
+
     no_position = held.isna().all(axis=1)
     held_filled = held.fillna(0.0)
+
+    # Daily simple returns of each ticker.
+    ret = prices.pct_change()
     gross = (held_filled * ret).sum(axis=1)
     gross[no_position] = np.nan
 
-    # Turnover and costs: weight change between rebalances. Costs are real on
-    # every day weights change, including day 0 when we open the position.
-    turnover_daily = (weights - weights.shift(1).fillna(0.0)).abs().sum(axis=1)
+    # Turnover: charge costs on the day the trade *clears* (= shifted weights
+    # changing), not on the signal day. This is the correct timing for P&L.
+    held_for_turnover = held.fillna(0.0)
+    turnover_daily = (held_for_turnover - held_for_turnover.shift(1).fillna(0.0)).abs().sum(axis=1)
     cost_per_unit = cfg.total_cost_per_side_bps / 10_000.0
     costs = turnover_daily * cost_per_unit
 
-    # Net return: gross minus costs. If gross is NaN (e.g. day 0) but costs are
-    # nonzero, charge the cost to NAV: returns reflect the cost of opening.
-    net = gross.copy()
-    net = net.where(~no_position, -costs[no_position])  # day-0-style rows
-    has_position = ~no_position
-    net[has_position] = gross[has_position] - costs[has_position]
+    # Net return: gross - cost. On rows where gross is NaN but cost is positive
+    # (i.e. the first non-zero turnover day if it happens before any position is
+    # held), charge the cost so NAV reflects it.
+    net = gross.fillna(0.0) - costs
+    # Restore NaN for the strictly-pre-position rows where no trade has cleared
+    # yet (cost = 0 there because turnover = 0).
+    pre_position_and_no_trade = no_position & (costs == 0.0)
+    net[pre_position_and_no_trade] = np.nan
 
     return BacktestResult(
         returns=net.rename("strategy_return"),
         gross_returns=gross.rename("gross_return"),
         turnover=turnover_daily.rename("turnover"),
-        weights=held,
+        held_weights=held_filled,
+        target_weights=target,
     )

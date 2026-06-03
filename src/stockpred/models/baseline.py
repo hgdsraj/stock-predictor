@@ -37,13 +37,16 @@ def fit_predict_proba(
     y_train: pd.Series,
     X_test: pd.DataFrame,
 ) -> pd.Series:
-    """Fit on (X_train, y_train), return predicted P(y=1) on X_test."""
-    # Drop rows where label is NaN.
+    """Fit on (X_train, y_train), return predicted P(y=1) on X_test.
+
+    Test rows that are entirely NaN in the original `X_test` (i.e. the model
+    has no real features to act on) produce NaN predictions instead of
+    base-rate predictions from the median imputer (review finding M3).
+    """
     mask = y_train.notna()
     Xt = X_train.loc[mask]
     yt = y_train.loc[mask].astype(int)
 
-    # Drop columns that are entirely NaN in train (would break imputer).
     keep_cols = Xt.columns[Xt.notna().any(axis=0)]
     Xt = Xt[keep_cols]
     Xs = X_test[keep_cols]
@@ -51,6 +54,12 @@ def fit_predict_proba(
     if Xt.empty or yt.nunique() < 2:
         return pd.Series(np.nan, index=X_test.index)
 
+    # Identify test rows that have no usable signal at all -- they will get
+    # NaN below regardless of imputer behaviour.
+    all_nan_mask = Xs.isna().all(axis=1)
+
     pipe.fit(Xt.values, yt.values)
     proba = pipe.predict_proba(Xs.values)[:, 1]
-    return pd.Series(proba, index=X_test.index, name="proba_up")
+    out = pd.Series(proba, index=X_test.index, name="proba_up")
+    out[all_nan_mask] = np.nan
+    return out

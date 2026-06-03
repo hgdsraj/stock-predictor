@@ -31,12 +31,17 @@ def _fig_to_b64(fig: plt.Figure) -> str:
 
 
 def _equity_chart(returns: pd.Series, benchmark: pd.Series | None) -> str:
-    cum = (1 + returns.fillna(0)).cumprod()
+    # L6 fix: plot only on dates with real returns, so NaN stretches don't
+    # appear as flat (== "no drawdown / no movement") in the chart.
+    r = returns.dropna()
+    cum = (1 + r).cumprod()
     fig, ax = plt.subplots(figsize=(10, 4))
     ax.plot(cum.index, cum.values, label="strategy", linewidth=1.5)
     if benchmark is not None:
-        bcum = (1 + benchmark.fillna(0)).cumprod()
-        ax.plot(bcum.index, bcum.values, label="benchmark", linewidth=1.0, alpha=0.7)
+        bench = benchmark.reindex(cum.index).dropna()
+        if not bench.empty:
+            bcum = (1 + bench).cumprod()
+            ax.plot(bcum.index, bcum.values, label="benchmark", linewidth=1.0, alpha=0.7)
     ax.set_title("Equity curve")
     ax.set_ylabel("Growth of $1")
     ax.grid(True, alpha=0.3)
@@ -45,7 +50,8 @@ def _equity_chart(returns: pd.Series, benchmark: pd.Series | None) -> str:
 
 
 def _drawdown_chart(returns: pd.Series) -> str:
-    cum = (1 + returns.fillna(0)).cumprod()
+    r = returns.dropna()
+    cum = (1 + r).cumprod()
     peak = cum.cummax()
     dd = cum / peak - 1
     fig, ax = plt.subplots(figsize=(10, 3))
@@ -57,15 +63,21 @@ def _drawdown_chart(returns: pd.Series) -> str:
 
 
 def _yearly_table(returns: pd.Series) -> str:
+    # M6 fix: per-column formatting, no shared `float_format` rule that
+    # conflates Sharpe (~1.2) and returns (%).
     yearly = returns.groupby(returns.index.year).agg(
         ret=lambda r: (1 + r).prod() - 1,
         sharpe=lambda r: (r.mean() / r.std() * (252**0.5)) if r.std() else float("nan"),
         max_dd=max_drawdown,
         n=len,
     )
-    return yearly.to_html(
-        classes="tbl", float_format=lambda x: f"{x:.2%}" if abs(x) < 100 else f"{x:.2f}"
-    )
+    formatters = {
+        "ret": lambda x: f"{x:.2%}" if pd.notna(x) else "—",
+        "sharpe": lambda x: f"{x:+.2f}" if pd.notna(x) else "—",
+        "max_dd": lambda x: f"{x:.2%}" if pd.notna(x) else "—",
+        "n": lambda x: f"{int(x)}" if pd.notna(x) else "—",
+    }
+    return yearly.to_html(classes="tbl", formatters=formatters)
 
 
 HTML_TEMPLATE = """<!doctype html>

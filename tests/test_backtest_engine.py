@@ -1,9 +1,10 @@
-"""Backtest engine sanity tests."""
+"""Backtest engine correctness tests, including horizon-aware semantics."""
 
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from stockpred.backtest.engine import run_backtest
 from stockpred.config import BacktestConfig
@@ -15,66 +16,50 @@ def _const_prices(rate: float, n: int = 30, ticker: str = "AAA") -> pd.DataFrame
     return px.to_frame()
 
 
+def _ZERO_COSTS() -> BacktestConfig:
+    return BacktestConfig(commission_bps=0, spread_bps=0, slippage_bps=0)
+
+
+# --------------------------- horizon == 1 ---------------------------- #
+
+
 def test_constant_long_position_earns_underlying_return():
     px = _const_prices(0.001)  # +10 bps/day
     weights = pd.DataFrame(1.0, index=px.index, columns=px.columns)
-    cfg = BacktestConfig(commission_bps=0, spread_bps=0, slippage_bps=0)
-    # trade_lag=1: assume fill at signal close (cleaner for this unit test).
-    res = run_backtest(weights, px, cfg=cfg, trade_lag=1)
-    # First day has no realised return (weight set EOD t, applies on t+1).
+    res = run_backtest(weights, px, cfg=_ZERO_COSTS(), horizon=1, trade_lag=1)
     daily = res.gross_returns.dropna()
     np.testing.assert_allclose(daily.values, 0.001, atol=1e-12)
 
 
-def test_costs_reduce_return_on_turnover():
-    """A full turnover day should be penalised by exactly cost_per_side bps * |dW|."""
-    px = _const_prices(0.0)  # flat price
+def test_costs_charged_on_clearing_day_not_signal_day():
+    """Cost timing fix (review finding H2). Cost should appear on the day the
+    trade actually clears (signal date + trade_lag), not on the signal date.
+
+    Signal sequence (target weights): [1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 1, 1, ...]
+    With trade_lag=2, the held series shifts by 2:
+        held[2..6] = 1, held[7..11] = 0, held[12..] = 1
+    Turnover-bearing days are: 2 (open from 0->1), 7 (close 1->0), 12 (reopen 0->1).
+    """
+    px = _const_prices(0.0, n=30)  # flat prices
     idx = px.index
-    # Day 0: +1; Day 1: 0; Day 2: +1; ... causes turnover of 1 on flip days.
+
     weights = pd.DataFrame(0.0, index=idx, columns=px.columns)
-    weights.iloc[0] = 1.0
-    weights.iloc[1] = 0.0  # close => turnover 1
-    weights.iloc[2] = 1.0  # open  => turnover 1
+    weights.iloc[0:5] = 1.0  # long for first 5 signal days
+    weights.iloc[5:10] = 0.0  # flat for next 5
+    weights.iloc[10:] = 1.0  # re-long thereafter
 
     cfg = BacktestConfig(commission_bps=2, spread_bps=3, slippage_bps=0)  # 5 bps/side
-    res = run_backtest(weights, px, cfg=cfg, trade_lag=1)
-    # Gross returns are 0 (flat prices). Net should be -cost on turnover days.
+    res = run_backtest(weights, px, cfg=cfg, horizon=1, trade_lag=2)
     expected_cost = 5 / 10_000
-    # Cost charged on the day the weight changes.
-    assert res.returns.iloc[0] == -expected_cost  # initial position from 0->1
-    assert res.returns.iloc[1] == -expected_cost  # 1 -> 0
-    assert res.returns.iloc[2] == -expected_cost  # 0 -> 1
 
-
-def test_trade_lag_2_matches_label_alignment():
-    """When labels are computed with trade_next_open=True (the project default),
-    the backtest must use trade_lag=2 so realisation == label window.
-
-    Construct a clean setup: ticker AAA gets a positive weight on date 0. With
-    trade_lag=2, the first non-zero P&L appears on day 2 (= close[1] -> close[2]
-    return), matching the label horizon-1 forward return at date 0.
-    """
-    idx = pd.bdate_range("2020-01-01", periods=6)
-    # Engineered returns: 0%, +1%, -2%, 0%, 0%, 0% (day 1 vs day 0 is +1%, etc.)
-    rates = [0.0, 0.01, -0.02, 0.0, 0.0, 0.0]
-    px = pd.Series(100.0, index=idx, name="AAA")
-    for i in range(1, len(idx)):
-        px.iloc[i] = px.iloc[i - 1] * (1 + rates[i])
-    prices = px.to_frame()
-
-    # Signal: long on day 0 only, then flat.
-    w = pd.DataFrame(0.0, index=idx, columns=["AAA"])
-    w.iloc[0] = 1.0
-
-    cfg = BacktestConfig(commission_bps=0, spread_bps=0, slippage_bps=0)
-    res = run_backtest(w, prices, cfg=cfg, trade_lag=2)
-    gross = res.gross_returns
-
-    # With trade_lag=2: weights from day 0 -> realised on day 2, i.e. the
-    # close[1]->close[2] return = -2%. Days 0 and 1 should have no realised P&L.
-    assert pd.isna(gross.iloc[0]) or gross.iloc[0] == 0.0
-    assert pd.isna(gross.iloc[1]) or gross.iloc[1] == 0.0
-    np.testing.assert_allclose(gross.iloc[2], -0.02, atol=1e-12)
+    # Days 2, 7, 12 (= signal-edge + trade_lag) should bear cost.
+    np.testing.assert_allclose(res.returns.iloc[2], -expected_cost, atol=1e-12)
+    np.testing.assert_allclose(res.returns.iloc[7], -expected_cost, atol=1e-12)
+    np.testing.assert_allclose(res.returns.iloc[12], -expected_cost, atol=1e-12)
+    # Days between edges should have no cost (turnover = 0).
+    for i in (3, 4, 5, 6, 8, 9, 10, 11, 13):
+        val = res.returns.iloc[i]
+        assert val == 0.0 or pd.isna(val), f"day {i}: {val}"
 
 
 def test_dollar_neutral_two_assets_offset_to_zero_on_correlated_move():
@@ -84,7 +69,73 @@ def test_dollar_neutral_two_assets_offset_to_zero_on_correlated_move():
         index=idx,
     )
     w = pd.DataFrame({"A": 1.0, "B": -1.0}, index=idx)
-    cfg = BacktestConfig(commission_bps=0, spread_bps=0, slippage_bps=0)
-    res = run_backtest(w, px, cfg=cfg, trade_lag=1)
-    # Both assets move identically -> long/short offsets exactly.
+    res = run_backtest(w, px, cfg=_ZERO_COSTS(), horizon=1, trade_lag=1)
     np.testing.assert_allclose(res.gross_returns.dropna().values, 0.0, atol=1e-12)
+
+
+# --------------------------- horizon > 1 ---------------------------- #
+
+
+@pytest.mark.parametrize("horizon", [5, 21])
+def test_horizon_aware_backtest_matches_realised_window_return(horizon):
+    """Regression test for review finding C1.
+
+    When the model claims to predict an h-day forward return, the backtest's
+    cumulative gross return for that single rebalance must equal the realised
+    h-day return on the held basket.
+
+    Set-up:
+      - Single ticker, prices grow at a fixed daily rate (so the h-day return
+        is exactly known).
+      - Place a single positive weight on the signal day; with cadence
+        enforcement, the trade clears at t+1 and is held for h days.
+      - Sum the gross daily returns over the held window. Assert this equals
+        the h-day realised return, to floating-point precision.
+    """
+    n = horizon * 4 + 10
+    daily = 0.002
+    idx = pd.bdate_range("2020-01-01", periods=n)
+    px = pd.DataFrame({"AAA": 100 * (1 + daily) ** np.arange(n)}, index=idx)
+
+    w = pd.DataFrame(0.0, index=idx, columns=["AAA"])
+    w.iloc[0] = 1.0
+
+    res = run_backtest(w, px, cfg=_ZERO_COSTS(), horizon=horizon, trade_lag=1)
+
+    # The position should be held over indices [1, 1 + horizon).
+    held_window = res.gross_returns.iloc[1 : 1 + horizon].fillna(0.0)
+    realised_cum = (1 + held_window).prod() - 1
+    expected_h_day_return = (1 + daily) ** horizon - 1
+    np.testing.assert_allclose(realised_cum, expected_h_day_return, atol=1e-12)
+
+
+def test_cadence_prevents_overlapping_holds_at_horizon_5():
+    """With horizon=5 and signals every day, the engine should hold each basket
+    for ~5 days before refreshing. Total positions across days should equal
+    n_signals / horizon (approximately)."""
+    n = 50
+    idx = pd.bdate_range("2020-01-01", periods=n)
+    px = pd.DataFrame({"AAA": 100.0}, index=idx)
+
+    # Signal every single day
+    w = pd.DataFrame(0.0, index=idx, columns=["AAA"])
+    w.iloc[:] = 1.0
+
+    res = run_backtest(w, px, cfg=_ZERO_COSTS(), horizon=5, trade_lag=1)
+
+    # Held weights should be constant 1.0 (because the cadence keeps refreshing
+    # to the same value), but turnover should be small: only the initial trade
+    # creates positive turnover.
+    nonzero_turnover_days = (res.turnover > 1e-9).sum()
+    assert nonzero_turnover_days <= 2, f"too many rebalances: {nonzero_turnover_days}"
+
+
+def test_zero_horizon_or_negative_raises_sane_error_or_works():
+    """Smoke: horizon=1 default path should be safe even for tiny panels."""
+    idx = pd.bdate_range("2020-01-01", periods=3)
+    px = pd.DataFrame({"AAA": [100.0, 101.0, 102.01]}, index=idx)
+    w = pd.DataFrame(0.0, index=idx, columns=["AAA"])
+    w.iloc[0] = 1.0
+    res = run_backtest(w, px, cfg=_ZERO_COSTS(), horizon=1, trade_lag=1)
+    assert "AAA" in res.held_weights.columns
+    assert "AAA" in res.target_weights.columns

@@ -83,3 +83,28 @@ def test_read_html_takes_stringio_not_raw_string(monkeypatch):
     # Should not raise OSError.
     tables = universe_mod._read_html_tables("http://example.com")
     assert isinstance(tables, list) and len(tables) >= 1
+
+
+def test_members_on_strict_boundary_for_removal_date():
+    """Regression test for review finding H3.
+
+    A ticker removed on date D must NOT appear in members_on(D). Using `>=`
+    would leak forward-looking information about the delisting.
+    """
+    removal_date = pd.Timestamp("2020-06-15")
+    fake_membership = pd.DataFrame(
+        {
+            "ticker": ["ZZZ", "AAA"],
+            "start_date": [pd.Timestamp("2010-01-01"), pd.NaT],  # ZZZ joined 2010, AAA always
+            "end_date": [removal_date, pd.NaT],
+        }
+    )
+
+    # On removal_date itself: ZZZ is GONE.
+    members = universe_mod.members_on(removal_date, membership=fake_membership)
+    assert "AAA" in members
+    assert "ZZZ" not in members, "ticker removed on date D must not be in members_on(D)"
+
+    # On removal_date - 1: ZZZ is still in.
+    prev = universe_mod.members_on(removal_date - pd.Timedelta(days=1), membership=fake_membership)
+    assert "ZZZ" in prev

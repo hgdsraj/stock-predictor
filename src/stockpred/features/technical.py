@@ -89,8 +89,13 @@ def compute_technical_features(
     feats["dist_low_252"] = (close - lo252) / lo252
 
     if volume is not None and not volume.empty:
+        # NOTE (H5): when `close` is adjusted, `close * volume` is NOT raw dollar
+        # volume — both have been adjusted for splits in opposite directions, and
+        # the dividend adjustment is not reversed by the multiplication. We treat
+        # this as a *proxy* for liquidity ranking, not a true dollar volume.
+        # If raw OHLCV is available, prefer `raw_close * raw_volume`.
         dv = (close * volume).replace(0, np.nan)
-        feats["adv_21"] = np.log(dv.rolling(21, min_periods=10).mean())
+        feats["adv_proxy_21"] = np.log(dv.rolling(21, min_periods=10).mean())
 
     feats["skew_21"] = log_ret.rolling(21, min_periods=21).skew()
     feats["kurt_63"] = log_ret.rolling(63, min_periods=63).kurt()

@@ -51,7 +51,8 @@ class PipelineConfig:
 
     start_date: str = "2010-01-01"  # default narrower for faster first run
     end_date: str | None = None
-    n_tickers: int | None = 100  # most liquid current S&P 500 names; None = all
+    n_tickers: int | None = 100  # subset of S&P 500; None = full historical universe
+    universe_sampling: str = "random"  # one of {"random", "current", "first"}
     horizon: int = 1  # which horizon to train baseline on
     k_per_side: int = 20  # long-short top-k
     cost_bps_per_side: float = 6.0
@@ -64,17 +65,64 @@ class PipelineConfig:
 def select_universe(
     cfg: PipelineConfig,
 ) -> tuple[list[str], pd.DataFrame]:
-    """Choose tickers and return their membership frame."""
+    """Choose tickers and return their membership frame.
+
+    Universe selection rules (M4 fix — no silent survivorship):
+      * Default: returns the full set of historical members in the date range.
+      * If `cfg.n_tickers` is set, the function uses `cfg.universe_sampling`
+        to decide HOW to pick the subset:
+            "random"  -> deterministic random sample (seeded by cfg.start_date),
+                         the only choice that does not introduce survivorship bias.
+            "current" -> take currently-listed names first. This INTRODUCES
+                         SURVIVORSHIP BIAS. A loud warning is emitted.
+            "first"   -> alphabetical first N (still mildly biased, but at
+                         least transparent).
+    """
+    import logging
+
+    log = logging.getLogger(__name__)
+
     membership = universe_mod.fetch_sp500_membership(refresh=cfg.refresh_data)
-    tickers = universe_mod.all_tickers_in_range(cfg.start_date, cfg.end_date, membership=membership)
-    if cfg.n_tickers is not None and len(tickers) > cfg.n_tickers:
-        # Prefer current constituents (open intervals end_date NaT)
+    all_tickers = universe_mod.all_tickers_in_range(
+        cfg.start_date, cfg.end_date, membership=membership
+    )
+
+    if cfg.n_tickers is None or len(all_tickers) <= cfg.n_tickers:
+        return all_tickers, membership
+
+    sampling = getattr(cfg, "universe_sampling", "random")
+    if sampling == "current":
+        log.warning(
+            "Universe sampling='current' selects only currently-listed names. "
+            "This is a SURVIVORSHIP-BIASED experiment and any positive backtest "
+            "result should be discounted heavily."
+        )
         current = sorted(membership[membership["end_date"].isna()]["ticker"].unique())
         if len(current) >= cfg.n_tickers:
-            tickers = current[: cfg.n_tickers]
-        else:
-            tickers = tickers[: cfg.n_tickers]
-    return tickers, membership
+            return current[: cfg.n_tickers], membership
+        return all_tickers[: cfg.n_tickers], membership
+    if sampling == "first":
+        log.info(
+            "Universe sampling='first' (alphabetical). Mildly biased toward "
+            "early-letter tickers; for unbiased samples use 'random'."
+        )
+        return all_tickers[: cfg.n_tickers], membership
+    # Default: deterministic random sample.
+    import hashlib
+
+    seed = int(
+        hashlib.sha256(f"{cfg.start_date}|{cfg.end_date}".encode()).hexdigest()[:8],
+        16,
+    )
+    rng = np.random.default_rng(seed)
+    chosen = sorted(rng.choice(all_tickers, size=cfg.n_tickers, replace=False).tolist())
+    log.info(
+        "Universe sampling='random' (seeded=%d): chose %d / %d tickers",
+        seed,
+        len(chosen),
+        len(all_tickers),
+    )
+    return chosen, membership
 
 
 def build_feature_matrix(close: pd.DataFrame, volume: pd.DataFrame | None) -> pd.DataFrame:
@@ -207,10 +255,11 @@ def run_phase1(cfg: PipelineConfig | None = None) -> dict:
         weights = weights.loc[keep_rows].reindex(weights.index).ffill().fillna(0.0)
 
     bt_cfg = BacktestConfig()
-    # trade_lag=2 because labels are computed with trade_next_open=True
-    # (forward return from close[t+1] to close[t+1+h]). The backtester must
-    # realise P&L over the SAME window the model was trained to predict.
-    res = run_backtest(weights, close, cfg=bt_cfg, trade_lag=2)
+    # Horizon-aware backtest. Labels are forward-h returns over close[t+1] to
+    # close[t+1+h] (trade_lag=1, horizon=h). The engine accumulates the same
+    # window and enforces a h-day rebalance cadence so successive positions
+    # don't overlap and double-count.
+    res = run_backtest(weights, close, cfg=bt_cfg, horizon=cfg.horizon, trade_lag=1)
     metrics = tearsheet_metrics(res.returns)
     log.info("Backtest metrics: %s", metrics)
 

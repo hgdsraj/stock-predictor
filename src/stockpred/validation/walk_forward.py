@@ -1,23 +1,27 @@
 """Purged + embargoed walk-forward cross-validation.
 
 Reference: Marcos López de Prado, *Advances in Financial Machine Learning*
-(Chapter 7), with simplifications appropriate for daily horizon labels.
+(Chapter 7), simplified for daily forward-horizon labels.
 
-Why this matters:
+Why this matters
+----------------
+When labels are *forward-looking* over h trading days, the label for date t
+depends on prices through date t+h. A naive train/test split where train ends
+at t and test starts at t+1 leaks: the last label in train uses prices that
+fall inside the test window. We defend with two devices:
 
-When labels are *forward-looking* over h days, the label for date t depends on
-prices through date t+h. A naive train/test split where train ends at t and
-test starts at t+1 leaks: the last label in train uses prices that are also in
-the test window. We fix this two ways:
+1. **Purging.** Drop from training any observation whose label window overlaps
+   the test window.
+2. **Embargo.** Drop a small buffer between the end of training and the start
+   of testing, to also prevent leakage from serial correlation in features.
 
-1. **Purging**: drop from the training set any observation whose label window
-   overlaps the test window.
-2. **Embargo**: drop a small buffer after the test window before the next
-   training fold begins, to prevent serial correlation leakage in the other
-   direction.
+**Embargo must be in trading days, not calendar days.** A 10 *calendar* day
+buffer is only ~7 trading days; for a 21-trading-day horizon, that leaves
+~14 days of overlap → real leakage. We use positional offsets into the sorted
+unique trading-date index, which is unambiguous.
 
-The splitter yields (train_idx, test_idx) tuples for use with sklearn-style
-fit/predict loops.
+The splitter yields (train_idx, test_idx) tuples of positional indices into
+the sorted unique date set.
 """
 
 from __future__ import annotations
@@ -31,47 +35,64 @@ import pandas as pd
 
 @dataclass(frozen=True)
 class WalkForwardSplit:
-    """Expanding-window walk-forward splitter."""
+    """Expanding-window walk-forward splitter.
+
+    Attributes
+    ----------
+    train_years : initial training window length, in calendar years.
+    test_months : test window length per fold, in calendar months.
+    embargo_days : buffer between end of train and start of test, in
+        **trading days**. Should be >= max forward-label horizon. Default 25
+        comfortably covers horizons up to 21 trading days plus safety margin.
+    min_train_obs : minimum number of training observations needed for a fold
+        to be yielded.
+    """
 
     train_years: int = 5
     test_months: int = 6
-    embargo_days: int = 10  # should be >= max label horizon
+    embargo_days: int = 25  # trading days; should be >= max label horizon
     min_train_obs: int = 1000
 
     def split(self, dates: pd.DatetimeIndex) -> Iterator[tuple[np.ndarray, np.ndarray]]:
-        """Yield (train_idx, test_idx) into `dates`.
-
-        `dates` is the *sorted unique* set of observation dates.
-        """
+        """Yield (train_idx, test_idx) into `dates` (sorted unique trading days)."""
         dates = pd.DatetimeIndex(dates).unique().sort_values()
-        if len(dates) == 0:
+        n = len(dates)
+        if n == 0:
             return
 
         first = dates[0]
-        # Initial train window end.
-        train_end = first + pd.DateOffset(years=self.train_years)
+        train_end_calendar = first + pd.DateOffset(years=self.train_years)
 
-        while train_end < dates[-1]:
-            test_start = train_end + pd.Timedelta(days=1)
-            test_end = test_start + pd.DateOffset(months=self.test_months) - pd.Timedelta(days=1)
-            if test_end > dates[-1]:
-                test_end = dates[-1]
+        while train_end_calendar < dates[-1]:
+            test_start_calendar = train_end_calendar + pd.Timedelta(days=1)
+            test_end_calendar = (
+                test_start_calendar + pd.DateOffset(months=self.test_months) - pd.Timedelta(days=1)
+            )
+            if test_end_calendar > dates[-1]:
+                test_end_calendar = dates[-1]
 
-            # Embargo: cut a buffer at the end of train to prevent label leakage
-            # from train into test.
-            purge_cut = test_start - pd.Timedelta(days=self.embargo_days)
+            # Locate test window in trading-day positions.
+            test_start_pos = int(dates.searchsorted(test_start_calendar, side="left"))
+            test_end_pos = int(dates.searchsorted(test_end_calendar, side="right")) - 1
 
-            train_mask = dates <= purge_cut
-            test_mask = (dates >= test_start) & (dates <= test_end)
+            if test_start_pos > test_end_pos:
+                # Test window contains no trading days; advance.
+                train_end_calendar = test_end_calendar
+                continue
 
-            train_idx = np.where(train_mask)[0]
-            test_idx = np.where(test_mask)[0]
+            # Embargo: cut N TRADING DAYS before the first test day.
+            purge_pos = max(0, test_start_pos - self.embargo_days) - 1
+            if purge_pos < 0:
+                train_idx = np.array([], dtype=np.int64)
+            else:
+                train_idx = np.arange(0, purge_pos + 1, dtype=np.int64)
+
+            test_idx = np.arange(test_start_pos, test_end_pos + 1, dtype=np.int64)
 
             if len(train_idx) >= self.min_train_obs and len(test_idx) > 0:
                 yield train_idx, test_idx
 
-            # Slide forward by one test window.
-            train_end = test_end
+            train_end_calendar = test_end_calendar
 
 
 def time_aware_filter(
