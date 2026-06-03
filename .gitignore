@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.python-version
+
+# uv
+.uv/
+
+# Data + cache (NEVER commit)
+data/
+cache/
+*.parquet
+*.feather
+*.csv
+!tests/fixtures/*.csv
+!configs/*.csv
+
+# Notebooks
+.ipynb_checkpoints/
+*.ipynb_meta
+
+# Reports / models
+reports/*.html
+reports/*.png
+models/*.pkl
+models/*.txt
+models/*.lgb
+
+# OS / editors
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Logs
+*.log
+logs/

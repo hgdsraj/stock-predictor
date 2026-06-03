@@ -1,0 +1,70 @@
+[project]
+name = "stock-predictor"
+version = "0.1.0"
+description = "Cross-sectional directional forecaster for S&P 500 equities."
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+authors = [{ name = "mahey" }]
+
+dependencies = [
+    # Data
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "pyarrow>=15",
+    "yfinance>=0.2.50",
+    "pandas-datareader>=0.10",   # FRED macro data
+    "requests>=2.32",
+    "lxml>=5",                   # for pd.read_html on Wikipedia
+    "beautifulsoup4>=4.12",
+    "html5lib>=1.1",
+
+    # ML
+    "scikit-learn>=1.5",
+    "lightgbm>=4.5",
+    "scipy>=1.13",
+
+    # Backtest / reporting
+    "matplotlib>=3.9",
+    "tqdm>=4.66",
+    "pyyaml>=6.0",
+
+    # CLI
+    "typer>=0.12",
+    "rich>=13",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-cov>=5",
+    "ruff>=0.6",
+    "mypy>=1.10",
+    "ipykernel>=6.29",
+    "jupyterlab>=4.2",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Pin public PyPI so the project resolves on any machine, independent of any
+# corp-internal package mirrors that may be configured system-wide.
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple/"
+default = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/stockpred"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "N", "SIM", "RUF"]
+ignore = ["E501"]  # let formatter handle line length
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -q"
