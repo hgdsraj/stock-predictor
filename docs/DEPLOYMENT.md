@@ -169,12 +169,13 @@ Backups: a daily cron line on the host:
 
 ## Environment variables (all optional)
 
-| Var                          | Default                     | Meaning                                 |
-| ---------------------------- | --------------------------- | --------------------------------------- |
-| `STOCKPRED_DB`               | `data/app.db`               | SQLite file path                        |
-| `STOCKPRED_WEB_DIST`         | `web/dist`                  | Directory holding the built SPA         |
-| `STOCKPRED_DISABLE_SCHEDULER`| `0`                         | Set `1` to skip APScheduler at startup  |
-| `STOCKPRED_CORS`             | `*`                         | Comma-separated allowed origins         |
+| Var                          | Default                                           | Meaning                                                                                       |
+| ---------------------------- | ------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `STOCKPRED_DB`               | `data/app.db`                                     | SQLite file path                                                                              |
+| `STOCKPRED_WEB_DIST`         | `web/dist`                                        | Directory holding the built SPA                                                               |
+| `STOCKPRED_DISABLE_SCHEDULER`| `0`                                               | Set `1` to skip APScheduler at startup                                                        |
+| `STOCKPRED_CORS`             | `http://localhost:5173,http://127.0.0.1:8000`     | Comma-separated allowed origins. Use `"*"` to widen (no credentials allowed in that mode).    |
+| `STOCKPRED_API_KEY`          | *(unset → write endpoints disabled)*              | Secret value. `POST /jobs/refresh` requires header `X-API-Key: <value>`.                       |
 
 ## Updating
 
@@ -193,7 +194,10 @@ Alembic migration script and noted in the commit message.
 ### Trigger a refresh from CLI
 
 ```bash
-curl -X POST http://localhost:8000/jobs/refresh
+# STOCKPRED_API_KEY must be set on the server. Without it, the write
+# endpoints are disabled (403). With it, every request must carry the
+# X-API-Key header.
+curl -X POST -H "X-API-Key: $STOCKPRED_API_KEY" http://localhost:8000/jobs/refresh
 # returns: {"job_id": "<uuid>", "status": "queued"}
 
 curl http://localhost:8000/jobs/<uuid>
@@ -230,13 +234,28 @@ hookup is a 3-line code change in `jobs.py`; left as an exercise for now).
 
 ## Security notes
 
-- The API has **no authentication**. Do not expose it to the public internet
-  without putting an auth layer (Caddy Basic Auth, Cloudflare Access,
-  Tailscale, a reverse-proxy with OIDC) in front.
-- The container runs as root by default — switch to a dedicated user with a
-  `USER` directive in your private fork before production exposure.
-- `STOCKPRED_CORS=*` is convenient locally but should be locked down in
-  production.
+- **Read endpoints** (`/healthz`, `/tickers`, `/predictions/latest`,
+  `/runs`, `/backtest/summary`, …) are public. Treat the data as
+  research output, not anything sensitive.
+- **Write endpoints** (`POST /jobs/refresh`) are gated by `STOCKPRED_API_KEY`.
+  If the env var is unset, they return 403; if set, every request must carry
+  `X-API-Key: <value>`. This protects against drive-by CSRF — anyone can hit
+  the read endpoints, but only holders of the key can trigger an expensive
+  pipeline run.
+- **CORS** defaults to `localhost:5173,127.0.0.1:8000`. Widen via
+  `STOCKPRED_CORS` only when you know what you're doing. The wildcard `*`
+  silently disables `allow_credentials` (browsers reject `*` + credentials
+  per spec).
+- **The container runs as a non-root user** (UID 1001) by default. The
+  `./data` volume must be writable by this user. On most hosts `chown -R
+  1001:1001 ./data` once at install does the trick.
+- **No transport encryption** is configured inside the container; put a
+  reverse proxy (Caddy / nginx / Cloudflare Tunnel) in front for HTTPS.
+- **Path traversal in the SPA fallback** is explicitly defended against
+  (test: `tests/test_backend_api.py::test_spa_fallback_rejects_path_traversal`).
+- For sensitive deployments, add an upstream auth layer (Cloudflare Access,
+  Tailscale, OIDC via Caddy `forward_auth`). This project's API key is a
+  drive-by deterrent, not a substitute for proper auth.
 
 ## What this project will NOT do for you
 

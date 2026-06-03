@@ -16,11 +16,17 @@ from fastapi.testclient import TestClient
 
 @pytest.fixture
 def app_client(tmp_path: Path, monkeypatch):
-    """Spin up a fresh FastAPI app with an isolated SQLite DB and no scheduler."""
+    """Spin up a fresh FastAPI app with an isolated SQLite DB and no scheduler.
+
+    Sets STOCKPRED_API_KEY=test so refresh endpoint can be exercised.
+    Sets STOCKPRED_CORS='*' to widen for tests that don't care about origin.
+    """
     db_path = tmp_path / "app.db"
     monkeypatch.setenv("STOCKPRED_DB", str(db_path))
     monkeypatch.setenv("STOCKPRED_DISABLE_SCHEDULER", "1")
-    # Ensure fresh module state (api uses module-level AppState).
+    monkeypatch.setenv("STOCKPRED_API_KEY", "test")
+    monkeypatch.setenv("STOCKPRED_CORS", "*")
+    # Ensure fresh module state (api uses module-level AppState + envs).
     import importlib
 
     import stockpred.backend.api as api_mod
@@ -199,3 +205,121 @@ def test_full_snapshot_round_trip(app_client, tmp_path):
     assert "run" in summary
     assert "equity_curve" in summary
     assert summary["run"]["metrics"]["sharpe"] == 0.5
+
+
+# --------------------------- security regressions ---------------------------
+
+
+def test_spa_fallback_rejects_path_traversal(app_client, tmp_path):
+    """Review finding C3: an attacker requesting /..%2F..%2Fetc%2Fpasswd must
+    NOT receive arbitrary file contents — they should get the SPA index."""
+    client, api_mod = app_client
+    # Create a synthetic SPA dist with a single index.html so the fallback fires.
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    (dist / "index.html").write_text("<html>spa</html>")
+    # Re-init the app with this dist path.
+    import importlib
+    import os
+
+    os.environ["STOCKPRED_WEB_DIST"] = str(dist)
+    importlib.reload(api_mod)
+    with TestClient(api_mod.app) as c:
+        # First, the index works.
+        r = c.get("/")
+        assert r.status_code == 200
+        assert "spa" in r.text
+
+        # Now an attempted traversal must fall through to the SPA index, not
+        # serve /etc/passwd or any other file outside the dist.
+        for attack in (
+            "../../../etc/passwd",
+            "..%2F..%2F..%2Fetc%2Fpasswd",
+            "..%5C..%5Cwindows%5Cwin.ini",
+            "%2e%2e/%2e%2e/etc/passwd",
+        ):
+            r = c.get(f"/{attack}")
+            # SPA fallback should serve index.html, not error out and not leak files.
+            assert r.status_code == 200
+            assert "root:" not in r.text  # /etc/passwd canary
+            assert "spa" in r.text
+
+
+def test_refresh_endpoint_requires_api_key(app_client):
+    """Review finding C1: POST /jobs/refresh must be gated."""
+    client, _ = app_client
+    # Without header: 401 because API key configured but not provided.
+    r = client.post("/jobs/refresh")
+    assert r.status_code == 401
+
+    # Wrong key: 401.
+    r = client.post("/jobs/refresh", headers={"X-API-Key": "wrong"})
+    assert r.status_code == 401
+
+
+def test_refresh_endpoint_disabled_when_no_api_key(tmp_path, monkeypatch):
+    """If STOCKPRED_API_KEY is unset, write endpoints return 403 (not 500)."""
+    monkeypatch.setenv("STOCKPRED_DB", str(tmp_path / "app.db"))
+    monkeypatch.setenv("STOCKPRED_DISABLE_SCHEDULER", "1")
+    monkeypatch.delenv("STOCKPRED_API_KEY", raising=False)
+    import importlib
+
+    import stockpred.backend.api as api_mod
+
+    importlib.reload(api_mod)
+    with TestClient(api_mod.app) as c:
+        r = c.post("/jobs/refresh")
+        assert r.status_code == 403
+        assert "STOCKPRED_API_KEY" in r.text
+
+
+def test_nan_metrics_serialise_as_null_not_NaN(app_client):
+    """Review finding H1: NaN/Inf in summary metrics must produce valid JSON
+    (null), not the non-RFC NaN token that breaks browser JSON parsers."""
+    import json as _json
+
+    from stockpred.backend import store
+    from stockpred.backend.db import session_scope
+
+    client, api_mod = app_client
+    SessionLocal = api_mod.AppState.SessionLocal
+
+    with session_scope(SessionLocal) as s:
+        run = store.create_run(s, config={}, note="nan-test")
+        store.complete_run(
+            s,
+            run,
+            summary={
+                "metrics": {
+                    "sharpe": float("nan"),
+                    "max_drawdown": float("-inf"),
+                    "ann_return": 0.1,
+                }
+            },
+        )
+
+    r = client.get("/backtest/summary")
+    assert r.status_code == 200
+    raw = r.text
+    # The literal "NaN" / "Infinity" tokens are not RFC-7159 valid JSON; their
+    # presence would crash browsers. We coerce to null in SafeJSONResponse.
+    assert "NaN" not in raw
+    assert "Infinity" not in raw
+    # Body must still be standard-parseable.
+    body = _json.loads(raw)
+    assert body["run"]["metrics"]["sharpe"] is None
+    assert body["run"]["metrics"]["max_drawdown"] is None
+    assert body["run"]["metrics"]["ann_return"] == 0.1
+
+
+def test_concurrent_refresh_returns_409(app_client):
+    """Review finding H2: a second refresh while one is in-flight must 409."""
+    client, api_mod = app_client
+    # Manually take the lock to simulate an in-flight job.
+    locked = api_mod._refresh_lock.acquire()
+    try:
+        assert locked
+        r = client.post("/jobs/refresh", headers={"X-API-Key": "test"})
+        assert r.status_code == 409
+    finally:
+        api_mod._refresh_lock.release()

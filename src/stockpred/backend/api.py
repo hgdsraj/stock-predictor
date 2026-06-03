@@ -21,14 +21,15 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import math
 import os
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 
@@ -47,11 +48,55 @@ WEB_DIST = os.environ.get(
     str((Path(__file__).resolve().parent.parent.parent.parent / "web" / "dist").resolve()),
 )
 
+# API key for write endpoints (POST /jobs/refresh). If unset, write endpoints
+# are disabled in deployments; localhost dev defaults to the convenience
+# value "dev" which is documented in README/DEPLOYMENT.
+WRITE_API_KEY = os.environ.get("STOCKPRED_API_KEY")
+
+# Concurrency lock so /jobs/refresh cannot kick off multiple in-flight
+# pipeline runs on the same process. APScheduler's daily job uses its own
+# coalesce=True+max_instances=1, but the on-demand endpoint needs its own
+# guard.
+_refresh_lock = threading.Lock()
+
+
+def _is_pipeline_running() -> bool:
+    """True if a refresh job is currently executing on this process."""
+    return _refresh_lock.locked()
+
 
 class AppState:
     engine = None
     SessionLocal = None
     scheduler = None
+
+
+# ----- JSON response: NaN/Inf -> null (RFC-7159 compliant) ----------------
+
+
+def _sanitize(value):
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _sanitize(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize(v) for v in value]
+    return value
+
+
+class SafeJSONResponse(JSONResponse):
+    """JSON response class that coerces NaN/Inf to null and forbids
+    non-conforming JSON output, so browsers can always parse the body."""
+
+    def render(self, content) -> bytes:
+        import json
+
+        return json.dumps(
+            _sanitize(content),
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
 
 
 @asynccontextmanager
@@ -77,20 +122,44 @@ def create_app() -> FastAPI:
         ),
         version="0.2.0",
         lifespan=lifespan,
+        default_response_class=SafeJSONResponse,  # NaN -> null, RFC 7159 valid
     )
 
-    # Permissive CORS so a separately-served frontend dev server can hit the API.
+    # CORS: restrict to explicit origins by default. Set STOCKPRED_CORS to a
+    # comma-separated list to widen. We intentionally do NOT pair "*" with
+    # allow_credentials=True (browsers reject the combo, and that combo is a
+    # CSRF vector once auth is added).
+    raw = os.environ.get("STOCKPRED_CORS", "http://localhost:5173,http://127.0.0.1:8000")
+    origins = [o.strip() for o in raw.split(",") if o.strip()]
+    wildcard = origins == ["*"]
+    if wildcard:
+        log.warning("STOCKPRED_CORS='*' — only safe for local development with no auth.")
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=os.environ.get("STOCKPRED_CORS", "*").split(","),
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_origins=origins,
+        allow_credentials=not wildcard,  # incompatible with "*" per spec
+        allow_methods=["GET", "POST"],
+        allow_headers=["Authorization", "Content-Type", "X-API-Key"],
     )
 
     register_routes(app)
     register_static(app)
     return app
+
+
+def _require_api_key(x_api_key: str | None = Header(default=None)) -> None:
+    """Guard write endpoints. Behavior:
+       - If STOCKPRED_API_KEY is unset, write endpoints are DISABLED (returns 403).
+       - If set, the header X-API-Key must equal it.
+    This protects against drive-by CSRF from any web page in any tab.
+    """
+    if WRITE_API_KEY is None:
+        raise HTTPException(
+            403,
+            "Write endpoints are disabled. Set STOCKPRED_API_KEY env var to enable.",
+        )
+    if not x_api_key or x_api_key != WRITE_API_KEY:
+        raise HTTPException(401, "X-API-Key header required")
 
 
 def get_db():
@@ -309,22 +378,37 @@ def register_routes(app: FastAPI) -> None:
             ],
         )
 
-    @app.post("/jobs/refresh", response_model=schemas.JobResponse, tags=["jobs"])
-    def refresh(background_tasks: BackgroundTasks):
+    @app.post(
+        "/jobs/refresh",
+        response_model=schemas.JobResponse,
+        tags=["jobs"],
+        dependencies=[Depends(_require_api_key)],
+    )
+    def refresh():
+        """Trigger a pipeline run. Requires X-API-Key header.
+
+        Returns 409 if another refresh is already in flight; the running job
+        will produce the same artefacts so there is no value in queuing.
+        """
         if AppState.SessionLocal is None:
             raise HTTPException(500, "DB not initialised")
-        # Run synchronously in a background thread so we don't block uvicorn.
+        if _is_pipeline_running():
+            raise HTTPException(409, "A pipeline run is already in flight")
+
         import uuid as _uuid
 
         job_id = str(_uuid.uuid4())
+        # Mark queued BEFORE starting the thread so polling immediately sees it.
+        jobs_mod._record_job(job_id, "queued")
 
         def _run():
-            jobs_mod.run_pipeline_job(
-                AppState.SessionLocal, pipeline_cfg=PipelineConfig(), job_id=job_id
-            )
+            # Held only for the duration of one pipeline run; releases on any exit.
+            with _refresh_lock:
+                jobs_mod.run_pipeline_job(
+                    AppState.SessionLocal, pipeline_cfg=PipelineConfig(), job_id=job_id
+                )
 
         threading.Thread(target=_run, daemon=True).start()
-        jobs_mod._record_job(job_id, "queued")
         return schemas.JobResponse(job_id=job_id, status="queued")
 
     @app.get("/jobs/{job_id}", response_model=schemas.JobResponse, tags=["jobs"])
@@ -343,29 +427,42 @@ def register_routes(app: FastAPI) -> None:
 
 
 def register_static(app: FastAPI) -> None:
-    """If a built frontend exists at `web/dist/`, serve it from `/`."""
-    dist = Path(WEB_DIST)
+    """If a built frontend exists at `web/dist/`, serve it from `/`.
+
+    Path-traversal-safe: any requested path is resolved against `dist` and
+    rejected if it escapes that directory (C3 fix).
+    """
+    dist = Path(WEB_DIST).resolve()
     if not dist.exists():
         log.info("Static frontend not found at %s; SPA disabled", dist)
         return
 
-    # Serve assets under /assets, and an index.html for everything else (SPA).
-    app.mount(
-        "/assets",
-        StaticFiles(directory=str(dist / "assets")),
-        name="assets",
-    )
+    assets_dir = dist / "assets"
+    if assets_dir.exists():
+        app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
 
     @app.get("/", include_in_schema=False)
     def index():
         return FileResponse(str(dist / "index.html"))
 
+    def _safe_target(full_path: str) -> Path | None:
+        # Compute the absolute target path, then verify it stays within `dist`.
+        target = (dist / full_path).resolve()
+        try:
+            target.relative_to(dist)
+        except ValueError:
+            return None
+        if not target.exists() or not target.is_file():
+            return None
+        return target
+
     @app.get("/{full_path:path}", include_in_schema=False)
     def spa_fallback(full_path: str):
-        # Anything that isn't an API route falls through to the SPA index.
-        target = dist / full_path
-        if target.exists() and target.is_file():
+        target = _safe_target(full_path)
+        if target is not None:
             return FileResponse(str(target))
+        # Anything else (including unknown routes and attempted traversal)
+        # falls through to the SPA index.
         return FileResponse(str(dist / "index.html"))
 
 

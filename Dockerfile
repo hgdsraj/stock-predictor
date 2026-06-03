@@ -54,6 +54,12 @@ ENV STOCKPRED_DB=/app/data/app.db \
 
 EXPOSE 8000
 
+# Drop privileges to a non-root user (review finding M3). The data directory
+# is owned by this user so volume mounts work.
+RUN useradd -u 1001 -m -s /bin/false app \
+    && chown -R app /app
+USER app
+
 # Healthcheck: container is "healthy" only after the API responds.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=5 \
   CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)" \
