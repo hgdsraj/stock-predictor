@@ -1,16 +1,18 @@
 #!/usr/bin/env python
-"""End-to-end Phase 1 entrypoint.
+"""End-to-end pipeline entrypoint.
 
 Usage:
     uv run python scripts/run_phase1.py
-    uv run python scripts/run_phase1.py --n-tickers 50 --start 2015-01-01
+    uv run python scripts/run_phase1.py --n-tickers 100 --horizons 1 5 21 --k 20
 
 The script will:
   - Fetch S&P 500 historical constituents (cached to data/cache/)
   - Download adjusted prices via yfinance (cached per-ticker parquet)
-  - Build features + labels
-  - Run walk-forward CV with the logistic baseline
-  - Construct top-k long/short portfolio, backtest with realistic costs
+  - Optionally fetch sector tags via yfinance .info
+  - Build features (technicals + cross-sectional ranks + sector-neutralised)
+  - Train walk-forward CV per horizon with LightGBM (default) or logistic baseline
+  - Ensemble per-horizon scores and construct top-k long/short portfolio
+  - Backtest horizon-aware, with realistic costs
   - Write an HTML tearsheet to reports/
 """
 
@@ -20,7 +22,7 @@ import argparse
 import logging
 import sys
 
-from stockpred.pipeline import PipelineConfig, run_phase1
+from stockpred.pipeline import PipelineConfig, run_pipeline
 
 
 def parse_args() -> argparse.Namespace:
@@ -28,8 +30,31 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--start", default="2010-01-01", help="History start date (YYYY-MM-DD)")
     p.add_argument("--end", default=None, help="History end date (YYYY-MM-DD)")
     p.add_argument("--n-tickers", type=int, default=100, help="Universe size (None = all)")
-    p.add_argument("--horizon", type=int, default=1, help="Forecast horizon in trading days")
+    p.add_argument(
+        "--universe-sampling",
+        choices=("random", "current", "first"),
+        default="random",
+        help="How to subset the historical universe (random is unbiased; current is SURVIVORSHIP-BIASED)",
+    )
+    p.add_argument(
+        "--horizons",
+        type=int,
+        nargs="+",
+        default=[1, 5, 21],
+        help="One or more forecast horizons (trading days)",
+    )
     p.add_argument("--k", type=int, default=20, help="Top/bottom k per side for portfolio")
+    p.add_argument(
+        "--model",
+        choices=("gbm", "logistic"),
+        default="gbm",
+        help="Model used per horizon",
+    )
+    p.add_argument(
+        "--no-sector",
+        action="store_true",
+        help="Disable sector-neutralised features (skip yfinance .info call)",
+    )
     p.add_argument("--refresh", action="store_true", help="Bypass data cache")
     p.add_argument("--verbose", "-v", action="store_true", help="DEBUG logging")
     return p.parse_args()
@@ -47,26 +72,35 @@ def main() -> int:
         start_date=args.start,
         end_date=args.end,
         n_tickers=args.n_tickers,
-        horizon=args.horizon,
+        universe_sampling=args.universe_sampling,
+        horizons=tuple(args.horizons),
         k_per_side=args.k,
+        model=args.model,
+        use_sector_features=not args.no_sector,
         refresh_data=args.refresh,
     )
-    result = run_phase1(cfg)
+    result = run_pipeline(cfg)
 
     print()
-    print("=" * 60)
-    print(" Phase 1 complete")
-    print("=" * 60)
+    print("=" * 64)
+    print(" Pipeline complete")
+    print("=" * 64)
     print(f"  Universe size      : {len(result['tickers'])}")
     print(f"  Feature matrix     : {result['feature_matrix_shape']}")
-    print(f"  Hit rate (OOS)     : {result['hit_rate']:.4f}")
-    print(f"  IC mean (OOS)      : {result['ic_summary']['ic_mean']:+.5f}")
-    print(f"  IC IR (OOS)        : {result['ic_summary']['ic_ir']:+.3f}")
+    print()
+    print("  Per-horizon OOS:")
+    for h, d in result["per_horizon_diagnostics"].items():
+        print(
+            f"    h={h:>2}d   hit={d['hit_rate']:.4f}   "
+            f"ic_mean={d['ic_mean']:+.5f}   ic_ir={d['ic_ir']:+.3f}"
+        )
     metrics = result["metrics"]
-    print(f"  Ann return (net)   : {metrics['ann_return']:+.2%}")
-    print(f"  Ann vol            : {metrics['ann_vol']:.2%}")
-    print(f"  Sharpe (net)       : {metrics['sharpe']:+.3f}")
-    print(f"  Max drawdown       : {metrics['max_drawdown']:.2%}")
+    print()
+    print("  Backtest (ensemble):")
+    print(f"    Ann return (net)   : {metrics['ann_return']:+.2%}")
+    print(f"    Ann vol            : {metrics['ann_vol']:.2%}")
+    print(f"    Sharpe (net)       : {metrics['sharpe']:+.3f}")
+    print(f"    Max drawdown       : {metrics['max_drawdown']:.2%}")
     print(f"  Tearsheet          : {result['tearsheet_path']}")
     print(f"  Elapsed            : {result['elapsed_s']:.1f}s")
     print()

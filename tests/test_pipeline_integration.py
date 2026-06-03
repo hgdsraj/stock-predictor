@@ -88,17 +88,23 @@ def test_pipeline_end_to_end_no_leakage(synthetic_panel, tmp_path, monkeypatch, 
         start_date="2012-01-02",
         end_date="2020-12-31",
         n_tickers=len(tickers),
-        horizon=1,
+        horizons=(1,),
         k_per_side=5,
+        use_sector_features=False,  # synthetic tickers have no real sector
+        model="logistic",  # baseline is fast for the noise-canary test
     )
     result = run_phase1(cfg)
 
     # Structural assertions.
     assert result["feature_matrix_shape"][0] > 5_000  # plenty of (date,ticker) rows
     assert result["feature_matrix_shape"][1] > 10  # plenty of features
-    preds = result["predictions"]
-    assert isinstance(preds, pd.Series)
-    assert preds.notna().sum() > 1_000
+
+    # Per-horizon predictions exist and are non-empty.
+    per_h = result["per_horizon_predictions"]
+    assert isinstance(per_h, dict) and len(per_h) >= 1
+    for h, preds in per_h.items():
+        assert isinstance(preds, pd.Series)
+        assert preds.notna().sum() > 1_000
 
     # Backtest.
     res = result["backtest"]
@@ -106,15 +112,15 @@ def test_pipeline_end_to_end_no_leakage(synthetic_panel, tmp_path, monkeypatch, 
     assert len(rets) > 100
     assert np.isfinite(rets).all()
 
-    # Hit rate on pure noise should sit near 50%. We allow a wide band but
-    # *exclude* clearly broken values (>65% or <35%) which would indicate a
-    # leakage regression.
-    hit = result["hit_rate"]
-    assert 0.35 < hit < 0.65, f"Suspicious hit rate {hit:.4f} on noise data"
-
-    # IC mean on pure noise should be tiny.
-    ic_mean = result["ic_summary"]["ic_mean"]
-    assert abs(ic_mean) < 0.05, f"IC {ic_mean:.4f} too large for noise data"
+    # Hit rate on pure noise should sit near 50% per horizon. Wide band but
+    # rules out clear leakage (>65% or <35%).
+    diag = result["per_horizon_diagnostics"]
+    for h, d in diag.items():
+        hit = d["hit_rate"]
+        assert 0.35 < hit < 0.65, f"horizon {h}: suspicious hit rate {hit:.4f}"
+        assert abs(d["ic_mean"]) < 0.05, (
+            f"horizon {h}: IC mean {d['ic_mean']:.4f} too large for noise data"
+        )
 
     # Tearsheet must exist and look real.
     ts = result["tearsheet_path"]
