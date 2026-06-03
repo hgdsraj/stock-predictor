@@ -1,0 +1,373 @@
+"""FastAPI application.
+
+The app is built around a single SQLite database (`data/app.db` by default)
+and an in-process APScheduler for daily refreshes.
+
+Routes:
+  GET  /healthz                — DB + scheduler health
+  GET  /tickers                — list all tickers with summary
+  GET  /tickers/{ticker}       — last year prices + predictions
+  GET  /tickers/{ticker}/details — fundamentals + extended history
+  GET  /predictions/latest     — top-k long / bottom-k short for the latest run
+  GET  /runs                   — recent runs (metadata)
+  GET  /runs/{run_id}/equity   — backtest equity curve for that run
+  GET  /backtest/summary       — latest backtest tearsheet payload
+  POST /jobs/refresh           — trigger an on-demand pipeline run
+  GET  /jobs/{job_id}          — get status of a job
+  GET  /jobs                   — list recent jobs
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import logging
+import os
+import threading
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from sqlalchemy.orm import Session
+
+from stockpred.backend import jobs as jobs_mod
+from stockpred.backend import schemas, store
+from stockpred.backend.db import create_all, make_engine, make_session_factory, session_scope
+from stockpred.pipeline import PipelineConfig
+
+log = logging.getLogger(__name__)
+
+# ----- App state ---------------------------------------------------------
+
+DB_PATH = os.environ.get("STOCKPRED_DB", None)
+WEB_DIST = os.environ.get(
+    "STOCKPRED_WEB_DIST",
+    str((Path(__file__).resolve().parent.parent.parent.parent / "web" / "dist").resolve()),
+)
+
+
+class AppState:
+    engine = None
+    SessionLocal = None
+    scheduler = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    AppState.engine = make_engine(DB_PATH)
+    create_all(AppState.engine)
+    AppState.SessionLocal = make_session_factory(AppState.engine)
+    AppState.scheduler = jobs_mod.make_scheduler(AppState.SessionLocal)
+    if os.environ.get("STOCKPRED_DISABLE_SCHEDULER") != "1":
+        AppState.scheduler.start()
+        log.info("scheduler started")
+    yield
+    if AppState.scheduler and AppState.scheduler.running:
+        AppState.scheduler.shutdown(wait=False)
+
+
+def create_app() -> FastAPI:
+    app = FastAPI(
+        title="stock-predictor",
+        description=(
+            "Cross-sectional directional forecaster for S&P 500 equities. "
+            "Free data, honest backtests, fully portable."
+        ),
+        version="0.2.0",
+        lifespan=lifespan,
+    )
+
+    # Permissive CORS so a separately-served frontend dev server can hit the API.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=os.environ.get("STOCKPRED_CORS", "*").split(","),
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    register_routes(app)
+    register_static(app)
+    return app
+
+
+def get_db():
+    if AppState.SessionLocal is None:
+        raise HTTPException(status_code=500, detail="DB not initialised")
+    with session_scope(AppState.SessionLocal) as s:
+        yield s
+
+
+# ----- Routes ------------------------------------------------------------
+
+
+def register_routes(app: FastAPI) -> None:
+    @app.get("/healthz", response_model=schemas.HealthResponse, tags=["meta"])
+    def healthz():
+        db_status = "ok" if AppState.engine is not None else "uninitialised"
+        sched_status = "running" if (AppState.scheduler and AppState.scheduler.running) else "off"
+        return schemas.HealthResponse(db=db_status, scheduler=sched_status)
+
+    @app.get("/tickers", response_model=list[schemas.TickerSummary], tags=["tickers"])
+    def list_tickers(s: Session = Depends(get_db)):
+        from stockpred.backend.models import Fundamental, PriceBar
+
+        # Latest price per ticker for the summary.
+        from sqlalchemy import func, select
+
+        latest_dates = (
+            select(PriceBar.ticker, func.max(PriceBar.date).label("max_date"))
+            .group_by(PriceBar.ticker)
+            .subquery()
+        )
+        rows = s.execute(
+            select(
+                PriceBar.ticker,
+                PriceBar.adj_close,
+                PriceBar.date,
+                Fundamental.sector,
+                Fundamental.industry,
+                Fundamental.market_cap,
+            )
+            .join(
+                latest_dates,
+                (PriceBar.ticker == latest_dates.c.ticker)
+                & (PriceBar.date == latest_dates.c.max_date),
+            )
+            .outerjoin(Fundamental, Fundamental.ticker == PriceBar.ticker)
+            .order_by(PriceBar.ticker)
+        ).all()
+        return [
+            schemas.TickerSummary(
+                ticker=r.ticker,
+                sector=r.sector,
+                industry=r.industry,
+                last_price=float(r.adj_close) if r.adj_close is not None else None,
+                market_cap=float(r.market_cap) if r.market_cap is not None else None,
+                last_updated=r.date,
+            )
+            for r in rows
+        ]
+
+    @app.get("/tickers/{ticker}/details", response_model=schemas.TickerDetail, tags=["tickers"])
+    def ticker_details(
+        ticker: str,
+        days: int = Query(default=365, ge=1, le=2000),
+        s: Session = Depends(get_db),
+    ):
+        fund = store.fundamental_for(s, ticker)
+        if fund is None:
+            raise HTTPException(404, f"unknown ticker {ticker}")
+
+        start = dt.date.today() - dt.timedelta(days=days)
+        prices = store.prices_for_ticker(s, ticker, start=start)
+
+        run = store.latest_run(s)
+        preds_out: list[schemas.PredictionOut] = []
+        if run:
+            for p in store.predictions_for_ticker(s, run.id, ticker):
+                if p.date >= start:
+                    preds_out.append(
+                        schemas.PredictionOut(
+                            date=p.date,
+                            ticker=p.ticker,
+                            score=p.score,
+                            rank=p.rank,
+                            side=p.side,
+                            weight=p.weight,
+                            per_horizon=p.per_horizon_json or {},
+                        )
+                    )
+
+        return schemas.TickerDetail(
+            ticker=fund.ticker,
+            sector=fund.sector,
+            industry=fund.industry,
+            market_cap=fund.market_cap,
+            beta=fund.beta,
+            trailing_pe=fund.trailing_pe,
+            forward_pe=fund.forward_pe,
+            dividend_yield=fund.dividend_yield,
+            short_ratio=fund.short_ratio,
+            short_percent_of_float=fund.short_percent_of_float,
+            fifty_two_week_high=fund.fifty_two_week_high,
+            fifty_two_week_low=fund.fifty_two_week_low,
+            long_business_summary=fund.long_business_summary,
+            prices=[
+                schemas.PriceBarOut(
+                    date=p.date,
+                    open=p.open,
+                    high=p.high,
+                    low=p.low,
+                    close=p.close,
+                    adj_close=p.adj_close,
+                    volume=p.volume,
+                )
+                for p in prices
+            ],
+            predictions=preds_out,
+        )
+
+    @app.get("/predictions/latest", response_model=schemas.TopMovers, tags=["predictions"])
+    def latest_movers(top_k: int = Query(default=10, ge=1, le=100), s: Session = Depends(get_db)):
+        run = store.latest_run(s)
+        if run is None:
+            return schemas.TopMovers(date=None, long=[], short=[])
+        data = store.latest_predictions(s, run.id, top_k=top_k)
+        date_val = data.get("date")
+        long_out = [
+            schemas.PredictionOut(
+                date=p.date,
+                ticker=p.ticker,
+                score=p.score,
+                rank=p.rank,
+                side=p.side,
+                weight=p.weight,
+                per_horizon=p.per_horizon_json or {},
+            )
+            for p in data["long"]
+        ]
+        short_out = [
+            schemas.PredictionOut(
+                date=p.date,
+                ticker=p.ticker,
+                score=p.score,
+                rank=p.rank,
+                side=p.side,
+                weight=p.weight,
+                per_horizon=p.per_horizon_json or {},
+            )
+            for p in data["short"]
+        ]
+        return schemas.TopMovers(date=date_val, long=long_out, short=short_out)
+
+    @app.get("/runs", response_model=list[schemas.RunSummary], tags=["runs"])
+    def runs(limit: int = Query(default=20, ge=1, le=100), s: Session = Depends(get_db)):
+        rows = store.list_runs(s, limit=limit)
+        return [
+            schemas.RunSummary(
+                id=r.id,
+                started_at=r.started_at,
+                completed_at=r.completed_at,
+                status=r.status,
+                metrics=r.summary_json.get("metrics", {}),
+                per_horizon_diagnostics=r.summary_json.get("per_horizon_diagnostics", {}),
+                tickers_count=r.summary_json.get("tickers_count", 0),
+                note=r.note,
+            )
+            for r in rows
+        ]
+
+    @app.get(
+        "/runs/{run_id}/equity",
+        response_model=list[schemas.EquityPoint],
+        tags=["runs"],
+    )
+    def equity_curve(run_id: int, s: Session = Depends(get_db)):
+        rows = store.equity_for_run(s, run_id)
+        return [
+            schemas.EquityPoint(
+                date=r.date,
+                daily_return=r.daily_return,
+                cumulative_return=r.cumulative_return,
+                drawdown=r.drawdown,
+                turnover=r.turnover,
+                benchmark_return=r.benchmark_return,
+            )
+            for r in rows
+        ]
+
+    @app.get("/backtest/summary", response_model=schemas.BacktestSummary, tags=["backtest"])
+    def backtest_summary(s: Session = Depends(get_db)):
+        run = store.latest_run(s)
+        if run is None:
+            raise HTTPException(404, "no runs yet")
+        equity = store.equity_for_run(s, run.id)
+        return schemas.BacktestSummary(
+            run=schemas.RunSummary(
+                id=run.id,
+                started_at=run.started_at,
+                completed_at=run.completed_at,
+                status=run.status,
+                metrics=run.summary_json.get("metrics", {}),
+                per_horizon_diagnostics=run.summary_json.get("per_horizon_diagnostics", {}),
+                tickers_count=run.summary_json.get("tickers_count", 0),
+                note=run.note,
+            ),
+            equity_curve=[
+                schemas.EquityPoint(
+                    date=r.date,
+                    daily_return=r.daily_return,
+                    cumulative_return=r.cumulative_return,
+                    drawdown=r.drawdown,
+                    turnover=r.turnover,
+                    benchmark_return=r.benchmark_return,
+                )
+                for r in equity
+            ],
+        )
+
+    @app.post("/jobs/refresh", response_model=schemas.JobResponse, tags=["jobs"])
+    def refresh(background_tasks: BackgroundTasks):
+        if AppState.SessionLocal is None:
+            raise HTTPException(500, "DB not initialised")
+        # Run synchronously in a background thread so we don't block uvicorn.
+        import uuid as _uuid
+
+        job_id = str(_uuid.uuid4())
+
+        def _run():
+            jobs_mod.run_pipeline_job(
+                AppState.SessionLocal, pipeline_cfg=PipelineConfig(), job_id=job_id
+            )
+
+        threading.Thread(target=_run, daemon=True).start()
+        jobs_mod._record_job(job_id, "queued")
+        return schemas.JobResponse(job_id=job_id, status="queued")
+
+    @app.get("/jobs/{job_id}", response_model=schemas.JobResponse, tags=["jobs"])
+    def job_status(job_id: str):
+        rec = jobs_mod.get_job_status(job_id)
+        if rec is None:
+            raise HTTPException(404, "unknown job")
+        return schemas.JobResponse(job_id=job_id, status=rec["status"], detail=str(rec))
+
+    @app.get("/jobs", tags=["jobs"])
+    def jobs_list(limit: int = Query(default=25, ge=1, le=100)):
+        return jobs_mod.list_jobs(limit)
+
+
+# ----- Static frontend ---------------------------------------------------
+
+
+def register_static(app: FastAPI) -> None:
+    """If a built frontend exists at `web/dist/`, serve it from `/`."""
+    dist = Path(WEB_DIST)
+    if not dist.exists():
+        log.info("Static frontend not found at %s; SPA disabled", dist)
+        return
+
+    # Serve assets under /assets, and an index.html for everything else (SPA).
+    app.mount(
+        "/assets",
+        StaticFiles(directory=str(dist / "assets")),
+        name="assets",
+    )
+
+    @app.get("/", include_in_schema=False)
+    def index():
+        return FileResponse(str(dist / "index.html"))
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    def spa_fallback(full_path: str):
+        # Anything that isn't an API route falls through to the SPA index.
+        target = dist / full_path
+        if target.exists() and target.is_file():
+            return FileResponse(str(target))
+        return FileResponse(str(dist / "index.html"))
+
+
+# Instantiate at import time so uvicorn can find `app`.
+app = create_app()
