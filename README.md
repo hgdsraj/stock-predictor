@@ -271,6 +271,37 @@ statistically significant *positive* risk-adjusted return on unseen data,
 but it now produces results indistinguishable from zero rather than
 significantly negative — which is genuine progress.**
 
+### Phase 9: confidence-weighted sizing, walk-forward meta-CV, sector-conditional meta
+
+Added: confidence-weighted signal sizing (`clip((P − floor) / (cap − floor),
+0, 1)` instead of binary threshold), expanding-window walk-forward CV inside
+the meta-gate, and per-sector meta classifiers (with cross-sectional columns
+dropped to actually isolate sector-specific learning).
+
+**Phase 9 honest real-data result** (150 names, 2014-2024, h=5, HRP, ranks-
+only, **confidence mode + walk-forward 3 folds**):
+
+| Metric                | Phase 8 (binary) | Phase 9 (confidence + WF-CV) |
+| --------------------- | ---------------- | ---------------------------- |
+| HOLDOUT Sharpe        | **−0.16**        | −0.57                        |
+| HOLDOUT 95% block-CI  | **[−0.67, +0.29]** | [−1.03, −0.15]             |
+
+**Phase 9 made things worse.** This is an honest finding: the binary gate's
+hard refusal to trade was protecting against losses on a holdout where the
+signal flipped sign. Confidence-weighted sizing trades more often (smaller
+size each), and on a backwards signal more trades = more losses.
+
+A sub-agent reviewer caught 4 critical/high bugs in the initial Phase 9
+wiring (per-sector meta seeing cross-sectional features defeating isolation;
+walk-forward concat without integrity check; NaN proba propagating in
+confidence mode; HRP silent equal-weight fallback on bad covariance). All
+fixed with regression tests. The corrected −0.57 above reflects the bug-
+fixed pipeline.
+
+**The bottom line after seven phases: more code rigor on top of an absent
+signal does not manufacture signal. Phase 8 (binary meta + ranks-only)
+remains the best honest result.**
+
 ```bash
 uv run python scripts/run_phase5.py \
     --start 2018-01-01 \

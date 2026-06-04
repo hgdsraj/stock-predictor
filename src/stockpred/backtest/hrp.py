@@ -67,9 +67,18 @@ def _quasi_diag(link: np.ndarray) -> list[int]:
 
 
 def _cluster_var(cov: np.ndarray, items: list[int]) -> float:
-    """Inverse-variance portfolio variance for a sub-cluster."""
+    """Inverse-variance portfolio variance for a sub-cluster.
+
+    Review H5 fix: guards against zero or non-finite diagonal entries
+    (which can come out of Ledoit-Wolf shrinkage on near-constant or all-
+    NaN return columns). Returns NaN if any diagonal entry is ill-conditioned;
+    the caller treats NaN as a skip signal.
+    """
     cov_ = cov[np.ix_(items, items)]
-    ivp = 1.0 / np.diag(cov_)
+    diag = np.diag(cov_)
+    if not np.all(np.isfinite(diag)) or np.any(diag <= 1e-20):
+        return float("nan")
+    ivp = 1.0 / diag
     ivp /= ivp.sum()
     return float(ivp @ cov_ @ ivp)
 

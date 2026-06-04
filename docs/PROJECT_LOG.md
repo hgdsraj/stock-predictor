@@ -663,28 +663,107 @@ are honestly at zero, not above.
   `_apply_meta_gate` (index preservation, threshold sensitivity).
 - **Final test count: 95 passing.**
 
-## Phase 9+ research items
+## Session 7 — Phase 9 (confidence sizing, walk-forward meta-CV, sector-conditional meta)
 
-The five obvious next moves, in expected ROI order:
-1. **Confidence-weighted sizing**: instead of gating at a hard threshold,
-   weight position size by P(correct) − 0.5. May reclaim some alpha
-   currently zeroed out by the binary gate.
-2. **Triple-barrier + meta combined**: train primary on TB labels, then
-   meta on whether TB label was correctly predicted. The current Phase 8
-   pipeline supports both individually but doesn't chain them.
-3. **Walk-forward meta-CV**: replace the single 80/20 dev split inside
-   `_apply_meta_gate` with proper walk-forward CV. Computationally
-   expensive (~5x current runtime) but methodologically cleaner.
-4. **Sector-conditional meta**: train one meta classifier per sector.
-5. **Cross-sectional regression instead of ranking**.
-   Fama-MacBeth style regression may extract more signal than top-k ranks.
+### What landed
+- **`meta_confidence_weight_signal`** in `models/meta.py`: scales primary signal
+  by `clip((P − floor) / (cap − floor), 0, 1)` instead of hard-gating. NaN proba
+  is treated as "don't trade" (weight 0), matching `meta_filter_signal`.
+- **`_apply_meta_gate`** in `pipeline_v5.py`: now accepts `mode`
+  (`binary`|`confidence`), `conf_floor`, `conf_cap`, and `walk_forward_folds`.
+  K=1 is Phase 8's single-pass; K>1 does proper expanding-window CV.
+- **`_apply_meta_gate_per_sector`** new helper: splits ensemble by `sector_map`
+  and recurses into `_apply_meta_gate` per sector. Drops cross-sectional
+  columns (`*_rank`, `reg_*`) inside the per-sector subset to actually isolate
+  sector-specific learning (review C1 fix). Untagged tickers gated globally.
+- **CLI**: `--meta-mode`, `--meta-conf-floor`, `--meta-conf-cap`,
+  `--meta-walk-forward-folds`, `--meta-per-sector` + input validation.
+- **Per-feature audit** on real data (100-name × 11-year): ranked features
+  hold up under hard-cutoff much better than raw versions (`*_rank` cols
+  degrade 15-50%, raw cols 100%+). Output saved to
+  `reports/per_feature_audit.csv` for future Phase X feature pruning.
+- **pytest**: added `slow` marker, deselected by default
+  (`addopts = "-ra -q -m 'not slow'"`).
 
-None of these are guaranteed to flip the holdout positive. They are
-legitimate research moves, not engineering work.
+### Sub-agent reviewer caught 4 critical/high issues — all fixed
+- **C1 (critical)**: per-sector meta was seeing universe-wide cross-sectional
+  features (`*_rank`, `reg_*`) at signal time, defeating the "isolate sector
+  learning" claim. Fix: drop those columns inside
+  `_apply_meta_gate_per_sector` before recursion.
+- **C2 (critical)**: walk-forward fold concat had no integrity check; silent
+  duplicate `(date, ticker)` rows possible on future boundary tweaks. Fix:
+  `pd.concat(..., verify_integrity=True)`.
+- **C3 (critical)**: duplicate "HOLDOUT meta-gate" log statement (cosmetic).
+  Fix: removed the duplicate.
+- **H4 (high)**: `--meta-per-sector` was silently dev-only; holdout uses
+  global. Fix: warn loudly at holdout site when the flag is set.
+- **H5 (high)**: HRP `1/np.diag(cov_)` could produce silent equal-weight
+  fallback on near-zero diagonals. Fix: guard `_cluster_var` to return NaN
+  on ill-conditioned input; caller already skips NaN.
+- **H6 (high)**: `meta_confidence_weight_signal` propagated NaN proba into
+  weight (vs `meta_filter_signal` which zeroed it). Fix: `.fillna(0.0)` after
+  clip. Also fixed the docstring formula (removed spurious `2 *` factor).
+  Regression test added.
 
-The honest interpretation of six phases of careful work: the strategy
-class (free-data daily-bar cross-sectional L/S on the S&P 500) does not
-appear to have meaningful retail-accessible *profitable* edge in this
-period, but it now produces results indistinguishable from random rather
-than significantly negative — which is genuine progress in honest terms.
-The infrastructure remains valuable for honest experimentation.
+### Honest real-data result, Phase 9 (corrected)
+
+Config tested: 150 current S&P names, 2014-2024, h=5, HRP, ranks_only,
+meta-gating in **confidence** mode with **3 walk-forward folds**:
+
+| Metric                | Phase 8 (binary gate) | Phase 9 (confidence + WF-CV) |
+| --------------------- | --------------------- | ---------------------------- |
+| HOLDOUT Sharpe        | **−0.16**             | **−0.57**                    |
+| HOLDOUT 95% block-CI  | [−0.67, +0.29]        | [−1.03, −0.15]               |
+| HOLDOUT max DD        | −16.0%                | −27.5%                       |
+
+**Phase 9 made things worse on this data.** The binary gate's hard refusal
+to trade was protecting against losses. Confidence-weighted sizing trades
+more often (at smaller size), and on a holdout window where the h=5d signal
+flipped sign (holdout IC IR −2.6 vs dev +1.8), more trades = more losses.
+
+**This is an honest finding, not a regression.** It tells us:
+- The binary gate was working *because* of the model's calibration, not
+  despite it.
+- Phase 6's leakage-audit + Phase 8's holdout discipline correctly surfaced
+  that the dev signal does not generalise; the more we let the model trade
+  on holdout, the more it loses.
+- Tuning `meta_conf_floor` higher (say 0.7) would make confidence mode
+  more conservative, approaching binary behaviour — worth exploring but
+  unlikely to break above zero either.
+
+### Tests (cumulative)
+- Phase 9 added 9 tests in `test_phase9.py` (6 unit fast + 2 slow integration
+  + 1 NaN-proba regression). 2 slow tests deselected by default; runnable
+  via `pytest -m slow`.
+- **Final test count: 101 passing** (was 95; gained 6 fast + 1 NaN fix test
+  + 2 deselected = 9 total Phase 9 tests).
+
+### Final honest summary across seven phases
+
+| Phase | Best holdout Sharpe | 95% CI |
+| ----- | ------------------- | ------ |
+| Phase 2 (baseline) | −1.30 | n/a |
+| Phase 5 (leaky, pre-fix) | −0.84 | [−1.60, −0.15] |
+| Phase 5 (leak-fixed) | −0.52 | [−1.34, +0.22] |
+| Phase 6 (Tier-2 + regime) | −0.95 | [−1.70, −0.23] |
+| Phase 7 (HRP big universe) | **−0.69** | [−1.12, −0.24] |
+| Phase 8 (binary meta + ranks-only) | **−0.16** | **[−0.67, +0.29]** |
+| Phase 9 (confidence + WF-CV) | −0.57 | [−1.03, −0.15] |
+
+**Best honest result remains Phase 8: HOLDOUT Sharpe −0.16, CI straddles
+zero, max DD −16%.** Phase 9's "improvements" were genuinely improvements
+in code rigor (walk-forward CV is more correct than 80/20; per-sector meta
+is more nuanced; confidence mode preserves more information), but they did
+not improve the actual backtest result. That's an honest finding: more
+sophistication on top of an absent signal does not manufacture signal.
+
+The seven-phase result is consistent and clear:
+- The infrastructure is rigorous, leakage-audited, and reusable.
+- The strategy class (free-data daily-bar cross-sectional L/S on S&P 500)
+  does not produce positive risk-adjusted return on unseen data.
+- Phase 8 with binary meta-gating produced the only result where the CI
+  straddled zero. Phase 9's variants are either equivalent or worse.
+- Phase X+ would require fundamentally different data (intraday, news
+  with sentiment, fundamentals point-in-time) or a different model class
+  (sequence models with regime-conditional ensembles). All require either
+  paid data or significantly more compute than a daily-bar laptop pipeline.

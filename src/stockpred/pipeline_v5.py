@@ -148,6 +148,22 @@ class PipelineV5Config:
     # of recall — useful when transaction costs dominate.
     use_meta_labelling: bool = False
     meta_threshold: float = 0.55
+    # Phase 9a: confidence-weighted sizing.
+    # 'binary'     -> traditional gate (zero if P < threshold, full size otherwise)
+    # 'confidence' -> scale signal by clip(2*(P-floor)/(cap-floor), 0, 1).
+    # 'confidence' preserves magnitude info; 'binary' is simpler.
+    meta_mode: str = "binary"
+    meta_conf_floor: float = 0.5
+    meta_conf_cap: float = 1.0
+    # Phase 9c: number of walk-forward folds for the meta-gate.
+    # K=1 -> Phase 8 single-pass (50/50 train/predict).
+    # K>1 -> proper expanding-window CV; cleaner but K* slower per gate.
+    meta_walk_forward_folds: int = 1
+    # Phase 9d: sector-conditional meta classifiers. When True, one meta
+    # GBM is trained per sector; each ticker is gated by its sector's
+    # classifier. Requires sector_map to be populated (i.e. fundamentals
+    # successfully loaded). Falls back to global meta if not.
+    meta_per_sector: bool = False
 
     # Phase 8: triple-barrier labels (López de Prado Ch. 3)
     # When enabled, the regression target switches from `fwd_vs_h` to the
@@ -267,6 +283,149 @@ def _build_weights(
 # --------------------------------------------------------------------- #
 
 
+def _apply_meta_gate_per_sector(
+    ensemble_score: pd.Series,
+    feats: pd.DataFrame,
+    labels: pd.DataFrame,
+    sector_map: dict[str, str],
+    *,
+    bt_horizon_for_meta: int,
+    threshold: float,
+    gbm_cfg,
+    log,
+    mode: str = "binary",
+    conf_floor: float = 0.5,
+    conf_cap: float = 1.0,
+    walk_forward_folds: int = 1,
+) -> pd.Series:
+    """Phase 9d: per-sector meta-gating. For each sector, recurse into
+    _apply_meta_gate on the subset of tickers in that sector. Tickers
+    without a sector tag are gated using a global meta classifier.
+
+    Returns a single Series with the same index as `ensemble_score`,
+    constructed by concatenating per-sector gated outputs.
+    """
+    if not sector_map:
+        log.warning(
+            "meta-per-sector requested but sector_map is empty; falling back to global meta"
+        )
+        return _apply_meta_gate(
+            ensemble_score,
+            feats,
+            labels,
+            bt_horizon_for_meta=bt_horizon_for_meta,
+            threshold=threshold,
+            gbm_cfg=gbm_cfg,
+            log=log,
+            mode=mode,
+            conf_floor=conf_floor,
+            conf_cap=conf_cap,
+            walk_forward_folds=walk_forward_folds,
+        )
+
+    # Review C1 fix: per-sector meta should learn sector-conditional patterns
+    # in isolation. Drop columns that encode universe-wide cross-sectional
+    # information (ranks computed across the full universe, regime
+    # broadcasts) so the sector-specific classifier doesn't see what other
+    # sectors did at date t. Sector dummies and ticker-local technicals stay.
+    cross_sectional_suffixes = ("_rank",)
+    cross_sectional_prefixes = ("reg_",)
+    feats_sector_local = feats[
+        [
+            c
+            for c in feats.columns
+            if not c.endswith(cross_sectional_suffixes)
+            and not c.startswith(cross_sectional_prefixes)
+        ]
+    ]
+    n_dropped = feats.shape[1] - feats_sector_local.shape[1]
+    if n_dropped > 0:
+        log.info(
+            "meta-per-sector: dropped %d cross-sectional cols (ranks/regime) "
+            "to isolate sector-specific learning",
+            n_dropped,
+        )
+
+    pieces: list[pd.Series] = []
+    # Group tickers by sector.
+    tickers_by_sector: dict[str, list[str]] = {}
+    untagged: list[str] = []
+    all_tickers = ensemble_score.index.get_level_values("ticker").unique()
+    for t in all_tickers:
+        sec = sector_map.get(t)
+        if sec is None:
+            untagged.append(t)
+        else:
+            tickers_by_sector.setdefault(sec, []).append(t)
+
+    if untagged:
+        log.info("meta-per-sector: %d untagged tickers will use global meta", len(untagged))
+
+    for sector, tickers in tickers_by_sector.items():
+        if len(tickers) < 5:
+            log.info(
+                "meta-per-sector: sector '%s' has %d tickers; skipping per-sector "
+                "meta (insufficient data), passing through",
+                sector,
+                len(tickers),
+            )
+            sub_mask = ensemble_score.index.get_level_values("ticker").isin(tickers)
+            pieces.append(ensemble_score[sub_mask])
+            continue
+        sub_mask = ensemble_score.index.get_level_values("ticker").isin(tickers)
+        feat_mask = feats_sector_local.index.get_level_values("ticker").isin(tickers)
+        label_mask = labels.index.get_level_values("ticker").isin(tickers)
+        sub_score = ensemble_score[sub_mask]
+        sub_feats = feats_sector_local[feat_mask]
+        sub_labels = labels[label_mask]
+        log.info(
+            "meta-per-sector: sector '%s' n_tickers=%d n_obs=%d",
+            sector,
+            len(tickers),
+            len(sub_score),
+        )
+        gated_sub = _apply_meta_gate(
+            sub_score,
+            sub_feats,
+            sub_labels,
+            bt_horizon_for_meta=bt_horizon_for_meta,
+            threshold=threshold,
+            gbm_cfg=gbm_cfg,
+            log=log,
+            mode=mode,
+            conf_floor=conf_floor,
+            conf_cap=conf_cap,
+            walk_forward_folds=walk_forward_folds,
+        )
+        pieces.append(gated_sub)
+
+    if untagged:
+        u_mask = ensemble_score.index.get_level_values("ticker").isin(untagged)
+        feat_mask = feats_sector_local.index.get_level_values("ticker").isin(untagged)
+        label_mask = labels.index.get_level_values("ticker").isin(untagged)
+        sub_score = ensemble_score[u_mask]
+        sub_feats = feats_sector_local[feat_mask]
+        sub_labels = labels[label_mask]
+        gated_u = _apply_meta_gate(
+            sub_score,
+            sub_feats,
+            sub_labels,
+            bt_horizon_for_meta=bt_horizon_for_meta,
+            threshold=threshold,
+            gbm_cfg=gbm_cfg,
+            log=log,
+            mode=mode,
+            conf_floor=conf_floor,
+            conf_cap=conf_cap,
+            walk_forward_folds=walk_forward_folds,
+        )
+        pieces.append(gated_u)
+
+    if not pieces:
+        return ensemble_score
+    return pd.concat(pieces).sort_index()
+
+
 def _apply_meta_gate(
     ensemble_score: pd.Series,
     feats: pd.DataFrame,
@@ -276,6 +435,10 @@ def _apply_meta_gate(
     threshold: float,
     gbm_cfg,
     log,
+    mode: str = "binary",
+    conf_floor: float = 0.5,
+    conf_cap: float = 1.0,
+    walk_forward_folds: int = 1,
 ) -> pd.Series:
     """Phase 8: train a binary GBM to predict P(ensemble_score is correct)
     and gate the score on that probability.
@@ -285,6 +448,11 @@ def _apply_meta_gate(
     prediction) is returned unmodified — we only gate where we have a
     prediction.
 
+    Phase 9a — `mode` parameter:
+      "binary"     -> hard threshold (zero if P(correct) < threshold).
+      "confidence" -> scale signal by clip((P - floor) / (cap - floor), 0, 1).
+                      Preserves magnitude information instead of discarding it.
+
     This is a single-pass implementation: for stricter walk-forward you
     would loop folds inside here. The 80/20 single-pass is enough to give
     a sense of whether the meta layer helps at all without quintupling
@@ -293,6 +461,7 @@ def _apply_meta_gate(
     from stockpred.models.meta import (
         build_meta_dataset,
         fit_meta,
+        meta_confidence_weight_signal,
         meta_filter_signal,
         predict_meta,
     )
@@ -311,46 +480,87 @@ def _apply_meta_gate(
     forbidden_prefixes = ("fwd_", "tb_")
     safe_feats = feats[[c for c in feats.columns if not c.startswith(forbidden_prefixes)]]
 
-    # Date-based 80/20 split.
     all_dates = ensemble_score.index.get_level_values("date").unique().sort_values()
     if len(all_dates) < 20:
         log.warning("meta-gate: not enough dates; skipping gate")
         return ensemble_score
-    split_idx = int(len(all_dates) * 0.8)
-    train_dates = all_dates[:split_idx]
-    pred_dates = all_dates[split_idx:]
 
-    train_mask = ensemble_score.index.get_level_values("date").isin(train_dates)
-    pred_mask = ensemble_score.index.get_level_values("date").isin(pred_dates)
-
-    score_train = ensemble_score[train_mask]
-    score_pred = ensemble_score[pred_mask]
+    # Phase 9c: walk-forward meta-CV. K folds, each rolling-train on dates
+    # prior to a test slice. K=1 reduces to the Phase 8 single 80/20 split.
+    K = max(1, int(walk_forward_folds))
+    # Reserve the first 50% as initial training history; partition the
+    # remaining 50% into K equally-sized prediction slices.
+    train_end_idx = max(1, int(len(all_dates) * 0.5))
+    remaining = len(all_dates) - train_end_idx
+    if remaining <= 0:
+        log.warning("meta-gate: not enough dates for walk-forward; skipping")
+        return ensemble_score
+    slice_size = max(1, remaining // K)
 
     try:
-        X_meta_train, y_meta_train = build_meta_dataset(
-            score_train,
-            realised.reindex(score_train.index),
-            safe_feats.loc[score_train.index],
-            use_primary_score=True,
+        gated_pieces: list[pd.Series] = []
+        # Always include the initial training window unchanged.
+        init_train_mask = ensemble_score.index.get_level_values("date").isin(
+            all_dates[:train_end_idx]
         )
-        if y_meta_train.empty or y_meta_train.nunique() < 2:
-            log.warning("meta-gate: insufficient class diversity; skipping gate")
+        gated_pieces.append(ensemble_score[init_train_mask])
+
+        for k in range(K):
+            tr_end = train_end_idx + k * slice_size
+            pr_start = tr_end
+            pr_end = pr_start + slice_size if k < K - 1 else len(all_dates)
+            tr_dates = all_dates[:tr_end]
+            pr_dates = all_dates[pr_start:pr_end]
+            if len(tr_dates) < 10 or len(pr_dates) < 1:
+                continue
+            tr_mask = ensemble_score.index.get_level_values("date").isin(tr_dates)
+            pr_mask = ensemble_score.index.get_level_values("date").isin(pr_dates)
+            score_train = ensemble_score[tr_mask]
+            score_pred = ensemble_score[pr_mask]
+            X_meta_train, y_meta_train = build_meta_dataset(
+                score_train,
+                realised.reindex(score_train.index),
+                safe_feats.loc[score_train.index],
+                use_primary_score=True,
+            )
+            if y_meta_train.empty or y_meta_train.nunique() < 2:
+                log.warning(
+                    "meta-gate fold %d/%d: insufficient class diversity; passing through",
+                    k + 1,
+                    K,
+                )
+                gated_pieces.append(score_pred)
+                continue
+            booster = fit_meta(X_meta_train, y_meta_train, cfg=gbm_cfg)
+            X_meta_pred = safe_feats.loc[score_pred.index].copy()
+            X_meta_pred["primary_abs"] = score_pred.abs()
+            proba = predict_meta(booster, X_meta_pred)
+            if mode == "confidence":
+                gated = meta_confidence_weight_signal(
+                    score_pred,
+                    proba,
+                    floor=conf_floor,
+                    cap=conf_cap,
+                )
+            else:
+                gated = meta_filter_signal(score_pred, proba, p_threshold=threshold)
+            log.info(
+                "meta-gate fold %d/%d (mode=%s): train n=%d, pred n=%d, %.1f%% survived gate",
+                k + 1,
+                K,
+                mode,
+                len(y_meta_train),
+                len(score_pred),
+                100 * (gated != 0).mean(),
+            )
+            gated_pieces.append(gated)
+
+        if not gated_pieces:
             return ensemble_score
-        booster = fit_meta(X_meta_train, y_meta_train, cfg=gbm_cfg)
-        X_meta_pred = safe_feats.loc[score_pred.index].copy()
-        X_meta_pred["primary_abs"] = score_pred.abs()
-        proba = predict_meta(booster, X_meta_pred)
-        # Gate only the prediction window; leave train as-is.
-        gated_pred = meta_filter_signal(score_pred, proba, p_threshold=threshold)
-        log.info(
-            "meta-gate: trained on %d obs, predicted on %d obs; "
-            "%.1f%% of pred window survived gate (threshold=%.2f)",
-            len(y_meta_train),
-            len(score_pred),
-            100 * (gated_pred != 0).mean(),
-            threshold,
-        )
-        return pd.concat([score_train, gated_pred]).sort_index()
+        # Review C2 fix: verify_integrity=True surfaces any silent fold-
+        # boundary bug as a loud failure rather than a silent duplicate.
+        out = pd.concat(gated_pieces, verify_integrity=True).sort_index()
+        return out
     except Exception as e:  # noqa: BLE001
         log.warning("meta-gate failed (%s); returning ungated score", e)
         return ensemble_score
@@ -611,15 +821,31 @@ def run_pipeline_v5(cfg: PipelineV5Config | None = None) -> dict:
     # sign(0) != sign(realised)), biasing the meta toward "predict wrong".
     dev_ensemble_score_ungated = dev_ensemble_score.copy()
     if cfg.use_meta_labelling:
-        dev_ensemble_score = _apply_meta_gate(
-            dev_ensemble_score,
-            dev_feats,
-            dev_labels,
+        meta_kwargs = dict(
             bt_horizon_for_meta=min(per_horizon_preds.keys()),
             threshold=cfg.meta_threshold,
             gbm_cfg=cfg.gbm,
             log=log,
+            mode=cfg.meta_mode,
+            conf_floor=cfg.meta_conf_floor,
+            conf_cap=cfg.meta_conf_cap,
+            walk_forward_folds=cfg.meta_walk_forward_folds,
         )
+        if cfg.meta_per_sector:
+            dev_ensemble_score = _apply_meta_gate_per_sector(
+                dev_ensemble_score,
+                dev_feats,
+                dev_labels,
+                sector_map,
+                **meta_kwargs,
+            )
+        else:
+            dev_ensemble_score = _apply_meta_gate(
+                dev_ensemble_score,
+                dev_feats,
+                dev_labels,
+                **meta_kwargs,
+            )
 
     # ---------------- Portfolio + backtest on the DEV span -----------
     # Review C1 fix: when we have a gated score, pass it directly via
@@ -725,6 +951,7 @@ def run_pipeline_v5(cfg: PipelineV5Config | None = None) -> dict:
             from stockpred.models.meta import (
                 build_meta_dataset,
                 fit_meta,
+                meta_confidence_weight_signal,
                 meta_filter_signal,
                 predict_meta,
             )
@@ -753,15 +980,32 @@ def run_pipeline_v5(cfg: PipelineV5Config | None = None) -> dict:
                         X_hold_m = safe_hold.reindex(hold_ensemble_pre.index).copy()
                         X_hold_m["primary_abs"] = hold_ensemble_pre.abs()
                         proba_h = predict_meta(booster_h, X_hold_m)
-                        gated_hold = meta_filter_signal(
-                            hold_ensemble_pre,
-                            proba_h,
-                            p_threshold=cfg.meta_threshold,
-                        )
+                        # Phase 9a: confidence vs binary mode
+                        if cfg.meta_mode == "confidence":
+                            gated_hold = meta_confidence_weight_signal(
+                                hold_ensemble_pre,
+                                proba_h,
+                                floor=cfg.meta_conf_floor,
+                                cap=cfg.meta_conf_cap,
+                            )
+                        else:
+                            gated_hold = meta_filter_signal(
+                                hold_ensemble_pre,
+                                proba_h,
+                                p_threshold=cfg.meta_threshold,
+                            )
                         log.info(
-                            "HOLDOUT meta-gate: %.1f%% of obs survived gate",
+                            "HOLDOUT meta-gate(mode=%s): %.1f%% of obs survived gate",
+                            cfg.meta_mode,
                             100 * (gated_hold != 0).mean(),
                         )
+                        if cfg.meta_per_sector:
+                            log.warning(
+                                "meta-per-sector is dev-only: HOLDOUT meta uses "
+                                "a single global classifier trained on full dev. "
+                                "DEV/HOLDOUT metrics are not directly comparable "
+                                "under this flag."
+                            )
                         # Store the gated score for downstream snapshot
                         # writers; we pass it directly to _build_weights via
                         # precomputed_score below (Review C1 fix).

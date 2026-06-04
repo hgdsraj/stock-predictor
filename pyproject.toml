@@ -74,4 +74,7 @@ ignore = ["E501"]  # let formatter handle line length
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra -q"
+addopts = "-ra -q -m 'not slow'"
+markers = [
+    "slow: marks tests that take more than 30 seconds (deselected by default; run with `-m slow` or `--override-ini=\"addopts=\"`)",
+]

@@ -253,12 +253,43 @@ Stack: Vite + React 18 + TypeScript + Tailwind + shadcn/ui + TanStack Query + Ta
 28. Update README + PROJECT_LOG
 29. Final code-review sub-agent + final E2E + commit + push instructions
 
-## Last-known-good test snapshot (Session 6 end)
+## Last-known-good test snapshot (Session 7 end)
 
 ```
 $ uv run pytest tests/ -q
-95 passed in ~180s
+101 passed, 2 deselected in ~185s
 ```
+
+(2 slow tests deselected by default; run with `pytest -m slow` for those.)
+
+Session 7 added:
+- `meta_confidence_weight_signal` in `models/meta.py`
+- `_apply_meta_gate_per_sector` helper in `pipeline_v5.py`
+- `_apply_meta_gate` extended with mode/conf_floor/conf_cap/walk_forward_folds
+- CLI: `--meta-mode`, `--meta-conf-floor`, `--meta-conf-cap`,
+  `--meta-walk-forward-folds`, `--meta-per-sector`
+- pytest slow marker (deselected by default)
+- 7 new tests in `test_phase9.py` (5 unit + 2 slow integration)
+
+Phase 9 reviewer fixes applied (4 critical/high):
+- C1: per-sector meta drops cross-sectional columns to actually isolate sector
+- C2: `pd.concat(..., verify_integrity=True)` on walk-forward folds
+- C3: removed duplicate HOLDOUT log statement
+- H4: warn when meta-per-sector flag set (holdout still uses global)
+- H5: `_cluster_var` guards against ill-conditioned diagonal
+- H6: confidence mode treats NaN proba as zero (matches binary mode)
+
+Phase 9 honest result (150 names, 2014-2024, h=5, HRP, confidence mode, WF=3):
+- HOLDOUT Sharpe: **−0.57** (worse than Phase 8's −0.16)
+- HOLDOUT 95% CI: [−1.03, −0.15] (back to entirely negative)
+
+The Phase 9 "improvements" are real code-rigor improvements but did NOT
+improve the actual backtest. Binary gate's hard refusal remains the best
+config. This is an honest finding: more sophistication on top of an absent
+signal doesn't manufacture signal.
+
+**Best result remains Phase 8.** Phase X+ would need either paid data or
+fundamentally different model class.
 
 (The 101 in Session 5 included some tests that were redundant; Session 6
 consolidated and added Phase 8 tests, netting 95.)

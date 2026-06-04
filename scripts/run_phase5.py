@@ -73,6 +73,35 @@ def parse_args() -> argparse.Namespace:
         help="P(correct) threshold for meta gate (default 0.55)",
     )
     p.add_argument(
+        "--meta-mode",
+        choices=("binary", "confidence"),
+        default="binary",
+        help="Phase 9a: binary gate vs confidence-weighted sizing",
+    )
+    p.add_argument(
+        "--meta-conf-floor",
+        type=float,
+        default=0.5,
+        help="Phase 9a: confidence weight = clip((P-floor)/(cap-floor), 0, 1)",
+    )
+    p.add_argument(
+        "--meta-conf-cap",
+        type=float,
+        default=1.0,
+        help="Phase 9a: see --meta-conf-floor",
+    )
+    p.add_argument(
+        "--meta-walk-forward-folds",
+        type=int,
+        default=1,
+        help="Phase 9c: K folds of expanding-window meta-CV (K=1 = single pass)",
+    )
+    p.add_argument(
+        "--meta-per-sector",
+        action="store_true",
+        help="Phase 9d: train one meta classifier per sector (requires sector data)",
+    )
+    p.add_argument(
         "--triple-barrier",
         action="store_true",
         help="Phase 8: use triple-barrier labels instead of fwd_vs_h",
@@ -120,6 +149,13 @@ def main() -> int:
         raise SystemExit(f"--meta-threshold must be in [0, 1]; got {args.meta_threshold}")
     if args.k_pct <= 0 or args.k_pct >= 1:
         raise SystemExit(f"--k-pct must be in (0, 1); got {args.k_pct}")
+    if not 0.0 <= args.meta_conf_floor < args.meta_conf_cap <= 1.0:
+        raise SystemExit(
+            f"--meta-conf-floor ({args.meta_conf_floor}) must be in [0, 1) "
+            f"and strictly less than --meta-conf-cap ({args.meta_conf_cap})"
+        )
+    if args.meta_walk_forward_folds < 1:
+        raise SystemExit("--meta-walk-forward-folds must be >= 1")
 
     cfg = PipelineV5Config(
         start_date=args.start,
@@ -142,6 +178,11 @@ def main() -> int:
         bootstrap_method=args.bootstrap_method,
         use_meta_labelling=args.meta_labelling,
         meta_threshold=args.meta_threshold,
+        meta_mode=args.meta_mode,
+        meta_conf_floor=args.meta_conf_floor,
+        meta_conf_cap=args.meta_conf_cap,
+        meta_walk_forward_folds=args.meta_walk_forward_folds,
+        meta_per_sector=args.meta_per_sector,
         use_triple_barrier_labels=args.triple_barrier,
         tb_k_sigma=args.tb_k_sigma,
         ranks_only=args.ranks_only,

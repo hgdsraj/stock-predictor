@@ -155,3 +155,41 @@ def meta_filter_signal(
     aligned = pd.concat([primary_pred.rename("p"), meta_proba.rename("m")], axis=1)
     out = aligned["p"].where(aligned["m"] >= p_threshold, 0.0)
     return out.rename(primary_pred.name or "filtered_pred")
+
+
+def meta_confidence_weight_signal(
+    primary_pred: pd.Series,
+    meta_proba: pd.Series,
+    *,
+    floor: float = 0.5,
+    cap: float = 1.0,
+) -> pd.Series:
+    """Phase 9: scale signal by meta confidence rather than hard-gating.
+
+    Weight = clip((P(correct) - floor) / (cap - floor), 0, 1).
+    Default floor=0.5, cap=1.0 maps:
+        P(correct)=0.50 -> weight 0    (refuse to trade)
+        P(correct)=0.60 -> weight 0.2
+        P(correct)=0.75 -> weight 0.5
+        P(correct)=1.00 -> weight 1.0  (full conviction)
+
+    NaN in meta_proba is treated as "don't trade" (weight 0), matching the
+    semantics of `meta_filter_signal`.
+
+    This preserves the magnitude information the binary threshold throws
+    away — a high-conviction signal still gets sized up, a borderline one
+    gets sized down, only outright noise (P ≤ 0.5) is zeroed.
+
+    Compared to `meta_filter_signal`, this is strictly *less* aggressive:
+    it keeps some weight on signals the binary gate would reject, and it
+    shrinks signals the binary gate would pass through unchanged. Net
+    effect depends on how well-calibrated the meta classifier is.
+    """
+    if cap <= floor:
+        raise ValueError(f"cap ({cap}) must exceed floor ({floor})")
+    aligned = pd.concat([primary_pred.rename("p"), meta_proba.rename("m")], axis=1)
+    # Review H6 fix: NaN proba -> weight 0 (treat as "don't trade") rather
+    # than propagating NaN through into downstream portfolio construction.
+    weight = ((aligned["m"] - floor) / (cap - floor)).clip(lower=0.0, upper=1.0).fillna(0.0)
+    out = aligned["p"] * weight
+    return out.rename(primary_pred.name or "confidence_weighted_pred")
