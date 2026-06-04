@@ -3,8 +3,26 @@
 from __future__ import annotations
 
 import datetime as dt
+import re
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
+
+
+# Strict ticker pattern. Allows:
+#   - Optional leading `^` (indices like ^VIX)
+#   - 1–16 chars from [A-Z0-9.-=]
+#   - Optional `.SUFFIX` for international (e.g. HND.TO, BABA.HK)
+# Disallows `/`, `..`, spaces, NUL, query strings, etc.
+_TICKER_RE = re.compile(r"^\^?[A-Z][A-Z0-9.\-=]{0,15}$")
+
+
+def _validate_ticker(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError("ticker must be a string")
+    v = value.strip().upper()
+    if not _TICKER_RE.fullmatch(v):
+        raise ValueError(f"invalid ticker: {value!r}")
+    return v
 
 
 class TickerSummary(BaseModel):
@@ -95,3 +113,33 @@ class HealthResponse(BaseModel):
     status: str = "ok"
     db: str
     scheduler: str
+
+
+class WatchedItem(BaseModel):
+    ticker: str
+    label: str | None = None
+    category: str | None = None
+    note: str | None = None
+    last_price: float | None = None
+    last_updated: dt.date | None = None
+
+
+class WatchedAdd(BaseModel):
+    ticker: str = Field(..., description="Strict pattern; see _validate_ticker")
+    label: str | None = Field(default=None, max_length=128)
+    category: str | None = Field(default=None, max_length=64)
+    note: str | None = Field(default=None, max_length=512)
+
+    @field_validator("ticker")
+    @classmethod
+    def _check_ticker(cls, v: str) -> str:
+        return _validate_ticker(v)
+
+
+class NewsHeadline(BaseModel):
+    uuid: str
+    title: str | None
+    publisher: str | None
+    link: str | None
+    type: str | None
+    published_at: dt.datetime | None

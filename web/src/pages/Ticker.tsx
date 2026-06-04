@@ -11,16 +11,21 @@ import {
   Bar,
   Legend,
 } from "recharts";
-import { ArrowLeft, Info } from "lucide-react";
+import { ArrowLeft, ExternalLink, Info, Newspaper } from "lucide-react";
 import { api } from "@/api/client";
 import { Card, CardContent, CardHeader, CardTitle, CardSubtitle } from "@/components/ui/Card";
-import { formatNumber, formatPercent, formatDate, formatCompactNumber } from "@/lib/format";
+import { formatNumber, formatPercent, formatDate, formatDateTime, formatCompactNumber } from "@/lib/format";
 
 export function Ticker() {
   const { ticker = "" } = useParams();
   const { data, isLoading, error } = useQuery({
     queryKey: ["ticker", ticker],
     queryFn: () => api.tickerDetail(ticker, 730),
+    enabled: !!ticker,
+  });
+  const news = useQuery({
+    queryKey: ["news", ticker],
+    queryFn: () => api.tickerNews(ticker, 15),
     enabled: !!ticker,
   });
 
@@ -152,6 +157,56 @@ export function Ticker() {
           </CardContent>
         </Card>
       </div>
+
+      <Card>
+        <CardHeader>
+          <div className="flex items-center gap-2">
+            <Newspaper className="h-4 w-4 text-muted-foreground" />
+            <CardTitle>Recent news</CardTitle>
+          </div>
+          <CardSubtitle>
+            Headlines from Yahoo Finance. We do not feed these into the model — see CONCEPTS.md §7e on
+            news as features.
+          </CardSubtitle>
+        </CardHeader>
+        <CardContent>
+          {news.isLoading ? (
+            <div className="text-sm text-muted-foreground">Loading…</div>
+          ) : (news.data ?? []).length === 0 ? (
+            <div className="text-sm text-muted-foreground">No news cached. Try the Refresh button.</div>
+          ) : (
+            <ul className="divide-y divide-border">
+              {(news.data ?? []).map((n) => (
+                <li key={n.uuid} className="py-3">
+                  {n.link ? (
+                    <a
+                      href={n.link}
+                      target="_blank"
+                      rel="noopener noreferrer nofollow"
+                      className="group flex items-start gap-2 hover:text-foreground"
+                    >
+                      <ExternalLink className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground group-hover:text-foreground" />
+                      <div className="flex-1">
+                        <div className="text-sm font-medium leading-snug">{n.title || "(untitled)"}</div>
+                        <div className="mt-1 text-xs text-muted-foreground">
+                          {n.publisher ?? "Unknown publisher"} · {formatDateTime(n.published_at)}
+                        </div>
+                      </div>
+                    </a>
+                  ) : (
+                    <div>
+                      <div className="text-sm font-medium leading-snug">{n.title || "(untitled)"}</div>
+                      <div className="mt-1 text-xs text-muted-foreground">
+                        {n.publisher ?? "Unknown publisher"} · {formatDateTime(n.published_at)}
+                      </div>
+                    </div>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+        </CardContent>
+      </Card>
     </div>
   );
 }

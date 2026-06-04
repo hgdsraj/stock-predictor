@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
+import { Eye, AlertTriangle } from "lucide-react";
 import {
   useReactTable,
   getCoreRowModel,
@@ -33,6 +34,7 @@ interface Row {
 
 export function Screener() {
   const { data, isLoading } = useQuery({ queryKey: ["tickers"], queryFn: api.tickers });
+  const watchlist = useQuery({ queryKey: ["watchlist"], queryFn: api.watchlist });
   const [sorting, setSorting] = useState<SortingState>([{ id: "market_cap", desc: true }]);
   const [search, setSearch] = useState("");
   const [sectorFilter, setSectorFilter] = useState<string>("All");
@@ -100,8 +102,68 @@ export function Screener() {
     getFilteredRowModel: getFilteredRowModel(),
   });
 
+  const watchlistItems = watchlist.data ?? [];
+
   return (
     <div className="space-y-4">
+      {watchlistItems.length > 0 && (
+        <Card>
+          <CardHeader>
+            <div className="flex items-center gap-2">
+              <Eye className="h-4 w-4 text-muted-foreground" />
+              <CardTitle>Watchlist</CardTitle>
+            </div>
+            <CardSubtitle>
+              External instruments tracked for context. Not included in the model's universe.
+            </CardSubtitle>
+          </CardHeader>
+          <CardContent className="p-0">
+            <Table>
+              <THead>
+                <TR>
+                  <TH>Ticker</TH>
+                  <TH>Label</TH>
+                  <TH>Category</TH>
+                  <TH>Last</TH>
+                  <TH>As of</TH>
+                  <TH>Note</TH>
+                </TR>
+              </THead>
+              <TBody>
+                {watchlistItems.map((w) => (
+                  <TR key={w.ticker}>
+                    <TD>
+                      <Link
+                        to={`/ticker/${encodeURIComponent(w.ticker)}`}
+                        className="font-semibold hover:underline"
+                      >
+                        {w.ticker}
+                      </Link>
+                    </TD>
+                    <TD>{w.label ?? "—"}</TD>
+                    <TD>
+                      <span className="badge">{w.category ?? "—"}</span>
+                    </TD>
+                    <TD>{formatNumber(w.last_price, { style: "currency", currency: "USD" })}</TD>
+                    <TD>{formatDate(w.last_updated)}</TD>
+                    <TD className="text-xs text-muted-foreground">
+                      {w.note?.startsWith("WARNING") ? (
+                        <span className="inline-flex items-center gap-1 text-amber-600">
+                          <AlertTriangle className="h-3 w-3" />
+                          {w.note}
+                        </span>
+                      ) : (
+                        w.note ?? "—"
+                      )}
+                    </TD>
+                  </TR>
+                ))}
+              </TBody>
+            </Table>
+          </CardContent>
+        </Card>
+      )}
+
       <Card>
         <CardHeader>
           <div className="flex flex-wrap items-end justify-between gap-3">

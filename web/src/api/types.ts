@@ -90,3 +90,21 @@ export interface HealthResponse {
   db: string;
   scheduler: string;
 }
+
+export interface WatchedItem {
+  ticker: string;
+  label: string | null;
+  category: string | null;
+  note: string | null;
+  last_price: number | null;
+  last_updated: string | null;
+}
+
+export interface NewsHeadline {
+  uuid: string;
+  title: string | null;
+  publisher: string | null;
+  link: string | null;
+  type: string | null;
+  published_at: string | null;
+}

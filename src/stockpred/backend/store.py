@@ -18,9 +18,11 @@ from sqlalchemy.orm import Session
 from stockpred.backend.models import (
     EquitySample,
     Fundamental,
+    NewsItem,
     PriceBar,
     Prediction,
     Run,
+    WatchedTicker,
 )
 
 log = logging.getLogger(__name__)
@@ -217,6 +219,141 @@ def equity_for_run(s: Session, run_id: int) -> list[EquitySample]:
     return list(
         s.execute(
             select(EquitySample).where(EquitySample.run_id == run_id).order_by(EquitySample.date)
+        )
+        .scalars()
+        .all()
+    )
+
+
+# --------------------------------------------------------------------- #
+# Watchlist
+# --------------------------------------------------------------------- #
+
+
+def list_watched(s: Session) -> list[WatchedTicker]:
+    return list(s.execute(select(WatchedTicker).order_by(WatchedTicker.ticker)).scalars().all())
+
+
+def add_watched(
+    s: Session,
+    ticker: str,
+    *,
+    label: str | None = None,
+    category: str | None = None,
+    note: str | None = None,
+) -> WatchedTicker:
+    stmt = sqlite_insert(WatchedTicker).values(
+        {
+            "ticker": ticker,
+            "label": label,
+            "category": category,
+            "note": note,
+            "added_at": _now(),
+        }
+    )
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["ticker"],
+        set_={
+            "label": stmt.excluded.label,
+            "category": stmt.excluded.category,
+            "note": stmt.excluded.note,
+        },
+    )
+    s.execute(stmt)
+    return s.get(WatchedTicker, ticker)
+
+
+def remove_watched(s: Session, ticker: str) -> bool:
+    row = s.get(WatchedTicker, ticker)
+    if row is None:
+        return False
+    s.delete(row)
+    return True
+
+
+def is_watched(s: Session, ticker: str) -> bool:
+    return s.get(WatchedTicker, ticker) is not None
+
+
+def seed_default_watchlist(s: Session) -> None:
+    """Seed a small default watchlist on first boot. Idempotent."""
+    defaults = [
+        (
+            "HND.TO",
+            "Horizons NaturalGas Bear (2x)",
+            "leveraged_etf",
+            "WARNING: 2x leveraged daily-reset; volatility decay over time",
+        ),
+        (
+            "HNU.TO",
+            "Horizons NaturalGas Bull (2x)",
+            "leveraged_etf",
+            "WARNING: 2x leveraged daily-reset; volatility decay over time",
+        ),
+        ("UNG", "United States Natural Gas Fund", "commodity_etf", None),
+        ("SPY", "SPDR S&P 500 ETF", "index_etf", "Benchmark"),
+        (
+            "^VIX",
+            "CBOE Volatility Index",
+            "regime",
+            "Implied vol of S&P 500 options; regime indicator",
+        ),
+    ]
+    for tkr, label, cat, note in defaults:
+        if not is_watched(s, tkr):
+            add_watched(s, tkr, label=label, category=cat, note=note)
+
+
+# --------------------------------------------------------------------- #
+# News
+# --------------------------------------------------------------------- #
+
+
+def upsert_news(s: Session, ticker: str, items: Iterable[dict]) -> int:
+    """Bulk-upsert news items for a ticker. (ticker, uuid) primary key
+    makes this naturally idempotent."""
+    payload = []
+    now = _now()
+    for it in items:
+        if not it.get("uuid"):
+            continue
+        payload.append(
+            {
+                "ticker": ticker,
+                "uuid": it["uuid"],
+                "title": it.get("title"),
+                "publisher": it.get("publisher"),
+                "link": it.get("link"),
+                "type": it.get("type"),
+                "published_at": it.get("published_at"),
+                "fetched_at": now,
+            }
+        )
+    if not payload:
+        return 0
+    stmt = sqlite_insert(NewsItem).values(payload)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["ticker", "uuid"],
+        set_={
+            "title": stmt.excluded.title,
+            "publisher": stmt.excluded.publisher,
+            "link": stmt.excluded.link,
+            "type": stmt.excluded.type,
+            "published_at": stmt.excluded.published_at,
+            "fetched_at": stmt.excluded.fetched_at,
+        },
+    )
+    s.execute(stmt)
+    return len(payload)
+
+
+def news_for_ticker(s: Session, ticker: str, *, limit: int = 20) -> list[NewsItem]:
+    return list(
+        s.execute(
+            select(NewsItem)
+            .where(NewsItem.ticker == ticker)
+            .order_by(desc(NewsItem.published_at))
+            .limit(limit)
         )
         .scalars()
         .all()

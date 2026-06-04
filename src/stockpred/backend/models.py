@@ -128,3 +128,42 @@ class EquitySample(Base):
         Index("ix_equity_run_date", "run_id", "date"),
         UniqueConstraint("run_id", "date", name="uq_equity_run_date"),
     )
+
+
+class WatchedTicker(Base):
+    """Arbitrary tickers tracked outside the model's universe (e.g. HND.TO,
+    HNU.TO, BTC-USD). Charted on the screener and ticker pages but NEVER used
+    as model targets or features — different instruments behave differently
+    (leveraged ETFs decay, crypto trades 24/7, etc.)."""
+
+    __tablename__ = "watched_tickers"
+
+    ticker: Mapped[str] = mapped_column(String(32), primary_key=True)
+    label: Mapped[str | None] = mapped_column(String(128))
+    category: Mapped[str | None] = mapped_column(
+        String(64)
+    )  # 'equity', 'leveraged_etf', 'commodity', ...
+    note: Mapped[str | None] = mapped_column(String(512))
+    added_at: Mapped[dt.datetime | None] = mapped_column(DateTime)
+
+
+class NewsItem(Base):
+    """Headline-level news from yfinance Ticker.news. Free, no API key.
+
+    Persisted with a (ticker, uuid) composite primary key so re-fetches are
+    idempotent. The model does NOT consume this table; it's purely a
+    presentation feed for the ticker detail page (CONCEPTS.md §7e).
+    """
+
+    __tablename__ = "news_items"
+
+    ticker: Mapped[str] = mapped_column(String(32), primary_key=True)
+    uuid: Mapped[str] = mapped_column(String(128), primary_key=True)
+    title: Mapped[str | None] = mapped_column(String(1024))
+    publisher: Mapped[str | None] = mapped_column(String(256))
+    link: Mapped[str | None] = mapped_column(String(2048))
+    type: Mapped[str | None] = mapped_column(String(64))
+    published_at: Mapped[dt.datetime | None] = mapped_column(DateTime)
+    fetched_at: Mapped[dt.datetime | None] = mapped_column(DateTime)
+
+    __table_args__ = (Index("ix_news_ticker_published", "ticker", "published_at"),)

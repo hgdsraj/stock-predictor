@@ -7,10 +7,12 @@ import type {
   BacktestSummary,
   HealthResponse,
   JobResponse,
+  NewsHeadline,
   RunSummary,
   TickerDetail,
   TickerSummary,
   TopMovers,
+  WatchedItem,
 } from "./types";
 
 const API_BASE = (import.meta as any).env?.VITE_API_BASE || "";
@@ -48,6 +50,8 @@ export const api = {
   tickers: () => get<TickerSummary[]>("/tickers"),
   tickerDetail: (ticker: string, days = 365) =>
     get<TickerDetail>(`/tickers/${encodeURIComponent(ticker)}/details?days=${days}`),
+  tickerNews: (ticker: string, limit = 20) =>
+    get<NewsHeadline[]>(`/tickers/${encodeURIComponent(ticker)}/news?limit=${limit}`),
   latestPredictions: (top_k = 10) =>
     get<TopMovers>(`/predictions/latest?top_k=${top_k}`),
   runs: (limit = 20) => get<RunSummary[]>(`/runs?limit=${limit}`),
@@ -58,4 +62,5 @@ export const api = {
   backtestSummary: () => get<BacktestSummary>("/backtest/summary"),
   refresh: () => post<JobResponse>("/jobs/refresh"),
   jobStatus: (job_id: string) => get<JobResponse>(`/jobs/${encodeURIComponent(job_id)}`),
+  watchlist: () => get<WatchedItem[]>("/watchlist"),
 };

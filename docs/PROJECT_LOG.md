@@ -224,17 +224,126 @@ stock-predictor/
 └── README.md
 ```
 
-## Next steps (Phase 5+)
+## Session 3 — Phase 5, deeper docs, news, watchlist, more security
 
-Honest signal research, not engineering:
-1. Use `validation/stress.py` to bootstrap-CI the Phase 2 backtest. If the
-   point-estimate Sharpe sits comfortably inside a CI that includes 0, stop
-   pretending there's a strategy.
-2. Drop the 21d horizon (IC IR ≈ 0) from the ensemble. Re-run with just
-   {1, 5} weighted by IC IR.
-3. Try sector neutralisation flag turned ON; current real-data run had it
-   off because the fundamentals fetch on cold-cache is slow.
-4. Run a sensitivity grid (`scripts/run_phase1.py` × grid of `cost_bps`,
-   `k_per_side`). If results swing wildly with a 2 → 6 bps cost change, the
-   "edge" is overfitting.
-5. (Long shot) news/sentiment via free LLM API + EDGAR 8-K filings.
+### User asks landed this session
+
+1. Documentation overhaul — terminology glossary, deeper how-to, beginner-friendly.
+2. Phase 5+: improve metrics, *not* by chasing win rate (which I pushed back on as the wrong objective) but by addressing the diagnosed issues from Phase 2.
+3. "Highest possible win rate" — refused as a target; explained why Sharpe ÷ bootstrap CI is the right framing.
+4. Intraday "every few minutes" — refused; explained free-data ceiling and why a real intraday system is a different architecture entirely.
+5. Integrate HND/HNU (natural gas leveraged ETFs) — added to a *watchlist* (charted but not modelled, since leveraged-ETF decay makes them unsuitable for the cross-sectional model).
+6. Integrate news — added per-ticker yfinance headlines with `link` scheme validation; **not** fed to the model.
+
+### Sub-agent dispatched: strategy research
+
+A `task` sub-agent ranked the Tier-1 highest-ROI improvements for the existing project:
+- Trade only when |score| > threshold; match holding period to horizon; beta-neutralise vs SPY; vol-target each leg; transaction-cost-aware sizing.
+- HRP or Ledoit-Wolf min-variance over selected names.
+- Add the canonical price-only factor features (12-1 momentum, ST reversal, IVOL, β, max return, Amihud, 52-week high, sector-relative momentum, cross-asset regime).
+- Triple-barrier labels + meta-labelling.
+The agent's honest reality-check: realistic post-work target for a free-data, daily-bar, S&P-only L/S strategy is **net Sharpe 0.4–0.8** and most retail attempts cap below 1.0 net. It also flagged the +2.45 dev IC IR as suspicious-strong and worth auditing.
+
+### Phase 5 changes
+
+`src/stockpred/pipeline_v5.py` + `scripts/run_phase5.py` plug in the Tier-1 portfolio improvements:
+- **IC-IR-weighted ensemble** (drops horizons with IC IR ≤ 0).
+- **Vol-scaled position sizing** (signal × 1/σ, normalised per side).
+- **Sector exposure caps** (default 30% gross per sector).
+- **Minimum 0.5% trade threshold** to suppress noise-trading.
+- **Untouched 2-year holdout window** + dev/holdout split.
+- **Bootstrap Sharpe 95% CI** on holdout.
+- **VIX-regime breakdown** on holdout (when macro data available).
+
+### Real-data Phase 5 result (60 names, 2018–2024, h ∈ {1, 5})
+
+| Metric                    | Phase 2 | Phase 5  |
+| ------------------------- | ------- | -------- |
+| DEV Sharpe                | −1.30   | **−0.04** |
+| DEV ann return            | −10.5%  | −0.6%    |
+| DEV max DD                | −57%    | −23%     |
+| HOLDOUT Sharpe            | —       | **−0.84** |
+| HOLDOUT 95% bootstrap CI  | —       | **[−1.60, −0.15]** |
+| h=5d IC IR (dev/holdout)  | +2.45/— | +2.06/+1.19 |
+
+**The dev improvement is large and matches the sub-agent's prediction.** The
++1.27 Sharpe lift came from portfolio construction discipline alone — no new
+features. But the **honest out-of-sample holdout still loses money**, and
+the bootstrap CI is entirely below zero. The h=5d IC IR shrunk from +2.45
+in dev to +1.19 in holdout, which is normal out-of-sample shrinkage rather
+than evidence of leakage, but the strategy as configured does not generalise.
+
+**No claim of a working strategy.** Phase 6+ would need to:
+- Add the Tier-2 features (12-1 momentum, IVOL, β, etc. — sub-agent's recommendation).
+- Add the cross-asset regime features (VIX, term structure, USD).
+- Beta-neutralise vs SPY at the portfolio level.
+- Consider Ledoit-Wolf shrunk min-variance over the selected names.
+
+### Sub-agent dispatched: Phase 5 reviewer
+
+A second sub-agent found 2 CRITICAL bugs in the new code:
+- **C1 — SSRF/path-traversal on POST /watchlist**: an attacker-supplied ticker that's not validated could write a parquet file outside the cache directory. Fixed: strict ticker regex applied to both `WatchedAdd.ticker` (via Pydantic validator) and the `{ticker}` path parameters on `/watchlist/{ticker}` (DELETE) and `/tickers/{ticker}/news` (GET).
+- **C2 — Holdout-leak via positional train/valid split in GBM early stopping**: `X_dev.iloc[:split]` is positional, and if the MultiIndex isn't sorted by date the validation set is interleaved with training. Fixed: `pipeline_v5.py` now sorts dev by date before splitting and asserts `train.date.max() < valid.date.min()`.
+
+Plus:
+- **HIGH H1**: bootstrap CI uses i.i.d. resampling on autocorrelated overlapping-horizon returns, which narrows the CI artificially. Logged for Phase 6; the user-facing wording in `scripts/run_phase5.py` already errs on the side of "CI excludes 0 = real" requiring conservative interpretation.
+- **MEDIUM M3**: `NewsItem.link` could have been `javascript:` — fixed in `data/news.py::_normalise_one` (only `http://`/`https://` are persisted) and the React side uses `<a rel="noopener noreferrer nofollow">`.
+- **LOW L2**: CORS missing DELETE — added.
+
+All CRITICAL and HIGH-priority-actionable findings fixed with regression tests.
+
+### New tests (this session)
+
+`tests/test_pipeline_v5.py`:
+- End-to-end Phase 5 run on synthetic noise — structural assertions + 35–65% hit-rate canary.
+
+`tests/test_watchlist_and_news.py`:
+- Default watchlist seeded on first boot (HND.TO, HNU.TO, UNG, SPY, ^VIX).
+- /watchlist add/delete require API key.
+- /watchlist add/delete round-trip with patched yfinance.
+- /tickers/{t}/news returns persisted items, most recent first.
+- /tickers/{t}/news is independent of the pipeline.
+- **Security regressions**:
+  - POST /watchlist rejects path-traversal tickers (`../../etc/passwd`, etc.) → 422.
+  - DELETE /watchlist/{ticker} rejects bad characters → 422.
+  - GET /tickers/{t}/news rejects bad characters → 422.
+  - News normaliser drops `javascript:` / non-http(s) links.
+  - News title with HTML is JSON-encoded safely.
+
+**Final test count: 62 passing, 0 failing.**
+
+### New documentation
+
+- **`docs/CONCEPTS.md`** (~4000 words): every term used in the project,
+  explained for someone with no quant background. Returns, IC, IC IR,
+  Sharpe, drawdown, hit rate, walk-forward CV, leakage failure modes,
+  ensemble logic, why our backtest loses money, what "high win rate"
+  actually means, further reading.
+- **`docs/USAGE.md`** (~3500 words): end-to-end user manual. Install (Docker
+  / local / dev mode), first run, interpreting output, dashboard pages,
+  Phase 5 mode, production deployment notes, API reference, common ops,
+  extending the project, troubleshooting, performance benchmarks.
+
+### Other infra changes
+- **macro.py rewritten**: dropped `pandas-datareader` (incompatible with
+  current pandas), now pulls FRED CSVs directly via `requests`. Removed
+  the dep from `pyproject.toml`.
+
+## Next steps (Phase 6+)
+
+In ranked order, per the strategy-research sub-agent:
+1. **Audit the +2.45 dev IC IR** by re-running with strict t-1 feature cutoff
+   and Newey-West-adjusted IC IR t-stats. If it survives, the signal is real;
+   if not, drop it from the ensemble.
+2. **Beta-neutralisation vs SPY** at the portfolio level. The current
+   vol-scaled long/short is *roughly* market-neutral but not explicitly
+   beta-zero.
+3. **Tier-2 features** (12-1 momentum, IVOL, β, max return, Amihud, 52-week
+   high). The literature consistently shows these add IC.
+4. **Cross-asset regime features** (VIX level/delta, term structure, USD).
+5. **Triple-barrier labels + meta-labelling** (López de Prado Ch. 3.6) to
+   convert the modest IC into actionable position sizing.
+6. **Block bootstrap** (vs i.i.d.) for honest CI on autocorrelated returns.
+7. **Sensitivity grid** across cost assumptions and `k_per_side_pct`.
+
+Plus the deferred review-flagged items in `docs/HANDOFF.md`.

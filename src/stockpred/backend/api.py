@@ -27,6 +27,7 @@ import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import pandas as pd
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -104,6 +105,12 @@ async def lifespan(app: FastAPI):
     AppState.engine = make_engine(DB_PATH)
     create_all(AppState.engine)
     AppState.SessionLocal = make_session_factory(AppState.engine)
+    # Seed default watchlist (HND.TO, HNU.TO, UNG, SPY, ^VIX) on first boot.
+    try:
+        with session_scope(AppState.SessionLocal) as s:
+            store.seed_default_watchlist(s)
+    except Exception as e:  # noqa: BLE001
+        log.warning("watchlist seed failed: %s", e)
     AppState.scheduler = jobs_mod.make_scheduler(AppState.SessionLocal)
     if os.environ.get("STOCKPRED_DISABLE_SCHEDULER") != "1":
         AppState.scheduler.start()
@@ -138,7 +145,7 @@ def create_app() -> FastAPI:
         CORSMiddleware,
         allow_origins=origins,
         allow_credentials=not wildcard,  # incompatible with "*" per spec
-        allow_methods=["GET", "POST"],
+        allow_methods=["GET", "POST", "DELETE"],  # /watchlist/{ticker} needs DELETE
         allow_headers=["Authorization", "Content-Type", "X-API-Key"],
     )
 
@@ -421,6 +428,127 @@ def register_routes(app: FastAPI) -> None:
     @app.get("/jobs", tags=["jobs"])
     def jobs_list(limit: int = Query(default=25, ge=1, le=100)):
         return jobs_mod.list_jobs(limit)
+
+    # ----- Watchlist (HND.TO, HNU.TO, ^VIX, etc.) ----------------------
+
+    @app.get("/watchlist", response_model=list[schemas.WatchedItem], tags=["watchlist"])
+    def watchlist(s: Session = Depends(get_db)):
+        from stockpred.backend.models import PriceBar
+        from sqlalchemy import func, select
+
+        rows = store.list_watched(s)
+        # Last-price lookup per ticker.
+        latest = dict(
+            s.execute(
+                select(PriceBar.ticker, func.max(PriceBar.date))
+                .where(PriceBar.ticker.in_([r.ticker for r in rows]))
+                .group_by(PriceBar.ticker)
+            ).all()
+        )
+        out = []
+        for r in rows:
+            last_price = None
+            last_dt = latest.get(r.ticker)
+            if last_dt is not None:
+                bar = s.execute(
+                    select(PriceBar.adj_close).where(
+                        PriceBar.ticker == r.ticker, PriceBar.date == last_dt
+                    )
+                ).scalar_one_or_none()
+                last_price = float(bar) if bar is not None else None
+            out.append(
+                schemas.WatchedItem(
+                    ticker=r.ticker,
+                    label=r.label,
+                    category=r.category,
+                    note=r.note,
+                    last_price=last_price,
+                    last_updated=last_dt,
+                )
+            )
+        return out
+
+    @app.post(
+        "/watchlist",
+        response_model=schemas.WatchedItem,
+        tags=["watchlist"],
+        dependencies=[Depends(_require_api_key)],
+    )
+    def watchlist_add(item: schemas.WatchedAdd, s: Session = Depends(get_db)):
+        from stockpred.data import prices as prices_mod
+
+        # Pull a year of prices for the new ticker so the screener has data.
+        try:
+            df = prices_mod.fetch_one(item.ticker)
+            if not df.empty:
+                rows = (
+                    df.reset_index()
+                    .assign(date=lambda d: pd.to_datetime(d["date"]).dt.date)
+                    .assign(ticker=item.ticker)
+                    .to_dict("records")
+                )
+                store.upsert_prices(s, rows)
+        except Exception as e:  # noqa: BLE001
+            log.warning("watchlist add: prices fetch failed for %s: %s", item.ticker, e)
+        added = store.add_watched(
+            s, item.ticker, label=item.label, category=item.category, note=item.note
+        )
+        return schemas.WatchedItem(
+            ticker=added.ticker,
+            label=added.label,
+            category=added.category,
+            note=added.note,
+        )
+
+    @app.delete(
+        "/watchlist/{ticker}",
+        tags=["watchlist"],
+        dependencies=[Depends(_require_api_key)],
+    )
+    def watchlist_remove(ticker: str, s: Session = Depends(get_db)):
+        try:
+            ticker = schemas._validate_ticker(ticker)
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from None
+        removed = store.remove_watched(s, ticker)
+        if not removed:
+            raise HTTPException(404, "not in watchlist")
+        return {"ok": True}
+
+    # ----- News --------------------------------------------------------
+
+    @app.get(
+        "/tickers/{ticker}/news",
+        response_model=list[schemas.NewsHeadline],
+        tags=["tickers"],
+    )
+    def ticker_news(
+        ticker: str,
+        limit: int = Query(default=20, ge=1, le=100),
+        refresh: bool = Query(default=False),
+        s: Session = Depends(get_db),
+    ):
+        try:
+            ticker = schemas._validate_ticker(ticker)
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from None
+        if refresh:
+            from stockpred.data import news as news_mod
+
+            items = news_mod.fetch_one(ticker, max_items=limit, refresh=True)
+            store.upsert_news(s, ticker, items)
+        rows = store.news_for_ticker(s, ticker, limit=limit)
+        return [
+            schemas.NewsHeadline(
+                uuid=r.uuid,
+                title=r.title,
+                publisher=r.publisher,
+                link=r.link,
+                type=r.type,
+                published_at=r.published_at,
+            )
+            for r in rows
+        ]
 
 
 # ----- Static frontend ---------------------------------------------------

@@ -253,21 +253,92 @@ Stack: Vite + React 18 + TypeScript + Tailwind + shadcn/ui + TanStack Query + Ta
 28. Update README + PROJECT_LOG
 29. Final code-review sub-agent + final E2E + commit + push instructions
 
-## Last-known-good test snapshot (pre-rewrites)
+## Last-known-good test snapshot (Session 3 end)
 
 ```
-$ uv run pytest tests/ -v
-collected 16 items
-tests/test_backtest_engine.py ....     [25%]
-tests/test_features.py ...             [43%]
-tests/test_labels_no_leakage.py ...    [62%]
-tests/test_pipeline_integration.py .   [68%]
-tests/test_universe_html_parse.py ..   [81%]
-tests/test_walk_forward.py ...         [100%]
-============ 16 passed in ~25s ============
+$ uv run pytest tests/ -q
+62 passed in ~90s
 ```
 
-If a future session can't reach this state, `git checkout` to the last commit on `main` and start from there.
+Test files (10):
+- test_backtest_engine.py (7)
+- test_baseline_nan.py (1)
+- test_features.py (5)
+- test_labels_no_leakage.py (3)
+- test_pipeline_integration.py (1) — Phase 2 synthetic E2E
+- test_pipeline_v5.py (1) — Phase 5 synthetic E2E
+- test_portfolio_construction.py (6)
+- test_stress.py (6)
+- test_universe_html_parse.py (3)
+- test_walk_forward.py (6)
+- test_backend_api.py (12)
+- test_watchlist_and_news.py (11)
+
+## Session 3 additions
+
+- **`docs/CONCEPTS.md`** + **`docs/USAGE.md`** — beginner-friendly docs.
+- **`src/stockpred/pipeline_v5.py`** + **`scripts/run_phase5.py`** — Phase 5
+  pipeline with IC-IR ensemble + vol-scaled sizing + sector caps + min trade
+  threshold + holdout + bootstrap CI + VIX regime breakdown.
+- **`src/stockpred/data/news.py`** + `NewsItem` table + `/tickers/{t}/news`
+  endpoint + Ticker page news card.
+- **`WatchedTicker`** table + `/watchlist` endpoints + Screener page panel.
+  Seeded with HND.TO, HNU.TO, UNG, SPY, ^VIX on first boot.
+- **`macro.py` rewritten** to drop `pandas-datareader` and pull FRED CSVs
+  via plain `requests`.
+- **Strict ticker validation** on every `{ticker}` path parameter and
+  `WatchedAdd.ticker` Pydantic field (review C1).
+- **Chronological train/valid split** in Phase 5 holdout scoring (review C2).
+- **News link scheme allowlist** (only `http(s)://` persisted).
+
+## Phase 5 real-data result
+
+```
+DEV   Sharpe -0.04  ann_return -0.6%  max_dd -23%
+HOLD  Sharpe -0.84  bootstrap 95% CI [-1.60, -0.15]  ← entirely negative
+```
+
+The dev metrics improved massively from Phase 2 (Sharpe went from -1.30 to
+~breakeven). The holdout is statistically significantly negative. We do NOT
+claim a working strategy.
+
+## Open items for the next session
+
+In rough priority order:
+
+### From the Phase 5 reviewer's open findings
+- **H1**: bootstrap CI is i.i.d. on autocorrelated returns. Move to block
+  bootstrap with block length = `bt_horizon`.
+- **H2**: `_trailing_vol` double-lag with `trade_lag=1` in engine. Remove
+  the `.shift(1)` in `_trailing_vol` OR document explicitly.
+- **H3**: holdout IC-IR weights are calibrated on a different model than
+  the one producing holdout preds. Either compute IC-IR on the same final
+  fit, or use the last walk-forward fold's model for holdout.
+- **M1–M6**: see review report (search PROJECT_LOG for "Phase 5 reviewer").
+- **L2 fixed**: CORS now allows DELETE.
+- **Test gaps**: holdout-leakage canary, `_split_holdout` boundary test,
+  `_trailing_vol` lag unit test, SSRF test on POST /watchlist (added),
+  XSS test on news (added), bootstrap CI sanity test, ic_ir ensemble path
+  E2E (currently only `equal` path is end-to-end tested).
+
+### From the strategy-research report (Phase 6+ — real signal work)
+1. Audit the +2.45 dev IC IR (recompute features with strict t-1 cutoff;
+   Newey-West-adjusted IC IR t-stat).
+2. Beta-neutralisation vs SPY at the portfolio level.
+3. Add Tier-2 features: 12-1 momentum, IVOL, β, max return, Amihud, 52-week
+   high, sector-relative momentum.
+4. Add cross-asset regime features: VIX level/delta, term structure, USD,
+   credit spreads.
+5. Triple-barrier labels + meta-labelling (López de Prado Ch. 3.6).
+6. Sensitivity grid across cost assumptions.
+
+### NOT to be done in this project without scope change
+- Intraday or real-time trading (free data is delayed; needs paid feeds).
+- Broker integration (this is a research tool, not an exec system).
+- Point-in-time fundamentals (yfinance `.info` is current; leaks if used historically).
+- Sentiment scoring of news (free headline-only data + no paid LLM = noise).
+
+If a future session can't reach test green, `git checkout` to the most recent commit on `main` and start from there.
 
 ---
 

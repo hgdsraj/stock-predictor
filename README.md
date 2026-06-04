@@ -5,7 +5,25 @@ backend, real frontend, and honest backtests. Free public data only.
 Single-container deploy. Built to surface what works and what doesn't —
 *not* to promise alpha.
 
-![pipeline diagram: data → features → walk-forward CV → ensemble → portfolio → backtest → tearsheet & SPA](docs/architecture.svg)
+> **First time reading this?** Start with [`docs/CONCEPTS.md`](docs/CONCEPTS.md).
+> It explains every term used here (return, hit rate, IC, IC IR, Sharpe,
+> drawdown, leakage, walk-forward CV, …) for someone with no quant
+> background. Then [`docs/USAGE.md`](docs/USAGE.md) shows how to install,
+> run, and interpret the dashboard end-to-end.
+
+## What it does in one paragraph
+
+Every trading day, the system predicts which S&P 500 stocks will go up the
+most and which will go down the most over the next 1, 5, and (formerly) 21
+trading days. It buys the predicted winners, sells short the predicted
+losers, and tracks the resulting portfolio's performance. A web dashboard
+shows the predictions, a screener of every ticker, per-ticker deep-dive
+pages with charts and news, and a backtest tearsheet. The pipeline can be
+re-run on demand or on a daily cron.
+
+A few non-S&P "watchlist" instruments (HND.TO, HNU.TO, UNG, SPY, ^VIX) are
+also tracked for context — charted on the screener page but **not** fed into
+the model (they behave differently from regular stocks).
 
 ## Honest expectations (read first)
 
@@ -166,11 +184,93 @@ $ uv run pytest tests/ -v
 - `test_pipeline_integration.py` — end-to-end on synthetic noise with hit-rate canary
 - `test_backend_api.py` — FastAPI endpoint contracts + snapshot round-trip
 
+## Phase 5: improved pipeline (latest)
+
+`scripts/run_phase5.py` plugs in the Tier-1 improvements identified by the
+strategy-research sub-agent: **IC-IR-weighted ensemble** (drops horizons
+with no signal), **vol-scaled position sizing**, **30% sector exposure
+caps**, **minimum 0.5% trade threshold**, an **untouched 2-year holdout
+window**, **bootstrap Sharpe confidence intervals**, and a **VIX-regime
+breakdown**.
+
+Real-data result, 60 names, 2018–2024, h ∈ {1, 5}:
+
+| Metric                     | Phase 2 (baseline) | Phase 5 (improved) |
+| -------------------------- | ------------------ | ------------------ |
+| DEV Sharpe (net of costs)  | **−1.30**          | **−0.04**          |
+| DEV ann return             | −10.5%             | −0.6%              |
+| DEV max drawdown           | −57%               | −23%               |
+| HOLDOUT Sharpe             | *not computed*     | **−0.84**          |
+| HOLDOUT bootstrap 95% CI   | —                  | **[−1.60, −0.15]** (entirely negative — strategy loses *significantly* on unseen data) |
+| h=5d IC IR (dev / holdout) | +2.45 / —          | **+2.06 / +1.19**  |
+
+Phase 5 portfolio construction lifted the *in-sample* Sharpe by ~1.3
+(from −1.3 to ~0), exactly as the strategy-research sub-agent predicted.
+But the **honest holdout test still loses money**, and the bootstrap CI
+confirms it's a statistically significant loss — so we do *not* claim a
+working strategy. See [`docs/PROJECT_LOG.md`](docs/PROJECT_LOG.md) for the
+honest write-up and what Phase 6+ research would need to address.
+
+```bash
+uv run python scripts/run_phase5.py \
+    --start 2018-01-01 \
+    --n-tickers 100 \
+    --horizons 1 5 \
+    --weighting ic_ir \
+    --position-sizing vol_scaled \
+    --sector-cap 0.30 \
+    --min-trade-threshold 0.005 \
+    --holdout-years 2
+```
+
+## Watchlist
+
+A small watchlist is seeded on first boot (HND.TO, HNU.TO, UNG, SPY, ^VIX)
+and surfaced on the Screener page. You can add/remove arbitrary tickers via
+`POST/DELETE /watchlist/{ticker}` (API key required). The model never trains
+on or predicts for these — they're for context only, because leveraged ETFs,
+crypto, and indices behave too differently from S&P 500 stocks for the
+current model class to handle responsibly.
+
+## News
+
+Per-ticker headlines are pulled from yfinance (`Ticker.news`) and shown on
+the ticker detail page. **The model does not consume these as features** —
+free headline-level news is too sparse and ambiguous to score sentiment from
+without a proper LLM API, and rolling sentiment scoring into features is the
+single fastest way to introduce look-ahead bias. We surface them for human
+context; if you later want event flags (earnings windows, 8-K filings) as
+features, the research sub-agent's report in [`docs/PROJECT_LOG.md`](docs/PROJECT_LOG.md)
+explains how to do it without leaking the future.
+
+## Out of scope (and why)
+
+These are not in the project and won't be added without a corresponding
+change to the constraints:
+
+- **Intraday / real-time trading.** yfinance data is 15+ minutes delayed
+  and rate-limited; honest intraday work requires paid feeds
+  ($50–$500/month) and a broker API. The architecture would also change
+  substantially (latency monitoring, different model class, real exec
+  infra). See [`docs/CONCEPTS.md`](docs/CONCEPTS.md) §12.
+- **Buying or selling actual stocks.** No broker integration. The backtest
+  is a research output, not a trading system.
+- **Point-in-time fundamentals.** yfinance `.info` is current-as-of-fetch.
+  Using it historically leaks the future. We display fundamentals on the
+  ticker page but never feed them to the model.
+- **News sentiment.** Headlines alone are too noisy for a useful daily
+  signal without paid sentiment APIs or a substantial NLP pipeline.
+
 ## Project documents
 
+- [`docs/CONCEPTS.md`](docs/CONCEPTS.md) — **terminology & ideas for
+  beginners.** Read first.
+- [`docs/USAGE.md`](docs/USAGE.md) — install, run, interpret, operate,
+  extend.
 - [`docs/PROJECT_LOG.md`](docs/PROJECT_LOG.md) — full chronological log
-- [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) — Docker, Fly, Render, VM
-- [`docs/HANDOFF.md`](docs/HANDOFF.md) — resume protocol for new sessions
+  including the strategy-research sub-agent's report and Phase 5 results.
+- [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) — Docker, Fly, Render, VM.
+- [`docs/HANDOFF.md`](docs/HANDOFF.md) — resume protocol for new sessions.
 
 ## License
 
