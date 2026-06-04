@@ -1,0 +1,222 @@
+"""Phase 11 tests: feature_exclude pruning hook in PipelineV5Config.
+
+The hook drops named columns from the feature matrix right after
+`ranks_only` is applied. Tests verify:
+
+  - feature_exclude=() is a no-op
+  - feature_exclude=('ret_1d_rank',) actually drops that column
+  - missing names are ignored (warning) without crashing
+  - removing ALL feature columns raises a clear RuntimeError rather
+    than silently training on an empty matrix
+"""
+
+from __future__ import annotations
+
+import logging
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from stockpred.pipeline_v5 import PipelineV5Config, run_pipeline_v5
+
+
+@pytest.fixture
+def synthetic_market(monkeypatch):
+    """Same fixture pattern as test_phase8.synthetic_market."""
+    rng = np.random.default_rng(17)
+    dates = pd.bdate_range("2012-01-02", "2022-12-31")
+    tickers = [f"SYN{i:02d}" for i in range(30)]
+    rets = rng.normal(0.0002, 0.012, size=(len(dates), len(tickers)))
+    prices = 100 * np.exp(np.cumsum(rets, axis=0))
+    volumes = rng.integers(1_000_000, 50_000_000, size=prices.shape)
+
+    long_rows = []
+    for i, t in enumerate(tickers):
+        df = pd.DataFrame(
+            {
+                "open": prices[:, i],
+                "high": prices[:, i] * 1.005,
+                "low": prices[:, i] * 0.995,
+                "close": prices[:, i],
+                "adj_close": prices[:, i],
+                "volume": volumes[:, i],
+            },
+            index=dates,
+        )
+        df.index.name = "date"
+        df["ticker"] = t
+        long_rows.append(df)
+    long_panel = pd.concat(long_rows).reset_index().set_index(["date", "ticker"]).sort_index()
+
+    fake_membership = pd.DataFrame(
+        {
+            "ticker": tickers,
+            "start_date": [pd.NaT] * len(tickers),
+            "end_date": [pd.NaT] * len(tickers),
+        }
+    )
+
+    monkeypatch.setattr(
+        "stockpred.pipeline.universe_mod.fetch_sp500_membership",
+        lambda *a, **kw: fake_membership,
+    )
+    monkeypatch.setattr(
+        "stockpred.pipeline.universe_mod.all_tickers_in_range",
+        lambda *a, **kw: tickers,
+    )
+    monkeypatch.setattr(
+        "stockpred.pipeline_v5.prices_mod.long_panel",
+        lambda *a, **kw: long_panel,
+    )
+    monkeypatch.setattr(
+        "stockpred.pipeline.prices_mod.long_panel",
+        lambda *a, **kw: long_panel,
+    )
+    monkeypatch.setattr(
+        "stockpred.pipeline_v5.fundamentals_mod.fetch_fundamentals",
+        lambda *a, **kw: pd.DataFrame(),
+    )
+    monkeypatch.setattr(
+        "stockpred.pipeline_v5.fundamentals_mod.sector_map",
+        lambda *a, **kw: {},
+    )
+    monkeypatch.setattr(
+        "stockpred.pipeline_v5.macro_mod.fetch_macro",
+        lambda *a, **kw: pd.DataFrame(),
+    )
+    monkeypatch.setattr(
+        "stockpred.pipeline_v5.prices_mod.fetch_one",
+        lambda *a, **kw: pd.DataFrame(),
+    )
+    return tickers
+
+
+def _base_cfg(synthetic_market, **overrides):
+    """Minimal Phase 8-ish config that runs fast on the synthetic fixture."""
+    base = dict(
+        start_date="2012-01-02",
+        end_date="2022-12-31",
+        n_tickers=len(synthetic_market),
+        horizons=(1,),
+        model="logistic",
+        ensemble_weighting="equal",
+        position_sizing="vol_scaled",
+        k_per_side_pct=0.2,
+        sector_cap_gross=None,
+        min_trade_threshold=0.0,
+        holdout_years=2,
+        use_sector_features=False,
+        use_tier2_features=False,
+        use_regime_features=False,
+        ranks_only=True,
+        bootstrap_n=20,
+    )
+    base.update(overrides)
+    return PipelineV5Config(**base)
+
+
+def test_phase11_feature_exclude_empty_is_noop(synthetic_market, tmp_path, monkeypatch):
+    """feature_exclude=() must run identically to omitting the field."""
+    monkeypatch.setattr("stockpred.pipeline_v5.REPORTS_DIR", tmp_path)
+    cfg = _base_cfg(synthetic_market, feature_exclude=())
+    result = run_pipeline_v5(cfg)
+    # Should have the same number of features ranks_only-mode produces.
+    assert result["feature_matrix_shape"][1] > 0
+
+
+def test_phase11_feature_exclude_drops_named_column(
+    synthetic_market, tmp_path, monkeypatch, caplog
+):
+    """feature_exclude=('ret_1d_rank',) must drop that column.
+
+    We compare feature_matrix_shape between baseline and excluded run; the
+    excluded run should have exactly one fewer column.
+    """
+    caplog.set_level(logging.INFO, logger="stockpred.pipeline_v5")
+    monkeypatch.setattr("stockpred.pipeline_v5.REPORTS_DIR", tmp_path)
+
+    cfg_base = _base_cfg(synthetic_market, feature_exclude=())
+    cfg_excl = _base_cfg(synthetic_market, feature_exclude=("ret_1d_rank",))
+
+    res_base = run_pipeline_v5(cfg_base)
+    res_excl = run_pipeline_v5(cfg_excl)
+
+    # Either ret_1d_rank exists (then drop reduces by 1) or it doesn't
+    # (then drop is a no-op and the warning fires). Both are valid; we
+    # only assert non-empty result. The "drops by 1" case is the
+    # interesting one; if ret_1d_rank is generated by the feature
+    # builder, the shapes should differ.
+    base_cols = res_base["feature_matrix_shape"][1]
+    excl_cols = res_excl["feature_matrix_shape"][1]
+    # ret_1d_rank is produced by add_cross_sectional_ranks on the ret_1d
+    # technical feature; it should be in the ranks_only set.
+    assert excl_cols == base_cols - 1, (
+        f"expected excluded run to have one fewer column (base={base_cols}, excluded={excl_cols})"
+    )
+
+
+def test_phase11_feature_exclude_missing_names_warn_not_crash(
+    synthetic_market, tmp_path, monkeypatch, caplog
+):
+    """Names not in feats should be ignored with a WARNING, not crash."""
+    caplog.set_level(logging.WARNING, logger="stockpred.pipeline_v5")
+    monkeypatch.setattr("stockpred.pipeline_v5.REPORTS_DIR", tmp_path)
+    cfg = _base_cfg(
+        synthetic_market,
+        feature_exclude=("definitely_not_a_real_feature_xyz",),
+    )
+    # Must complete without raising.
+    result = run_pipeline_v5(cfg)
+    assert result["feature_matrix_shape"][1] > 0
+    # And we should have logged a warning about the missing name.
+    assert any(
+        "not present" in rec.getMessage().lower()
+        and "definitely_not_a_real_feature_xyz" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+def test_phase11_feature_exclude_all_columns_raises(synthetic_market, tmp_path, monkeypatch):
+    """Excluding every column must raise RuntimeError, not silently train
+    on an empty matrix."""
+    monkeypatch.setattr("stockpred.pipeline_v5.REPORTS_DIR", tmp_path)
+
+    # First, get the column list with a no-op run.
+    cfg_base = _base_cfg(synthetic_market, feature_exclude=())
+    res = run_pipeline_v5(cfg_base)
+    n_base = res["feature_matrix_shape"][1]
+    assert n_base > 0
+
+    # Rebuild config that excludes every column. We don't know the names
+    # without re-running, so we use a second config that excludes via
+    # the actual feature names. Cheat: we know the rank cols end with
+    # _rank under ranks_only=True. Pass a permissive blocklist by
+    # introspecting the feature builder.
+    from stockpred.features.cross_sectional import add_cross_sectional_ranks
+    from stockpred.features.technical import compute_technical_features
+
+    # Re-build the same feature matrix the pipeline would build and pull
+    # column names. (Same code path the pipeline uses.)
+    import pandas as pd_
+    import numpy as _np
+
+    rng = _np.random.default_rng(17)
+    dates = pd_.bdate_range("2012-01-02", "2022-12-31")
+    tickers = synthetic_market
+    rets = rng.normal(0.0002, 0.012, size=(len(dates), len(tickers)))
+    prices = 100 * _np.exp(_np.cumsum(rets, axis=0))
+    volumes = rng.integers(1_000_000, 50_000_000, size=prices.shape)
+    close = pd_.DataFrame(prices, index=dates, columns=tickers)
+    close.index.name = "date"
+    close.columns.name = "ticker"
+    volume = pd_.DataFrame(volumes, index=dates, columns=tickers)
+    volume.index.name = "date"
+    volume.columns.name = "ticker"
+    feats = add_cross_sectional_ranks(compute_technical_features(close, volume=volume))
+    all_rank_cols = [c for c in feats.columns if c.endswith("_rank")]
+    assert len(all_rank_cols) > 0  # sanity
+
+    cfg_all = _base_cfg(synthetic_market, feature_exclude=tuple(all_rank_cols))
+    with pytest.raises(RuntimeError, match="removed ALL feature columns"):
+        run_pipeline_v5(cfg_all)

@@ -152,35 +152,63 @@ floor_sweep.py`. Output: `reports/phase10_conf_floor_sweep.csv`.
 
 Next candidates:
 
-1. **Phase 11 — feature pruning from per-feature audit**: re-run
-   `per_feature_audit.py` on the big universe (currently it's 100-name),
-   then drop the bottom-quartile by `pct_drop`. Test whether removing
-   noisy features improves holdout.
-2. **Phase 12 — chained TB + meta on the best config**: `--triple-barrier`
-   + `--meta-labelling --ranks-only --position-sizing hrp` together.
-   Currently neither has been tested in combination on the big universe.
+1. **Phase 11 — feature pruning from per-feature audit** *(IN PROGRESS as
+   of this commit)*: re-run `per_feature_audit.py` on the big universe
+   (150-name × 11yr), then test baseline vs drop-bottom-quartile-by-
+   `pct_drop` vs drop-top-quartile-by-`pct_drop` on the Phase 8 best
+   config. Driver: `scripts/phase11_feature_pruning.py`. Pipeline hook:
+   `PipelineV5Config.feature_exclude: tuple[str, ...] = ()`.
+2. **Phase 12 — EDGAR 8-K event flags as features** *(user requested
+   2026-06-04, news-as-features path; promoted from Phase 16)*: free
+   historical event flags (8-K filed today: Y/N) from SEC EDGAR's free
+   JSON API. Binary daily per-ticker feature plus rolling event-count
+   features (8-K events in last 5/21/63 days). Most-defensible news
+   source: full historical coverage, no sentiment-model dependency, no
+   selection bias. Honest expectation: small effect if any.
+3. **Phase 13 — GDELT tone + event counts** *(user requested
+   2026-06-04)*: free GDELT 2.0 GKG (Global Knowledge Graph) per-ticker
+   daily tone score and theme counts, historical to 2015. Adds
+   sentiment-like signal layered on EDGAR's event flags. Bias risk:
+   left boundary at ~2015 reduces 2014 training rows.
+4. **Phase 14 — FinBERT live-mode sentiment** *(user requested
+   2026-06-04; DASHBOARD-ONLY, NOT a backtest feature)*: use existing
+   yfinance news plumbing (`src/stockpred/data/news.py`) + local
+   FinBERT model (~500 MB download) to score headlines for the Ticker
+   detail page in the UI. Surface latest sentiment as a panel, not a
+   model input. We do NOT use it as a backtest feature because
+   yfinance only has ~30 days of history; using it as a feature would
+   create catastrophic selection bias in walk-forward CV.
+5. **Phase 15 — chained TB + meta on the best config**: `--triple-barrier`
+   + `--meta-labelling --ranks-only --position-sizing hrp` together,
+   layered on whatever the best result from Phases 11-13 ends up being.
    Consider also pinning `--meta-mode confidence --meta-conf-floor 0.60`
    (the Phase 10 sweet spot) as a third leg.
-3. **Phase 13 — Fama-MacBeth cross-sectional regression**: replace the
+6. **Phase 16 — Fama-MacBeth cross-sectional regression**: replace the
    per-date GBM-then-rank with a daily Fama-MacBeth regression of returns
    on factor exposures. Different model class, less prone to overfit on
    tabular data with weak signals.
-4. **Phase 14 — hyperparameter sweep on the best config**: with the
+7. **Phase 17 — hyperparameter sweep on the best config**: with the
    sensitivity grid runner, sweep GBM `num_leaves`, `learning_rate`,
-   `n_estimators`, `min_data_in_leaf` on Phase 8 config. Report best
-   holdout Sharpe + CI.
-5. **Phase 15 — robust signal aggregation**: replace `top_bottom_k` per
+   `n_estimators`, `min_data_in_leaf` on the best post-Phase-15 config.
+   Report best holdout Sharpe + CI.
+8. **Phase 18 — robust signal aggregation**: replace `top_bottom_k` per
    day with a daily Bayesian shrinkage of the GBM output toward zero,
    weighted by historical sign-precision per ticker. Lopez de Prado
    Ch. 4 style.
-6. **Phase 16 (out of scope without budget)**: news + sentiment via
-   local FinBERT (~500 MB model), event flags from EDGAR 8-K, intraday
-   data via Alpaca/Polygon (paid).
+9. **OUT-OF-SCOPE without budget**: intraday data via Alpaca/Polygon
+   (paid); options-flow / IV-skew (paid); high-frequency news wire
+   (Bloomberg/Reuters, paid).
 
 **None of these are guaranteed to flip HOLDOUT Sharpe above zero.** The
 strategy-research sub-agent's ceiling estimate for free-data daily-bar
 S&P 500 cross-sectional L/S is net Sharpe 0.4–0.8 *if* something works,
 with most retail attempts capping below 1.0. We are at 0 (CI straddles).
+
+**News-as-features rationale (per user direction 2026-06-04)**: EDGAR
+event flags first (most-defensible, full history); GDELT tone second
+(layered on, ~2015 boundary); FinBERT third (live-mode only, dashboard
+panel, NOT a backtest feature — yfinance shallow history would cause
+catastrophic walk-forward bias).
 
 ## Known issues / wart list (don't add to roadmap; just be aware)
 

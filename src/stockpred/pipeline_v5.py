@@ -180,6 +180,13 @@ class PipelineV5Config:
     # versions add noise + same-day regime-level dependence.
     ranks_only: bool = False
 
+    # Phase 11: explicit feature-name blocklist. Any column whose name is
+    # in this tuple is dropped from `feats` right after `ranks_only` is
+    # applied. Used by `scripts/phase11_feature_pruning.py` to test whether
+    # removing low-information features (per per-feature audit) improves
+    # holdout. Empty tuple = no pruning (default).
+    feature_exclude: tuple[str, ...] = ()
+
     # Stress
     bootstrap_n: int = 500
 
@@ -696,6 +703,27 @@ def run_pipeline_v5(cfg: PipelineV5Config | None = None) -> dict:
             feats = feats[keep_cols]
         else:
             log.warning("ranks_only: no rank/sec/reg columns found; keeping all")
+
+    # Phase 11: explicit feature blocklist. Applied AFTER ranks_only so the
+    # blocklist can target either raw or rank columns regardless of whether
+    # ranks_only is set.
+    if cfg.feature_exclude:
+        present = [c for c in cfg.feature_exclude if c in feats.columns]
+        missing = [c for c in cfg.feature_exclude if c not in feats.columns]
+        if missing:
+            log.warning(
+                "feature_exclude: %d names not present in feats (ignored): %s",
+                len(missing),
+                missing,
+            )
+        if present:
+            log.info("feature_exclude: dropping %d cols: %s", len(present), present)
+            feats = feats.drop(columns=present)
+            if feats.shape[1] == 0:
+                raise RuntimeError(
+                    "feature_exclude removed ALL feature columns; refusing to "
+                    "train on an empty matrix."
+                )
 
     log.info("Final feature matrix: %s rows x %s cols", *feats.shape)
 
