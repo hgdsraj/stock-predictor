@@ -10,8 +10,8 @@ venv/
 .uv/
 
 # Data + cache (NEVER commit)
-data/
-cache/
+/data/
+/cache/
 *.parquet
 *.feather
 *.csv

@@ -9,11 +9,6 @@ __pycache__
 .pytest_cache
 .ruff_cache
 .mypy_cache
-data/
-cache/
-logs/
-reports/
-models/
 notebooks/
 web/node_modules
 web/dist
