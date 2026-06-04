@@ -253,12 +253,40 @@ Stack: Vite + React 18 + TypeScript + Tailwind + shadcn/ui + TanStack Query + Ta
 28. Update README + PROJECT_LOG
 29. Final code-review sub-agent + final E2E + commit + push instructions
 
-## Last-known-good test snapshot (Session 4 end)
+## Last-known-good test snapshot (Session 5 end)
 
 ```
 $ uv run pytest tests/ -q
-75 passed in ~125s
+101 passed in ~170s
 ```
+
+Session 5 added:
+- `src/stockpred/backtest/hrp.py` — Hierarchical Risk Parity
+- `src/stockpred/labels_triple_barrier.py` — Triple-barrier labels
+- `src/stockpred/models/meta.py` — Meta-labelling
+- `scripts/per_feature_audit.py` — Per-feature leakage attribution
+- Engine: `pct_change` now clipped to ±50% (data-glitch defence)
+- 14 new tests in `test_phase7.py`, 1 new in `test_backtest_engine.py`
+
+Phase 7 reviewer fixes applied:
+- HRP/vol_scaled `kk <= n//2` clamp
+- `_cov_estimate` drops `bfill`
+- HRP numerical stability hardening
+- `build_meta_dataset` forbidden-column guard
+
+Big-universe Phase 7 result:
+- 822 historical S&P 500 tickers, 2008-2024, h={1,5}
+- HOLDOUT Sharpe: vol_scaled −0.78, HRP **−0.69** (HRP slightly better)
+- HOLDOUT 95% block-CI for HRP: [−1.12, −0.24] (still entirely negative)
+- Per-horizon HOLDOUT IC IR: h=1 +0.69, h=5 +0.49 (real signal!)
+- The signal is real; portfolio construction is reasonable; but the
+  strategy still loses money on holdout after costs.
+
+Phase 8+ research items (in PROJECT_LOG):
+- Wire meta-labelling as a primary-signal gate
+- Wire triple-barrier as an alternate training target
+- Run per_feature_audit on the big universe
+- Try longer horizons (h=21+) on the big universe
 
 Phase 6 additions (this session):
 - `src/stockpred/features/tier2.py` — momentum_12_1, st_reversal_5,

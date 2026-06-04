@@ -139,3 +139,29 @@ def test_zero_horizon_or_negative_raises_sane_error_or_works():
     res = run_backtest(w, px, cfg=_ZERO_COSTS(), horizon=1, trade_lag=1)
     assert "AAA" in res.held_weights.columns
     assert "AAA" in res.target_weights.columns
+
+
+def test_pct_change_is_clipped_to_plus_minus_50pct():
+    """Defensive fix (Phase 7 big-universe finding): data-quality glitches
+    in adjusted close (e.g. 0.50 -> 0.01 -> 0.50 reverse-split artefacts)
+    produce phantom +9900% / -99% returns that, multiplied by even a small
+    position weight, blow up DEV NAV.
+
+    Backtester now clips per-name pct_change to +/- 50%."""
+    idx = pd.bdate_range("2020-01-01", periods=5)
+    # AAA goes through a data glitch (100 -> 100 -> 1 -> 100 -> 100).
+    px = pd.DataFrame({"AAA": [100.0, 100.0, 1.0, 100.0, 100.0]}, index=idx)
+    w = pd.DataFrame(0.1, index=idx, columns=["AAA"])  # constant +0.1 position
+    res = run_backtest(w, px, cfg=_ZERO_COSTS(), horizon=1, trade_lag=1)
+    # Without clipping, day 2 = -99% * 0.1 = -9.9% and day 3 = +9900% * 0.1 = +990.
+    # With clipping, day 2 is at most -50% * 0.1 = -5% and day 3 +50% * 0.1 = +5%.
+    daily = res.gross_returns.dropna().abs()
+    assert (daily <= 0.05 + 1e-9).all(), f"clipping failed: {daily.tolist()}"
+    """Smoke: horizon=1 default path should be safe even for tiny panels."""
+    idx = pd.bdate_range("2020-01-01", periods=3)
+    px = pd.DataFrame({"AAA": [100.0, 101.0, 102.01]}, index=idx)
+    w = pd.DataFrame(0.0, index=idx, columns=["AAA"])
+    w.iloc[0] = 1.0
+    res = run_backtest(w, px, cfg=_ZERO_COSTS(), horizon=1, trade_lag=1)
+    assert "AAA" in res.held_weights.columns
+    assert "AAA" in res.target_weights.columns

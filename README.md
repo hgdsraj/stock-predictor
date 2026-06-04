@@ -216,12 +216,30 @@ not the forward return. **Fix:** the denominator is now strictly t-1 lagged.
 - combos with HOLDOUT Sharpe > 0: **0 / 8**
 - combos with bootstrap CI lower > 0: **0 / 8**
 
-**The strategy as currently configured does not produce a positive
-risk-adjusted return on unseen data.** This is the honest outcome of a
-free-data, daily-bar, 60-name research project — and is in line with the
-strategy-research sub-agent's stated realistic ceiling. The infrastructure
-correctly surfaces this rather than hiding it. See [`docs/PROJECT_LOG.md`](docs/PROJECT_LOG.md)
-for the full Phase 6 write-up and Phase 7+ roadmap.
+### Phase 7: HRP + triple-barrier + meta-labelling + per-feature audit + big-universe run
+
+Added: Hierarchical Risk Parity portfolio construction (López de Prado 2016),
+triple-barrier labels (Ch. 3), meta-labelling (Ch. 3.6), per-feature leakage
+audit, and a defensive ±50% clip on daily returns to handle yfinance
+data-quality glitches.
+
+**Big universe (822 historical S&P 500 tickers, 2008-2024) result:**
+
+| Configuration                    | HOLDOUT Sharpe | HOLDOUT 95% block-CI | HOLDOUT max DD |
+| -------------------------------- | -------------- | -------------------- | -------------- |
+| Phase 6 vol_scaled               | −0.78          | [−1.29, −0.31]       | −32%           |
+| Phase 7 HRP                      | **−0.69**      | **[−1.12, −0.24]**   | **−29.6%**     |
+
+Per-horizon HOLDOUT IC IR is now **positive on both horizons** (h=1d +0.69,
+h=5d +0.49) on the big universe — the signal is real and survives the
+honest out-of-sample test. But the strategy still loses money after costs.
+HRP gave a small but real improvement over vol-scaled top-K.
+
+**The bottom line after four phases of careful work: the strategy class
+(free-data daily-bar cross-sectional L/S) does not have meaningful retail-
+accessible edge in this period.** The infrastructure remains valuable for
+honest experimentation. See [`docs/PROJECT_LOG.md`](docs/PROJECT_LOG.md)
+for the full Phase 7 write-up and Phase 8+ roadmap.
 
 ```bash
 uv run python scripts/run_phase5.py \
