@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import re
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -101,6 +102,114 @@ class RunSummary(BaseModel):
 class BacktestSummary(BaseModel):
     run: RunSummary
     equity_curve: list[EquityPoint]
+
+
+class CVParams(BaseModel):
+    train_years: int = Field(default=3, ge=1)
+    test_months: int = Field(default=6, ge=1)
+    embargo_days: int = Field(default=25, ge=0)
+    min_train_obs: int = Field(default=1000, ge=1)
+
+
+class GBMParams(BaseModel):
+    num_leaves: int = Field(default=63, ge=2)
+    learning_rate: float = Field(default=0.03, gt=0)
+    n_estimators: int = Field(default=800, ge=1)
+    min_data_in_leaf: int = Field(default=200, ge=1)
+    feature_fraction: float = Field(default=0.8, gt=0, le=1)
+    bagging_fraction: float = Field(default=0.8, gt=0, le=1)
+    bagging_freq: int = Field(default=5, ge=0)
+    reg_lambda: float = Field(default=1.0, ge=0)
+    early_stopping_rounds: int | None = Field(default=50)
+
+
+class RefreshRequest(BaseModel):
+    """Body for POST /jobs/refresh. All fields are optional; defaults mirror the pipeline configs."""
+
+    phase: Literal[1, 5] = Field(
+        default=1,
+        description="Which pipeline to run. 1 = Phase 1 (basic GBM), 5 = Phase 5 (vol-scaled, regime-aware).",
+    )
+
+    # --- Universe / history ---
+    start_date: str = Field(default="2010-01-01", description="ISO date, e.g. '2015-01-01'")
+    end_date: str | None = Field(default=None, description="ISO date; None = today")
+    n_tickers: int | None = Field(default=100, ge=1, description="Universe size; None = all")
+    universe_sampling: Literal["random", "current", "first"] = Field(
+        default="random",
+        description="How tickers are sampled from S&P 500 membership history.",
+    )
+    refresh_data: bool = Field(default=False, description="Force-refetch cached price/fundamental data")
+
+    # --- Horizons + model ---
+    horizons: list[int] | None = Field(
+        default=None,
+        description=(
+            "Forecast horizons in trading days. "
+            "Defaults to [1, 5, 21] for phase 1 and [1, 5] for phase 5 "
+            "(21d showed no signal in Phase 2 evaluation)."
+        ),
+    )
+    model: Literal["gbm", "logistic"] = Field(default="gbm")
+    use_sector_features: bool = Field(default=True)
+
+    # --- CV ---
+    cv: CVParams = Field(default_factory=CVParams)
+
+    # --- GBM hyper-params (ignored when model='logistic') ---
+    gbm: GBMParams = Field(default_factory=GBMParams)
+
+    # --- Phase 1 only ---
+    k_per_side: int = Field(
+        default=20, ge=1, description="[Phase 1] Number of longs and shorts in portfolio."
+    )
+    feature_cols: list[str] | None = Field(
+        default=None, description="[Phase 1] Explicit feature list; None = use all."
+    )
+
+    # --- Phase 5 only ---
+    use_tier2_features: bool = Field(
+        default=True,
+        description="[Phase 5] Include 12-1 momentum, IVOL, beta, max-ret, Amihud features.",
+    )
+    use_regime_features: bool = Field(
+        default=True,
+        description="[Phase 5] Include VIX, term spread, USD, cross-sectional dispersion features.",
+    )
+    beta_neutralise: bool = Field(
+        default=False, description="[Phase 5] Apply portfolio-level beta-vs-SPY neutralisation."
+    )
+    bootstrap_method: Literal["block", "iid"] = Field(
+        default="block", description="[Phase 5] Stress-test bootstrap method."
+    )
+    holdout_years: int = Field(
+        default=2, ge=0, description="[Phase 5] Years held out from CV / model selection."
+    )
+    position_sizing: Literal["vol_scaled", "top_k"] = Field(
+        default="vol_scaled",
+        description="[Phase 5] Portfolio construction method.",
+    )
+    k_per_side_pct: float = Field(
+        default=0.15,
+        gt=0,
+        le=1,
+        description="[Phase 5] Fraction of universe selected per side (vol_scaled mode).",
+    )
+    leverage_per_side: float = Field(default=1.0, gt=0, description="[Phase 5] Gross leverage per side.")
+    sector_cap_gross: float | None = Field(
+        default=0.30,
+        description="[Phase 5] Max gross exposure per GICS sector; None = uncapped.",
+    )
+    min_trade_threshold: float = Field(
+        default=0.005, ge=0, description="[Phase 5] Ignore weight changes smaller than this."
+    )
+    ensemble_weighting: Literal["ic_ir", "equal"] = Field(
+        default="ic_ir",
+        description="[Phase 5] How to weight horizons in the ensemble score.",
+    )
+    bootstrap_n: int = Field(
+        default=500, ge=1, description="[Phase 5] Number of bootstrap samples for stress test."
+    )
 
 
 class JobResponse(BaseModel):

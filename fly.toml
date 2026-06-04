@@ -7,7 +7,7 @@ app = 'stock-predictor'
 primary_region = 'ord'
 
 [build]
-  dockerfile = "Dockerfile"
+  dockerfile = "Dockerfile.fly"
 
 [env]
   STOCKPRED_DB = "/data/app.db"

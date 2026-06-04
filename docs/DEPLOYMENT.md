@@ -12,7 +12,6 @@ required. To run, you need:
 - Docker (with `compose` plugin) on the host, OR
 - A platform that builds from a `Dockerfile` (Fly.io, Render, Railway, Koyeb, …), OR
 - Python 3.11+ and Node 20+ on the host (manual).
-
 ## Local quick-start (Docker)
 
 ```bash
@@ -193,14 +192,96 @@ Alembic migration script and noted in the commit message.
 
 ### Trigger a refresh from CLI
 
+`POST /jobs/refresh` accepts an optional JSON body. Omit it entirely to run
+Phase 1 with stock defaults.
+
 ```bash
-# STOCKPRED_API_KEY must be set on the server. Without it, the write
-# endpoints are disabled (403). With it, every request must carry the
-# X-API-Key header.
-curl -X POST -H "X-API-Key: $STOCKPRED_API_KEY" http://localhost:8000/jobs/refresh
+# Minimal — Phase 1, all defaults
+curl -X POST \
+     -H "X-API-Key: $STOCKPRED_API_KEY" \
+     http://localhost:8000/jobs/refresh
 # returns: {"job_id": "<uuid>", "status": "queued"}
 
+# Phase 5 (vol-scaled, regime-aware) with a smaller universe
+curl -X POST \
+     -H "X-API-Key: $STOCKPRED_API_KEY" \
+     -H "Content-Type: application/json" \
+     -d '{"phase": 5, "n_tickers": 50}' \
+     http://localhost:8000/jobs/refresh
+
+# Force-refresh cached data and use a specific date window
+curl -X POST \
+     -H "X-API-Key: $STOCKPRED_API_KEY" \
+     -H "Content-Type: application/json" \
+     -d '{"refresh_data": true, "start_date": "2015-01-01"}' \
+     http://localhost:8000/jobs/refresh
+
+# Poll until done
 curl http://localhost:8000/jobs/<uuid>
+```
+
+#### Full body reference
+
+All fields are optional. Unset fields use the pipeline defaults shown below.
+
+```jsonc
+{
+  // Which pipeline to run.
+  // 1 = Phase 1 (basic GBM, top-k portfolio)
+  // 5 = Phase 5 (vol-scaled, regime-aware, sector-capped)
+  "phase": 1,
+
+  // Universe / history
+  "start_date": "2010-01-01",  // ISO date
+  "end_date": null,            // null = today
+  "n_tickers": 100,            // null = all S&P 500 members
+  "universe_sampling": "random",  // "random" | "current" | "first"
+  "refresh_data": false,       // force-refetch cached price/fundamental data
+
+  // Model
+  "horizons": [1, 5, 21],     // forecast horizons in trading days
+  "model": "gbm",             // "gbm" | "logistic"
+  "use_sector_features": true,
+
+  // Cross-validation
+  "cv": {
+    "train_years": 3,
+    "test_months": 6,
+    "embargo_days": 25,
+    "min_train_obs": 1000
+  },
+
+  // LightGBM hyper-params (ignored when model = "logistic")
+  "gbm": {
+    "num_leaves": 63,
+    "learning_rate": 0.03,
+    "n_estimators": 800,
+    "min_data_in_leaf": 200,
+    "feature_fraction": 0.8,
+    "bagging_fraction": 0.8,
+    "bagging_freq": 5,
+    "reg_lambda": 1.0,
+    "early_stopping_rounds": 50
+  },
+
+  // ── Phase 1 only ──────────────────────────────────────────────
+  "k_per_side": 20,           // number of longs and shorts
+  "feature_cols": null,       // explicit feature list; null = use all
+
+  // ── Phase 5 only ──────────────────────────────────────────────
+  "use_tier2_features": true,    // 12-1 momentum, IVOL, beta, max-ret, Amihud
+  "use_regime_features": true,   // VIX, term spread, USD, cross-sec dispersion
+  "beta_neutralise": false,      // portfolio-level beta-vs-SPY neutralisation
+  "bootstrap_method": "block",   // "block" | "iid"
+  "holdout_years": 2,            // years held out from CV
+  "position_sizing": "vol_scaled", // "vol_scaled" | "top_k"
+  "k_per_side_pct": 0.15,        // fraction of universe per side (vol_scaled)
+  "leverage_per_side": 1.0,
+  "sector_cap_gross": 0.30,      // max gross exposure per GICS sector; null = uncapped
+  "min_trade_threshold": 0.005,
+  "ensemble_weighting": "ic_ir", // "ic_ir" | "equal"
+  "bootstrap_n": 500
+}
 ```
 
 ### Inspect the latest run

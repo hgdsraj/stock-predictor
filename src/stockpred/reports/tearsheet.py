@@ -30,17 +30,30 @@ def _fig_to_b64(fig: plt.Figure) -> str:
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
+def _sanitize_returns(r: pd.Series) -> pd.Series:
+    """Drop NaN/inf and clip extreme daily returns to prevent cumprod overflow."""
+    r = r.replace([float("inf"), float("-inf")], float("nan")).dropna()
+    # Cap at ±500% daily to avoid numpy overflow in cumprod
+    return r.clip(-5.0, 5.0)
+
+
 def _equity_chart(returns: pd.Series, benchmark: pd.Series | None) -> str:
     # L6 fix: plot only on dates with real returns, so NaN stretches don't
     # appear as flat (== "no drawdown / no movement") in the chart.
-    r = returns.dropna()
+    r = _sanitize_returns(returns)
+    if r.empty:
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.set_title("Equity curve (no data)")
+        return _fig_to_b64(fig)
     cum = (1 + r).cumprod()
+    cum = cum.replace([float("inf"), float("-inf")], float("nan")).dropna()
     fig, ax = plt.subplots(figsize=(10, 4))
     ax.plot(cum.index, cum.values, label="strategy", linewidth=1.5)
     if benchmark is not None:
-        bench = benchmark.reindex(cum.index).dropna()
+        bench = _sanitize_returns(benchmark).reindex(cum.index).dropna()
         if not bench.empty:
             bcum = (1 + bench).cumprod()
+            bcum = bcum.replace([float("inf"), float("-inf")], float("nan")).dropna()
             ax.plot(bcum.index, bcum.values, label="benchmark", linewidth=1.0, alpha=0.7)
     ax.set_title("Equity curve")
     ax.set_ylabel("Growth of $1")
@@ -50,8 +63,13 @@ def _equity_chart(returns: pd.Series, benchmark: pd.Series | None) -> str:
 
 
 def _drawdown_chart(returns: pd.Series) -> str:
-    r = returns.dropna()
+    r = _sanitize_returns(returns)
+    if r.empty:
+        fig, ax = plt.subplots(figsize=(10, 3))
+        ax.set_title("Drawdown (no data)")
+        return _fig_to_b64(fig)
     cum = (1 + r).cumprod()
+    cum = cum.replace([float("inf"), float("-inf")], float("nan")).dropna()
     peak = cum.cummax()
     dd = cum / peak - 1
     fig, ax = plt.subplots(figsize=(10, 3))

@@ -38,6 +38,9 @@ from stockpred.backend import jobs as jobs_mod
 from stockpred.backend import schemas, store
 from stockpred.backend.db import create_all, make_engine, make_session_factory, session_scope
 from stockpred.pipeline import PipelineConfig
+from stockpred.pipeline_v5 import PipelineV5Config
+from stockpred.config import CVConfig
+from stockpred.models.gbm import GBMConfig
 
 log = logging.getLogger(__name__)
 
@@ -391,28 +394,91 @@ def register_routes(app: FastAPI) -> None:
         tags=["jobs"],
         dependencies=[Depends(_require_api_key)],
     )
-    def refresh():
+    def refresh(body: schemas.RefreshRequest | None = None):
         """Trigger a pipeline run. Requires X-API-Key header.
 
-        Returns 409 if another refresh is already in flight; the running job
-        will produce the same artefacts so there is no value in queuing.
+        Accepts an optional JSON body to configure the run (phase, universe,
+        horizons, model hyper-params, etc.). Defaults to Phase 1 with stock
+        settings when the body is omitted.
+
+        Returns 409 if another refresh is already in flight.
         """
         if AppState.SessionLocal is None:
             raise HTTPException(500, "DB not initialised")
         if _is_pipeline_running():
             raise HTTPException(409, "A pipeline run is already in flight")
 
+        body = body or schemas.RefreshRequest()
+        cv_cfg = CVConfig(
+            train_years=body.cv.train_years,
+            test_months=body.cv.test_months,
+            embargo_days=body.cv.embargo_days,
+            min_train_obs=body.cv.min_train_obs,
+        )
+        gbm_cfg = GBMConfig(
+            num_leaves=body.gbm.num_leaves,
+            learning_rate=body.gbm.learning_rate,
+            n_estimators=body.gbm.n_estimators,
+            min_data_in_leaf=body.gbm.min_data_in_leaf,
+            feature_fraction=body.gbm.feature_fraction,
+            bagging_fraction=body.gbm.bagging_fraction,
+            bagging_freq=body.gbm.bagging_freq,
+            reg_lambda=body.gbm.reg_lambda,
+            early_stopping_rounds=body.gbm.early_stopping_rounds,
+        )
+
+        if body.phase == 5:
+            horizons = tuple(body.horizons) if body.horizons is not None else (1, 5)
+            pipeline_cfg = PipelineV5Config(
+                start_date=body.start_date,
+                end_date=body.end_date,
+                n_tickers=body.n_tickers,
+                universe_sampling=body.universe_sampling,
+                refresh_data=body.refresh_data,
+                horizons=horizons,
+                model=body.model,
+                gbm=gbm_cfg,
+                use_sector_features=body.use_sector_features,
+                use_tier2_features=body.use_tier2_features,
+                use_regime_features=body.use_regime_features,
+                beta_neutralise=body.beta_neutralise,
+                bootstrap_method=body.bootstrap_method,
+                cv=cv_cfg,
+                holdout_years=body.holdout_years,
+                position_sizing=body.position_sizing,
+                k_per_side_pct=body.k_per_side_pct,
+                leverage_per_side=body.leverage_per_side,
+                sector_cap_gross=body.sector_cap_gross,
+                min_trade_threshold=body.min_trade_threshold,
+                ensemble_weighting=body.ensemble_weighting,
+                bootstrap_n=body.bootstrap_n,
+            )
+        else:
+            horizons = tuple(body.horizons) if body.horizons is not None else (1, 5, 21)
+            pipeline_cfg = PipelineConfig(
+                start_date=body.start_date,
+                end_date=body.end_date,
+                n_tickers=body.n_tickers,
+                universe_sampling=body.universe_sampling,
+                refresh_data=body.refresh_data,
+                horizons=horizons,
+                k_per_side=body.k_per_side,
+                cv=cv_cfg,
+                model=body.model,
+                gbm=gbm_cfg,
+                use_sector_features=body.use_sector_features,
+                feature_cols=body.feature_cols,
+            )
+
         import uuid as _uuid
 
         job_id = str(_uuid.uuid4())
-        # Mark queued BEFORE starting the thread so polling immediately sees it.
         jobs_mod._record_job(job_id, "queued")
 
         def _run():
-            # Held only for the duration of one pipeline run; releases on any exit.
             with _refresh_lock:
                 jobs_mod.run_pipeline_job(
-                    AppState.SessionLocal, pipeline_cfg=PipelineConfig(), job_id=job_id
+                    AppState.SessionLocal, pipeline_cfg=pipeline_cfg, job_id=job_id
                 )
 
         threading.Thread(target=_run, daemon=True).start()

@@ -23,6 +23,7 @@ from stockpred.backend import store
 from stockpred.backend.db import session_scope
 from stockpred.backend.snapshot import snapshot_run
 from stockpred.pipeline import PipelineConfig, run_pipeline
+from stockpred.pipeline_v5 import PipelineV5Config, run_pipeline_v5
 
 log = logging.getLogger(__name__)
 
@@ -54,7 +55,7 @@ def list_jobs(limit: int = 25) -> list[dict]:
 def run_pipeline_job(
     session_factory,
     *,
-    pipeline_cfg: PipelineConfig | None = None,
+    pipeline_cfg: PipelineConfig | PipelineV5Config | None = None,
     job_id: str | None = None,
 ) -> str:
     """Execute the pipeline and snapshot to DB. Synchronous; meant to be
@@ -64,7 +65,10 @@ def run_pipeline_job(
     _record_job(job_id, "running", config=dataclasses.asdict(pipeline_cfg))
 
     try:
-        result = run_pipeline(pipeline_cfg)
+        if isinstance(pipeline_cfg, PipelineV5Config):
+            result = run_pipeline_v5(pipeline_cfg)
+        else:
+            result = run_pipeline(pipeline_cfg)
         with session_scope(session_factory) as s:
             run = snapshot_run(
                 s,
