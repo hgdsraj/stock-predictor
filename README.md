@@ -133,7 +133,7 @@ All under the FastAPI app (`http://localhost:8000`). Swagger UI at `/docs`.
 | GET    | `/runs`                       | Recent runs metadata                         |
 | GET    | `/runs/{id}/equity`           | Equity curve for a specific run              |
 | GET    | `/backtest/summary`           | Tearsheet payload                            |
-| POST   | `/jobs/refresh`               | Trigger an on-demand pipeline run            |
+| POST   | `/jobs/refresh`               | Trigger an on-demand pipeline run. Optional JSON body selects phase (1 or 5) and all config knobs — see [DEPLOYMENT.md](docs/DEPLOYMENT.md#trigger-a-refresh-from-cli) |
 | GET    | `/jobs/{id}`                  | Job status                                   |
 
 ## Anti-patterns this project actively prevents

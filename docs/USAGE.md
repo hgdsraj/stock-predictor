@@ -54,8 +54,14 @@ export STOCKPRED_API_KEY="dev-only-do-not-reuse"
 # Start the server
 uv run python scripts/serve.py --host 127.0.0.1 --port 8000
 
-# In another terminal, kick off a refresh
+# In another terminal, kick off a refresh (Phase 1, all defaults)
 curl -X POST -H "X-API-Key: $STOCKPRED_API_KEY" http://127.0.0.1:8000/jobs/refresh
+
+# Or run Phase 5 with a smaller universe
+curl -X POST -H "X-API-Key: $STOCKPRED_API_KEY" \
+     -H "Content-Type: application/json" \
+     -d '{"phase": 5, "n_tickers": 50}' \
+     http://127.0.0.1:8000/jobs/refresh
 ```
 
 Open <http://127.0.0.1:8000> in a browser. The dashboard will be empty until
@@ -321,12 +327,47 @@ curl http://localhost:8000/runs/3/equity
 curl http://localhost:8000/backtest/summary
 
 # --- Authenticated endpoints ---
-# Trigger an on-demand refresh
+
+# Trigger Phase 1 (basic GBM, top-k portfolio) — body is optional
 curl -X POST \
      -H "X-API-Key: $STOCKPRED_API_KEY" \
      http://localhost:8000/jobs/refresh
 
-# Get a job's status
+# Trigger Phase 5 (vol-scaled, regime-aware, sector-capped)
+curl -X POST \
+     -H "X-API-Key: $STOCKPRED_API_KEY" \
+     -H "Content-Type: application/json" \
+     -d '{"phase": 5}' \
+     http://localhost:8000/jobs/refresh
+
+# Custom run: Phase 5, smaller universe, force-refresh cached data
+curl -X POST \
+     -H "X-API-Key: $STOCKPRED_API_KEY" \
+     -H "Content-Type: application/json" \
+     -d '{
+           "phase": 5,
+           "n_tickers": 50,
+           "start_date": "2015-01-01",
+           "refresh_data": true,
+           "horizons": [1, 5],
+           "position_sizing": "vol_scaled",
+           "use_regime_features": true
+         }' \
+     http://localhost:8000/jobs/refresh
+
+# Tune GBM hyper-params
+curl -X POST \
+     -H "X-API-Key: $STOCKPRED_API_KEY" \
+     -H "Content-Type: application/json" \
+     -d '{
+           "model": "gbm",
+           "gbm": {"n_estimators": 400, "learning_rate": 0.05, "num_leaves": 31}
+         }' \
+     http://localhost:8000/jobs/refresh
+
+# All body fields and their defaults — see DEPLOYMENT.md for the full reference
+
+# Poll job status
 curl http://localhost:8000/jobs/<job-id>
 ```
 
