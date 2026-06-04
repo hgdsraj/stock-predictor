@@ -253,12 +253,37 @@ Stack: Vite + React 18 + TypeScript + Tailwind + shadcn/ui + TanStack Query + Ta
 28. Update README + PROJECT_LOG
 29. Final code-review sub-agent + final E2E + commit + push instructions
 
-## Last-known-good test snapshot (Session 3 end)
+## Last-known-good test snapshot (Session 4 end)
 
 ```
 $ uv run pytest tests/ -q
-62 passed in ~90s
+75 passed in ~125s
 ```
+
+Phase 6 additions (this session):
+- `src/stockpred/features/tier2.py` — momentum_12_1, st_reversal_5,
+  max_daily_return, amihud_illiquidity, beta_vs_bench, idio_vol_vs_bench
+- `src/stockpred/features/regime.py` — VIX + FRED macro + cross-sectional
+  dispersion, with `broadcast_to_panel()` helper
+- `src/stockpred/backtest/portfolio.py::neutralise_portfolio_beta`
+- `src/stockpred/validation/stress.py::bootstrap_sharpe` now accepts
+  `method='block'` (default for Phase 5 pipeline)
+- `src/stockpred/pipeline_v5.py` config knobs: `use_tier2_features`,
+  `use_regime_features`, `beta_neutralise`, `bootstrap_method`
+- `scripts/leakage_audit.py` (THIS IS THE MOST IMPORTANT FILE — caught
+  a real bug)
+- `scripts/sensitivity.py` (works but cost-grid monkey-patch is buggy)
+- `tests/test_phase6.py` — 13 tests covering all of the above
+
+THE CRITICAL FIX in this session: `compute_vol_scaled_forward_returns`
+was leaking via shared `close[t]` between feature `ret_1d` and the
+trailing-vol denominator. Fixed by shifting the denominator +1 day. All
+previous Phase 5 numbers were partly artefactual; PROJECT_LOG documents
+the honest post-fix numbers.
+
+The honest result: across a sensitivity grid of 8 combinations, **zero**
+combos produced positive holdout Sharpe with a CI excluding zero. The
+strategy as currently configured does not generalise out-of-sample.
 
 Test files (10):
 - test_backtest_engine.py (7)

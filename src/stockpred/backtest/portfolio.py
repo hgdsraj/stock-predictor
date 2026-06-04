@@ -230,6 +230,59 @@ def apply_min_trade_threshold(
 # --------------------------------------------------------------------- #
 
 
+def neutralise_portfolio_beta(
+    weights: pd.DataFrame,
+    asset_betas: pd.DataFrame,
+    *,
+    target: float = 0.0,
+) -> pd.DataFrame:
+    """Phase 6: rescale weights so portfolio beta ≈ `target`.
+
+    For each date with a non-zero portfolio beta we *shrink* the long and
+    short sides toward each other (not toward zero, which would change
+    leverage). Specifically: long-side := long * (1 - alpha), short-side :=
+    short * (1 + alpha) where alpha is chosen to drive portfolio beta to
+    target. If alpha hits a sensible cap (|alpha| > 0.5), we leave that day
+    untouched and the gross exposure shifts a bit; this is a soft constraint.
+
+    Parameters
+    ----------
+    weights : wide [date x ticker] target weights
+    asset_betas : wide [date x ticker] beta of each name vs the benchmark
+    """
+    if weights.empty:
+        return weights
+    aligned_betas = asset_betas.reindex_like(weights).fillna(1.0)
+    port_beta = (weights * aligned_betas).sum(axis=1)
+    long_mask = weights > 0
+    short_mask = weights < 0
+    long_beta = (weights.where(long_mask, 0.0) * aligned_betas).sum(axis=1)
+    short_beta = (weights.where(short_mask, 0.0) * aligned_betas).sum(axis=1)
+
+    out = weights.copy()
+    for date in weights.index:
+        pb = port_beta.loc[date]
+        if abs(pb - target) < 1e-6:
+            continue
+        lb = long_beta.loc[date]
+        sb = short_beta.loc[date]
+        # Solve: long * (1-a) * lb + short * (1+a) * sb = target
+        # Net beta in pb = lb + sb; we want lb*(1-a) + sb*(1+a) = target.
+        # => lb - a*lb + sb + a*sb = target  =>  a*(sb - lb) = target - (lb+sb)
+        denom = sb - lb
+        if abs(denom) < 1e-9:
+            continue
+        alpha = (target - (lb + sb)) / denom
+        if not np.isfinite(alpha) or abs(alpha) > 0.5:
+            continue  # too aggressive; skip this day
+        # Apply: scale longs by (1-alpha), shorts by (1+alpha).
+        row = out.loc[date]
+        row = row.where(~long_mask.loc[date], row * (1 - alpha))
+        row = row.where(~short_mask.loc[date], row * (1 + alpha))
+        out.loc[date] = row
+    return out
+
+
 def ic_ir_weighted_ensemble(
     per_horizon_predictions: dict[int, pd.Series],
     per_horizon_ic_ir: dict[int, float],

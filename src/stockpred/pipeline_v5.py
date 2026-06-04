@@ -50,6 +50,7 @@ from stockpred.backtest.portfolio import (
     apply_min_trade_threshold,
     apply_sector_caps,
     ic_ir_weighted_ensemble,
+    neutralise_portfolio_beta,
     top_bottom_k_weights,
     vol_scaled_weights,
 )
@@ -67,7 +68,9 @@ from stockpred.features.cross_sectional import (
     add_sector_dummies,
     neutralise_by_sector,
 )
+from stockpred.features.regime import broadcast_to_panel, compute_regime_features
 from stockpred.features.technical import compute_technical_features
+from stockpred.features.tier2 import compute_tier2_features
 from stockpred.labels import long_labels
 from stockpred.models.baseline import fit_predict_proba, make_baseline_pipeline
 from stockpred.models.gbm import GBMConfig, predict_gbm, train_gbm
@@ -111,6 +114,10 @@ class PipelineV5Config:
     model: str = "gbm"
     gbm: GBMConfig = field(default_factory=GBMConfig)
     use_sector_features: bool = True
+    use_tier2_features: bool = True  # Phase 6: 12-1 momentum, IVOL, beta, max ret, Amihud
+    use_regime_features: bool = True  # Phase 6: VIX, term spread, USD, xs dispersion
+    beta_neutralise: bool = False  # Phase 6: portfolio-level beta-vs-SPY neutralisation
+    bootstrap_method: str = "block"  # Phase 6: 'block' or 'iid'
 
     # Validation
     cv: CVConfig = field(
@@ -168,6 +175,7 @@ def _build_weights(
     per_horizon_diag: dict[int, dict],
     close: pd.DataFrame,
     sector_map: dict[str, str],
+    asset_betas: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Compose per-horizon predictions into the final wide weights frame."""
     # 1) Ensemble.
@@ -202,6 +210,10 @@ def _build_weights(
     # 4) Minimum trade threshold.
     if cfg.min_trade_threshold > 0:
         weights = apply_min_trade_threshold(weights, min_abs_delta=cfg.min_trade_threshold)
+
+    # 5) Beta-neutralisation vs SPY (Phase 6).
+    if cfg.beta_neutralise and asset_betas is not None and not asset_betas.empty:
+        weights = neutralise_portfolio_beta(weights, asset_betas, target=0.0)
 
     return weights
 
@@ -283,11 +295,40 @@ def run_pipeline_v5(cfg: PipelineV5Config | None = None) -> dict:
         except Exception as e:  # noqa: BLE001
             log.warning("Sector load failed (%s); continuing without.", e)
 
-    log.info("Building features...")
+    log.info("Building features (tier-1 technicals + sector)...")
     feats = build_feature_matrix(
         close, volume, sector_map=sector_map, use_sector_features=cfg.use_sector_features
     )
-    log.info("Feature matrix: %s rows x %s cols", *feats.shape)
+
+    # Optional benchmark (SPY) for tier-2 + regime features.
+    spy_close: pd.Series | None = None
+    if cfg.use_tier2_features or cfg.use_regime_features or cfg.beta_neutralise:
+        try:
+            spy_df = prices_mod.fetch_one("SPY")
+            if not spy_df.empty:
+                spy_close = spy_df["adj_close"].reindex(close.index).ffill().rename("SPY")
+        except Exception as e:  # noqa: BLE001
+            log.warning("SPY fetch failed (%s); benchmark-relative features disabled.", e)
+
+    if cfg.use_tier2_features:
+        log.info("Building tier-2 features (12-1 momentum, IVOL, beta, max ret, Amihud)...")
+        t2 = compute_tier2_features(close, volume, bench_close=spy_close)
+        if not t2.empty:
+            feats = feats.join(t2, how="left")
+            log.info("After tier-2: %s rows x %s cols", *feats.shape)
+
+    if cfg.use_regime_features:
+        log.info("Building regime features (VIX, term spread, USD, xs dispersion)...")
+        try:
+            regime_wide = compute_regime_features(close, refresh=False)
+            if not regime_wide.empty:
+                reg_long = broadcast_to_panel(regime_wide, feats.index)
+                feats = feats.join(reg_long, how="left")
+                log.info("After regime: %s rows x %s cols", *feats.shape)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Regime features failed (%s); continuing.", e)
+
+    log.info("Final feature matrix: %s rows x %s cols", *feats.shape)
 
     log.info("Building labels for horizons %s...", cfg.horizons)
     labels = long_labels(close, horizons=tuple(cfg.horizons), include_vol_scaled=True)
@@ -334,8 +375,26 @@ def run_pipeline_v5(cfg: PipelineV5Config | None = None) -> dict:
     if not per_horizon_preds:
         raise RuntimeError("All horizons failed.")
 
+    # ---------------- Compute SPY-relative betas for neutralisation -----
+    asset_betas: pd.DataFrame | None = None
+    if cfg.beta_neutralise and spy_close is not None and not spy_close.dropna().empty:
+        try:
+            from stockpred.features.tier2 import beta_vs_bench
+
+            asset_betas = beta_vs_bench(close, spy_close, window=60)
+            log.info("Computed asset betas vs SPY for neutralisation: %s", asset_betas.shape)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Could not compute asset betas (%s); skipping beta-neutralise.", e)
+
     # ---------------- Portfolio + backtest on the DEV span -----------
-    dev_weights = _build_weights(cfg, per_horizon_preds, per_horizon_diag, close, sector_map)
+    dev_weights = _build_weights(
+        cfg,
+        per_horizon_preds,
+        per_horizon_diag,
+        close,
+        sector_map,
+        asset_betas=asset_betas,
+    )
     if dev_weights.empty:
         raise RuntimeError("Dev portfolio is empty.")
     bt_cfg = BacktestConfig()
@@ -366,23 +425,30 @@ def run_pipeline_v5(cfg: PipelineV5Config | None = None) -> dict:
             pred = fit_predict_proba(pipe, X_dev, y_dev, X_hold) - 0.5
         else:
             # Fix C2 (review finding): chronological train/valid split, not
-            # positional. We sort dev by date so the last 10% is the most
-            # recent dev period — never interleaved with earlier training.
+            # positional. We sort dev by date and split at a *date* boundary
+            # so train and valid never share a date across tickers.
             X_dev_sorted = X_dev.sort_index(level="date")
             y_dev_sorted = y_dev.reindex(X_dev_sorted.index)
-            split = max(1, int(len(X_dev_sorted) * 0.9))
-            tr_dates = X_dev_sorted.iloc[:split].index.get_level_values("date").max()
-            va_dates = X_dev_sorted.iloc[split:].index.get_level_values("date").min()
-            assert tr_dates < va_dates, (
-                f"Internal valid split is interleaved: train.max={tr_dates} >= valid.min={va_dates}"
-            )
-            booster = train_gbm(
-                X_dev_sorted.iloc[:split],
-                y_dev_sorted.iloc[:split],
-                X_valid=X_dev_sorted.iloc[split:],
-                y_valid=y_dev_sorted.iloc[split:],
-                cfg=cfg.gbm,
-            )
+            all_dates = X_dev_sorted.index.get_level_values("date").unique().sort_values()
+            split_date = all_dates[max(1, int(len(all_dates) * 0.9))]
+            tr_mask = X_dev_sorted.index.get_level_values("date") < split_date
+            va_mask = ~tr_mask
+            if not va_mask.any():
+                # No room for a validation split; train on everything.
+                booster = train_gbm(X_dev_sorted, y_dev_sorted, cfg=cfg.gbm)
+            else:
+                tr_max = X_dev_sorted.loc[tr_mask].index.get_level_values("date").max()
+                va_min = X_dev_sorted.loc[va_mask].index.get_level_values("date").min()
+                assert tr_max < va_min, (
+                    f"Internal valid split overlaps: train.max={tr_max} >= valid.min={va_min}"
+                )
+                booster = train_gbm(
+                    X_dev_sorted.loc[tr_mask],
+                    y_dev_sorted.loc[tr_mask],
+                    X_valid=X_dev_sorted.loc[va_mask],
+                    y_valid=y_dev_sorted.loc[va_mask],
+                    cfg=cfg.gbm,
+                )
             pred = predict_gbm(booster, X_hold)
 
         hit_h, ic_h = _diagnostics(pred, y_ret_hold, y_bin_hold)
@@ -403,7 +469,14 @@ def run_pipeline_v5(cfg: PipelineV5Config | None = None) -> dict:
     hold_bt = None
     hold_score = pd.Series(dtype=float, name="ensemble_score")
     if hold_preds:
-        hold_weights = _build_weights(cfg, hold_preds, per_horizon_diag, close, sector_map)
+        hold_weights = _build_weights(
+            cfg,
+            hold_preds,
+            per_horizon_diag,
+            close,
+            sector_map,
+            asset_betas=asset_betas,
+        )
         if not hold_weights.empty:
             hold_bt = run_backtest(hold_weights, close, cfg=bt_cfg, horizon=bt_horizon, trade_lag=1)
             hold_metrics = tearsheet_metrics(hold_bt.returns)
@@ -421,13 +494,24 @@ def run_pipeline_v5(cfg: PipelineV5Config | None = None) -> dict:
     # ---------------- Bootstrap Sharpe CI on HOLDOUT -----------------
     ci = {}
     if hold_bt is not None and not hold_bt.returns.dropna().empty:
-        ci = bootstrap_sharpe(hold_bt.returns, n_resamples=cfg.bootstrap_n)
+        # Block bootstrap by default (review H1). Block length ~ horizon so we
+        # preserve the short-range autocorrelation overlapping-horizon strategies
+        # induce in daily returns.
+        block_len = bt_horizon if cfg.bootstrap_method == "block" else None
+        ci = bootstrap_sharpe(
+            hold_bt.returns,
+            n_resamples=cfg.bootstrap_n,
+            method=cfg.bootstrap_method,
+            block_length=block_len,
+        )
         log.info(
-            "HOLDOUT bootstrap Sharpe: %.3f  [%.3f, %.3f] @ %.0f%%",
+            "HOLDOUT bootstrap Sharpe (%s, block=%s): %.3f  [%.3f, %.3f] @ %.0f%%",
+            ci.get("method"),
+            ci.get("block_length"),
             ci["sharpe"],
             ci["sharpe_lo"],
             ci["sharpe_hi"],
-            ci["ci_pct"] * 100,
+            float(ci["ci_pct"]) * 100,
         )
 
     # ---------------- Regime breakdown on HOLDOUT --------------------

@@ -62,6 +62,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--holdout-years", type=int, default=2)
     p.add_argument("--bootstrap-n", type=int, default=500)
     p.add_argument("--no-sector", action="store_true")
+    p.add_argument("--no-tier2", action="store_true", help="Disable Phase 6 tier-2 features")
+    p.add_argument("--no-regime", action="store_true", help="Disable Phase 6 regime features")
+    p.add_argument(
+        "--beta-neutralise",
+        action="store_true",
+        help="Apply portfolio-level beta neutralisation vs SPY (Phase 6)",
+    )
+    p.add_argument(
+        "--bootstrap-method",
+        choices=("block", "iid"),
+        default="block",
+        help="block (default; honest for overlapping horizons) or iid",
+    )
     p.add_argument("--refresh", action="store_true")
     p.add_argument("--verbose", "-v", action="store_true")
     return p.parse_args()
@@ -90,6 +103,10 @@ def main() -> int:
         holdout_years=args.holdout_years,
         bootstrap_n=args.bootstrap_n,
         use_sector_features=not args.no_sector,
+        use_tier2_features=not args.no_tier2,
+        use_regime_features=not args.no_regime,
+        beta_neutralise=args.beta_neutralise,
+        bootstrap_method=args.bootstrap_method,
         refresh_data=args.refresh,
     )
     r = run_pipeline_v5(cfg)

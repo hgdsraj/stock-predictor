@@ -67,20 +67,29 @@ def compute_vol_scaled_forward_returns(
 ) -> dict[int, pd.DataFrame]:
     """Forward log returns divided by trailing realised vol (per ticker).
 
-    The denominator is the rolling standard deviation of *trailing* daily log
-    returns over `vol_window` days, *known at signal time t*. This is lag-safe
-    because the volatility is computed on past returns only.
+    *** Phase 6 leakage fix (P6L1): the trailing-vol denominator is shifted
+    by +1 day so it uses only returns strictly through close-of-(t-1). ***
 
-    The resulting target has roughly unit variance across stocks/horizons,
-    which is exactly what we want as a regression target for a tree model.
+    The previous version used returns through close-of-t in the denominator,
+    which created a same-day shared-input leak with features like `ret_1d`
+    that also use close-of-t. A tree model could learn "when the most recent
+    return is large, the divisor is large, so the target is smaller in
+    magnitude" — getting most of its 'predictive' power from the divisor
+    rather than the forward return. The Phase 6 leakage audit (scripts/
+    leakage_audit.py) found the h=5d IC IR fell from +2.45 to -0.58 after
+    applying a strict t-1 cutoff to features; this was the cause.
+
+    With this fix, the denominator only uses information known one day
+    before the signal date, eliminating the shared-input correlation.
     """
     if prices.empty:
         return {h: prices.copy() for h in horizons}
 
     log_p = np.log(prices)
     daily_log_ret = log_p.diff()
-    trailing_vol = daily_log_ret.rolling(vol_window, min_periods=vol_window).std()
-    # Avoid division by zero / tiny vol (which would blow up the target).
+    # Lag-safe denominator: shift forward 1 day so the value at date t uses
+    # only daily returns through close-of-(t-1).
+    trailing_vol = daily_log_ret.rolling(vol_window, min_periods=vol_window).std().shift(1)
     trailing_vol = trailing_vol.where(trailing_vol > 1e-6)
 
     fwd = compute_forward_returns(prices, horizons, trade_next_open=trade_next_open)

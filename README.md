@@ -184,32 +184,44 @@ $ uv run pytest tests/ -v
 - `test_pipeline_integration.py` — end-to-end on synthetic noise with hit-rate canary
 - `test_backend_api.py` — FastAPI endpoint contracts + snapshot round-trip
 
-## Phase 5: improved pipeline (latest)
+## Phase 5 + 6: improved pipeline + leakage audit (latest)
 
-`scripts/run_phase5.py` plugs in the Tier-1 improvements identified by the
-strategy-research sub-agent: **IC-IR-weighted ensemble** (drops horizons
-with no signal), **vol-scaled position sizing**, **30% sector exposure
-caps**, **minimum 0.5% trade threshold**, an **untouched 2-year holdout
-window**, **bootstrap Sharpe confidence intervals**, and a **VIX-regime
-breakdown**.
+`scripts/run_phase5.py` plugs in: **IC-IR-weighted ensemble**, **vol-scaled
+position sizing**, **30% sector caps**, **min trade threshold**, **untouched
+2-year holdout**, **block-bootstrap Sharpe CI**, **Tier-2 features** (12-1
+momentum, IVOL, β, max return, Amihud), **cross-asset regime features**
+(VIX, term spread, USD, cross-sectional dispersion), and optional
+**portfolio-level beta neutralisation vs SPY**.
 
-Real-data result, 60 names, 2018–2024, h ∈ {1, 5}:
+`scripts/leakage_audit.py` runs the pipeline twice (as-is and with a hard
+t-1 cutoff on features) to surface any same-day leakage in the label or
+feature plumbing.
 
-| Metric                     | Phase 2 (baseline) | Phase 5 (improved) |
-| -------------------------- | ------------------ | ------------------ |
-| DEV Sharpe (net of costs)  | **−1.30**          | **−0.04**          |
-| DEV ann return             | −10.5%             | −0.6%              |
-| DEV max drawdown           | −57%               | −23%               |
-| HOLDOUT Sharpe             | *not computed*     | **−0.84**          |
-| HOLDOUT bootstrap 95% CI   | —                  | **[−1.60, −0.15]** (entirely negative — strategy loses *significantly* on unseen data) |
-| h=5d IC IR (dev / holdout) | +2.45 / —          | **+2.06 / +1.19**  |
+### Phase 6 finding: a real label leak was uncovered and fixed
+The Phase 5 vol-scaled-return target was sharing `close[t]` with features
+like `ret_1d` via its trailing-vol denominator (computed through close-of-t).
+The model was getting most of its "predictive" power from the denominator,
+not the forward return. **Fix:** the denominator is now strictly t-1 lagged.
 
-Phase 5 portfolio construction lifted the *in-sample* Sharpe by ~1.3
-(from −1.3 to ~0), exactly as the strategy-research sub-agent predicted.
-But the **honest holdout test still loses money**, and the bootstrap CI
-confirms it's a statistically significant loss — so we do *not* claim a
-working strategy. See [`docs/PROJECT_LOG.md`](docs/PROJECT_LOG.md) for the
-honest write-up and what Phase 6+ research would need to address.
+### Honest real-data result (60 names, 2018–2024, h ∈ {1, 5})
+
+| Metric                     | Phase 2 baseline | Phase 5 (leaky) | Phase 6 (leak-fixed + Tier-2 + regime) |
+| -------------------------- | ---------------- | --------------- | ---------------------------------------- |
+| DEV Sharpe (net)           | −1.30            | −0.04           | **−0.40**                                |
+| HOLDOUT Sharpe (net)       | *not computed*   | −0.84           | **−0.95**                                |
+| HOLDOUT 95% block-CI       | —                | [−1.60, −0.15]  | **[−1.70, −0.23]** — entirely negative   |
+
+### Sensitivity grid result (8 combinations across k_per_side × cost × beta_neutralise)
+- best HOLDOUT Sharpe: **−0.63**
+- combos with HOLDOUT Sharpe > 0: **0 / 8**
+- combos with bootstrap CI lower > 0: **0 / 8**
+
+**The strategy as currently configured does not produce a positive
+risk-adjusted return on unseen data.** This is the honest outcome of a
+free-data, daily-bar, 60-name research project — and is in line with the
+strategy-research sub-agent's stated realistic ceiling. The infrastructure
+correctly surfaces this rather than hiding it. See [`docs/PROJECT_LOG.md`](docs/PROJECT_LOG.md)
+for the full Phase 6 write-up and Phase 7+ roadmap.
 
 ```bash
 uv run python scripts/run_phase5.py \

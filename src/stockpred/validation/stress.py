@@ -62,25 +62,67 @@ def bootstrap_sharpe(
     periods_per_year: int = 252,
     confidence: float = 0.95,
     rng_seed: int = 0,
-) -> dict[str, float]:
+    method: str = "iid",
+    block_length: int | None = None,
+) -> dict[str, float | str]:
     """Bootstrap a confidence interval for annualised Sharpe.
 
-    Uses i.i.d. resampling with replacement (acceptable for daily returns from
-    a multi-name long/short portfolio; for very autocorrelated series you'd
-    want block bootstrap, but most cross-sectional equity returns have low
-    daily autocorr).
+    Methods:
+      "iid"   — i.i.d. resampling with replacement. Suitable only when daily
+                returns have negligible autocorrelation. With overlapping
+                multi-day-horizon strategies, this narrows the CI artificially.
+      "block" — moving-block bootstrap (Künsch 1989). Preserves short-range
+                autocorrelation by sampling contiguous blocks. Use this for
+                any strategy with horizon > 1 day or visible autocorr in
+                daily returns. `block_length` defaults to ~horizon.
 
-    Returns dict with keys: sharpe, sharpe_lo, sharpe_hi, ci_pct.
+    Returns dict: sharpe, sharpe_lo, sharpe_hi, ci_pct, method, block_length.
     """
     r = returns.dropna().to_numpy(dtype=float)
     n = len(r)
+    out_base: dict[str, float | str] = {
+        "sharpe": float("nan"),
+        "sharpe_lo": float("nan"),
+        "sharpe_hi": float("nan"),
+        "ci_pct": float(confidence),
+        "method": method,
+        "block_length": float(block_length) if block_length else float("nan"),
+    }
     if n < 30:
-        return {
-            "sharpe": float("nan"),
-            "sharpe_lo": float("nan"),
-            "sharpe_hi": float("nan"),
-            "ci_pct": confidence,
-        }
+        return out_base
+
+    rng = np.random.default_rng(rng_seed)
+    if method == "block":
+        L = max(2, int(block_length) if block_length else max(2, int(np.sqrt(n))))
+        # Number of blocks to fill ~n observations.
+        n_blocks = int(np.ceil(n / L))
+        # Sample starting indices uniformly over [0, n - L].
+        max_start = max(1, n - L)
+        starts = rng.integers(0, max_start, size=(n_resamples, n_blocks))
+        # Build (n_resamples, n_blocks * L) index array, then truncate to n.
+        offsets = np.arange(L)
+        idx = (starts[:, :, None] + offsets[None, None, :]).reshape(n_resamples, -1)[:, :n]
+        samples = r[idx]
+        out_base["block_length"] = float(L)
+    elif method == "iid":
+        idx = rng.integers(0, n, size=(n_resamples, n))
+        samples = r[idx]
+    else:
+        raise ValueError(f"unknown bootstrap method: {method!r}")
+
+    means = samples.mean(axis=1)
+    stds = samples.std(axis=1, ddof=1)
+    stds = np.where(stds == 0, np.nan, stds)
+    sharpes = means / stds * np.sqrt(periods_per_year)
+    alpha = (1 - confidence) / 2
+    lo, hi = np.nanpercentile(sharpes, [100 * alpha, 100 * (1 - alpha)])
+    point = (
+        (r.mean() / r.std(ddof=1) * np.sqrt(periods_per_year)) if r.std(ddof=1) else float("nan")
+    )
+    out_base["sharpe"] = float(point)
+    out_base["sharpe_lo"] = float(lo)
+    out_base["sharpe_hi"] = float(hi)
+    return out_base
     rng = np.random.default_rng(rng_seed)
     # Sample with replacement
     idx = rng.integers(0, n, size=(n_resamples, n))

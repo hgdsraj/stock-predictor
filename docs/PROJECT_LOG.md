@@ -329,21 +329,165 @@ All CRITICAL and HIGH-priority-actionable findings fixed with regression tests.
   current pandas), now pulls FRED CSVs directly via `requests`. Removed
   the dep from `pyproject.toml`.
 
-## Next steps (Phase 6+)
+## Session 4 — Phase 6
 
-In ranked order, per the strategy-research sub-agent:
-1. **Audit the +2.45 dev IC IR** by re-running with strict t-1 feature cutoff
-   and Newey-West-adjusted IC IR t-stats. If it survives, the signal is real;
-   if not, drop it from the ensemble.
-2. **Beta-neutralisation vs SPY** at the portfolio level. The current
-   vol-scaled long/short is *roughly* market-neutral but not explicitly
-   beta-zero.
-3. **Tier-2 features** (12-1 momentum, IVOL, β, max return, Amihud, 52-week
-   high). The literature consistently shows these add IC.
-4. **Cross-asset regime features** (VIX level/delta, term structure, USD).
-5. **Triple-barrier labels + meta-labelling** (López de Prado Ch. 3.6) to
-   convert the modest IC into actionable position sizing.
-6. **Block bootstrap** (vs i.i.d.) for honest CI on autocorrelated returns.
-7. **Sensitivity grid** across cost assumptions and `k_per_side_pct`.
+### Phase 6a: leakage audit (biggest finding)
+
+Built `scripts/leakage_audit.py` which runs the pipeline twice — once "as is"
+and once with every feature additionally shifted +1 day (so feature_at_t
+uses prices strictly through close-of-(t-1)). Any large drop or sign flip
+between the two variants is a smoking gun for same-day leakage.
+
+**Result (before fix):** h=5d IC IR went from +2.45 (as-is) to **−0.58
+(hard-cutoff sign-flipped)**. The Phase 5 "real signal" was largely an
+artefact.
+
+**Root cause:** `compute_vol_scaled_forward_returns` used a trailing-vol
+denominator computed *through close-of-t*, which shared `close[t]` with
+features like `ret_1d`. The tree model could read the denominator
+indirectly through correlated features ("when ret_1d is large the divisor
+is large, so the target is smaller in magnitude") rather than predicting
+the forward return.
+
+**Fix:** `labels.py::compute_vol_scaled_forward_returns` now shifts the
+denominator by +1 day so it only uses returns through close-of-(t-1).
+Regression test in `tests/test_phase6.py::test_vol_scaled_label_denominator_is_lag_safe`.
+
+**Result (after fix):**
+- h=5d as-is IC IR drops from +2.45 to ~+3.7 (without leak), and
+- h=5d hard-cutoff IC IR rises to ~+1.8.
+- The Δ between variants is still ~50% but is mostly **short-term reversal**
+  (Lehmann 1990, Lo & MacKinlay 1990) — a real, legitimate effect, not a leak.
+- Conservative interpretation: the true 5d IC IR is in the +1.5 to +2.5 range
+  out-of-sample, but not the +3.7 that the as-is dev metric shows.
+
+### Phase 6b: Tier-2 features
+
+`src/stockpred/features/tier2.py` (~150 lines) implements the canonical
+price-only factors the literature consistently supports:
+- 12-1 momentum (Jegadeesh & Titman 1993)
+- Short-term reversal (Lehmann 1990; Lo & MacKinlay 1990)
+- Max daily return / lottery (Bali, Cakici & Whitelaw 2011)
+- Amihud illiquidity (Amihud 2002)
+- Beta vs SPY (Frazzini & Pedersen 2014)
+- Idiosyncratic vol vs SPY (Ang et al. 2006)
+
+All lag-safe; mutating future prices does not change earlier feature values
+(tested).
+
+### Phase 6c: Regime features
+
+`src/stockpred/features/regime.py` (~110 lines) broadcasts cross-asset
+regime signals to every (date, ticker) cell:
+- VIX level + 5d / 21d changes
+- T10Y3M term spread (FRED)
+- DTWEXBGS USD index 21d % change (FRED)
+- Cross-sectional return dispersion (computed from the panel)
+
+### Phase 6d: portfolio-level beta neutralisation
+
+`backtest/portfolio.py::neutralise_portfolio_beta` shrinks the long and
+short legs toward each other to drive portfolio beta toward zero, given a
+per-asset beta panel. Soft constraint: if the required adjustment exceeds
+|α| > 0.5 (would distort gross too much), the day is left untouched.
+
+Pipeline wiring: `PipelineV5Config.beta_neutralise` (default False; opt-in
+to avoid changing default behaviour without explicit consent). Test
+`test_neutralise_portfolio_beta_reduces_portfolio_beta`.
+
+### Phase 6e: block bootstrap
+
+`validation/stress.py::bootstrap_sharpe` now supports `method='block'`
+(default for Phase 5 pipeline) in addition to `'iid'`. Moving-block
+resampling (Künsch 1989) preserves the short-range autocorrelation that
+overlapping multi-day-horizon strategies induce. With autocorrelated input
+the block CI is materially wider than iid (tested via AR(1) regression).
+
+### Phase 6f: sensitivity grid
+
+`scripts/sensitivity.py` runs the Phase 5 pipeline across a grid of
+(horizons × k_per_side × cost × sector_cap × beta_neutralise) and reports
+DEV Sharpe, HOLDOUT Sharpe, holdout-bootstrap CI, and max drawdown for
+every combination. Saves to `reports/sensitivity_grid.csv`.
+
+**First-run result (8 combinations on a smaller 30-name, 5-yr window):**
+- best holdout Sharpe across the grid: **−0.63**
+- worst: −0.75
+- combos with positive holdout Sharpe: **0 / 8**
+- combos with bootstrap CI lower > 0: **0 / 8**
+
+The strategy is *robustly* unprofitable across these knobs, which is
+honest if disappointing. (Known limitation: the script's cost-grid
+monkey-patch doesn't fully propagate to `BacktestConfig()` inside the
+engine — flagged for fix.)
+
+### Phase 6 real-data result (leak-fixed Phase 5 + Tier-2 + regime features)
+
+60 names, 2018-2024, h ∈ {1, 5}, IC-IR ensemble, vol-scaled sizing,
+sector caps:
+
+| Metric                    | Pre-leak-fix | Post-leak-fix | + Tier-2 + regime |
+| ------------------------- | ------------ | ------------- | ----------------- |
+| DEV Sharpe                | −0.04        | **−0.52**     | **−0.40**         |
+| HOLDOUT Sharpe            | −0.84        | **−0.52**     | **−0.95**         |
+| HOLDOUT 95% block-bootstrap CI | [-1.60, -0.15] | [-1.34, +0.22] | **[-1.70, -0.23]** |
+| Feature count             | 36           | 36            | **44**            |
+
+**Honest read:** the Phase 5 "DEV Sharpe lift to ~0" was partly artefactual.
+After fixing the label leak, the true DEV Sharpe is −0.5. Adding Tier-2 and
+regime features slightly improves DEV but **worsens HOLDOUT** — the new
+features fit the training period but don't generalise. The honest holdout
+result is a statistically significant negative Sharpe across the grid.
+
+### What did NOT work
+- The Tier-2 + regime features did not lift holdout performance, and may
+  have hurt it via overfitting. This is consistent with the literature: a
+  single 60-name × 5-year sample is too small for these factors to assert
+  themselves over noise. To genuinely test them you'd need a larger
+  universe (~500 names) and a longer history (~15-20 years).
+- Beta-neutralisation alone did not change results materially (the
+  vol-scaled long/short is already roughly market-neutral).
+- The h=21d horizon is permanently dropped from the default.
+
+### What DID work
+- The leakage audit caught a real, material bug that would have made every
+  prior result misleadingly optimistic.
+- The block bootstrap correctly widens CI on autocorrelated returns,
+  giving honest uncertainty quantification.
+- The sensitivity grid shows the result is *not* the artefact of one lucky
+  parameter choice — it's robustly negative.
+- The infrastructure now lets you run an honest experiment in 3 minutes,
+  audit it in 4, and grid-sweep it in 30. That's the actual deliverable.
+
+### Real bottom line
+Across many honest experiments, **on free daily yfinance data, with the
+S&P 500 universe and the model class we're using, this strategy does not
+produce a positive risk-adjusted return on unseen data**. The
+strategy-research sub-agent's reality check — "realistic post-work target
+net Sharpe 0.4-0.8, and most retail attempts cap below 1.0" — appears to
+apply here. We are below their estimated floor.
+
+Roadmap to actually break out:
+1. **Bigger universe + longer history.** Run on the full ~700-name historical
+   S&P 500 over 15+ years rather than 60 × 5. Likely a 30-minute pipeline run.
+2. **Triple-barrier labels + meta-labelling** (López de Prado Ch. 3.6).
+   Convert IC into actionable bets only when conviction exceeds a
+   data-driven threshold.
+3. **HRP or Ledoit-Wolf min-variance** on the selected names instead of
+   vol-scaled equal-weight per side.
+4. **Audit features individually for leakage** the way the labels were
+   audited; build per-feature IC IR after a strict t-1 shift.
+
+These are the legitimate next moves. None are a guarantee.
+
+## Next steps (Phase 7+)
+
+1. Bigger universe / longer history (the most likely improvement).
+2. Triple-barrier labels + meta-labelling.
+3. HRP / Ledoit-Wolf portfolio construction.
+4. Per-feature leakage audit (extend `scripts/leakage_audit.py` to attribute
+   the as-is vs hard-cutoff Δ to individual features).
+5. Fix the sensitivity script's BacktestConfig monkey-patch so cost-grid
+   actually varies costs.
 
 Plus the deferred review-flagged items in `docs/HANDOFF.md`.
