@@ -21,6 +21,7 @@ from stockpred.backend.models import (
     NewsItem,
     PriceBar,
     Prediction,
+    QueuedJob,
     Run,
     WatchedTicker,
 )
@@ -373,3 +374,66 @@ def news_for_ticker(s: Session, ticker: str, *, limit: int = 20) -> list[NewsIte
         .scalars()
         .all()
     )
+
+
+# --------------------------------------------------------------------- #
+# Queued jobs
+# --------------------------------------------------------------------- #
+
+_MAX_PENDING_JOBS = 5
+
+
+def count_pending_queued_jobs(s: Session) -> int:
+    from sqlalchemy import func
+    return s.execute(
+        select(func.count()).select_from(QueuedJob).where(QueuedJob.status == "pending")
+    ).scalar_one()
+
+
+def create_queued_job(
+    s: Session, config: dict, *, label: str | None = None
+) -> QueuedJob:
+    """Create a pending queued job. Raises ValueError if the pending cap is hit."""
+    import uuid as _uuid
+
+    if count_pending_queued_jobs(s) >= _MAX_PENDING_JOBS:
+        raise ValueError(f"Maximum of {_MAX_PENDING_JOBS} pending queued jobs reached")
+    job = QueuedJob(
+        id=str(_uuid.uuid4()),
+        created_at=_now(),
+        config_json=config,
+        label=label,
+        status="pending",
+    )
+    s.add(job)
+    s.flush()
+    return job
+
+
+def list_queued_jobs(s: Session) -> list[QueuedJob]:
+    return list(
+        s.execute(select(QueuedJob).order_by(desc(QueuedJob.created_at))).scalars().all()
+    )
+
+
+def get_queued_job(s: Session, queue_id: str) -> QueuedJob | None:
+    return s.get(QueuedJob, queue_id)
+
+
+def mark_queued_launched(s: Session, queue_id: str, job_id: str) -> QueuedJob | None:
+    job = s.get(QueuedJob, queue_id)
+    if job is None:
+        return None
+    job.status = "launched"
+    job.launched_at = _now()
+    job.job_id = job_id
+    s.add(job)
+    return job
+
+
+def delete_queued_job(s: Session, queue_id: str) -> bool:
+    job = s.get(QueuedJob, queue_id)
+    if job is None:
+        return False
+    s.delete(job)
+    return True
