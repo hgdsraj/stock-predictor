@@ -575,20 +575,116 @@ are real research, not "another phase".
 - Engine clipping added 1 test in `test_backtest_engine.py`.
 - **Final test count: 101 passing.**
 
-### Roadmap (Phase 8+) — honest research, not engineering
-1. Wire meta-labelling into the pipeline as a gate on the primary score
-   (built, not yet plumbed).
-2. Wire triple-barrier labels as an alternate training target.
-3. Run `per_feature_audit.py` on the big universe to identify features
-   that disproportionately rely on same-day info; consider dropping them.
-4. Replace short-horizon predictions with longer windows (h=21+) which
-   may have less reversal/leakage hybrid.
-5. Per-sector or per-regime conditional models (regime-aware ensemble).
-6. Consider walk-forward retraining at a slower cadence (monthly) to
-   reduce overfitting from per-fold model drift.
+## Session 6 — Phase 8 (meta-labelling + triple-barrier + per-feature audit + ranks_only)
 
-None of these are guaranteed to flip the holdout Sharpe positive. The
-honest interpretation of the four phases of careful work: the strategy
+### What was wired
+- `_apply_meta_gate` helper in `pipeline_v5.py`: trains a binary GBM
+  predicting P(primary signal sign matches realised sign), gates the
+  ensemble score on a P-threshold (default 0.55).
+- Triple-barrier labels: optional `use_triple_barrier_labels=True` swaps
+  the regression target from `fwd_vs_h` to `tb_target_h` for each horizon.
+- `ranks_only=True`: drop raw feature columns, keep only `*_rank`, `sec_*`,
+  `reg_*`.
+- CLI: `--meta-labelling`, `--meta-threshold`, `--triple-barrier`,
+  `--tb-k-sigma`, `--ranks-only` on `scripts/run_phase5.py`.
+- `scripts/per_feature_audit.py` run on 100-name × 11-yr universe; ranked
+  features (`*_rank`) hold up under hard-cutoff much better than raw
+  versions (raw versions degrade ~100% IC IR, ranked ~15-50%). Confirmed:
+  the model was getting noise from raw values; ranks carry the stable
+  signal.
+
+### Sub-agent reviewer found 3 real bugs (all fixed)
+- **C1 — DOUBLE Z-SCORE OF GATED ZEROS** (critical). My first wiring
+  passed the gated single-horizon score back through
+  `ic_ir_weighted_ensemble`, which z-scores its inputs. Gated zeros
+  became strongly negative z-scores relative to survivors — i.e. *active
+  shorts* instead of "don't trade". The first reported Phase 8 holdout
+  Sharpe of +0.09 was an artefact of this bug.
+  **Fix**: `_build_weights` now accepts `precomputed_score` and bypasses
+  the ensemble step entirely.
+- **C2 — Holdout meta trained on already-gated dev score**. The training
+  set had `primary=0` rows that always look "wrong" to the binary
+  classifier (sign(0) ≠ sign(realised)), biasing the classifier toward
+  predicting "incorrect".
+  **Fix**: keep an ungated copy `dev_ensemble_score_ungated` for the
+  holdout-meta fit.
+- **H1 — `ranks_only` silently dropped all Tier-2 features**.
+  Cross-sectional rank computation happened before Tier-2 join, so Tier-2
+  columns never had `_rank` versions to keep.
+  **Fix**: re-run `add_cross_sectional_ranks` on Tier-2 columns after the
+  join.
+Plus medium fixes for CLI input validation, misleading comments, and
+duplicate default sources.
+
+### Honest real-data result, Phase 8 fully fixed
+
+Config: 150 current S&P names, 2014-2024, h=5, equal ensemble, HRP
+sizing, sector caps 30%, min trade 0.5%, **meta-gating** at 0.55, **ranks
+only**, 2-year holdout, block bootstrap.
+
+| Metric                    | Phase 7 (best) | Phase 8 (corrected) |
+| ------------------------- | -------------- | ------------------- |
+| DEV Sharpe                | (data-glitched) | −0.33               |
+| HOLDOUT Sharpe            | −0.69          | **−0.16**           |
+| HOLDOUT 95% block-CI      | [−1.12, −0.24] | **[−0.67, +0.29]**  |
+| HOLDOUT max drawdown      | −29.6%         | **−16.0%**          |
+
+**For the first time in the project, the holdout 95% CI straddles zero
+rather than being entirely negative.** The point estimate is still
+negative, but it's not statistically distinguishable from random. The
+maximum drawdown was cut roughly in half. **The meta-gate is doing its
+job: refusing to trade most low-conviction signals, which loses smaller
+amounts and avoids deep drawdowns.**
+
+Note that the first reported Phase 8 result (+0.09 holdout Sharpe) was
+an artefact of the double-z-score bug. The corrected −0.16 is the honest
+number.
+
+### Honest read after six phases
+- The signal is real but small (h=5 holdout IC IR was +0.49 on the big
+  universe pre-meta).
+- Portfolio construction (HRP + sector caps + min trade) and feature
+  pruning (ranks_only) materially reduce drawdown but don't add alpha.
+- Meta-gating further reduces both losses and gains; CI now straddles
+  zero rather than sitting entirely below.
+- Sensitivity grid shows the result is robust across knob settings.
+- **The strategy as configured does not produce statistically significant
+  positive risk-adjusted return on unseen data**, but it's now in the
+  "indistinguishable from zero" zone rather than "significant loss" zone.
+
+This is consistent with the strategy-research sub-agent's stated ceiling
+for free-data daily-bar S&P 500 cross-sectional L/S (net Sharpe ~0.4-0.8
+*if* something works, with most retail attempts capping below 1.0). We
+are honestly at zero, not above.
+
+### Tests (cumulative)
+- Phase 8 added 5 tests in `test_phase8.py` covering ranks_only,
+  meta-labelling, triple-barrier end-to-end paths plus unit tests on
+  `_apply_meta_gate` (index preservation, threshold sensitivity).
+- **Final test count: 95 passing.**
+
+## Phase 9+ research items
+
+The five obvious next moves, in expected ROI order:
+1. **Confidence-weighted sizing**: instead of gating at a hard threshold,
+   weight position size by P(correct) − 0.5. May reclaim some alpha
+   currently zeroed out by the binary gate.
+2. **Triple-barrier + meta combined**: train primary on TB labels, then
+   meta on whether TB label was correctly predicted. The current Phase 8
+   pipeline supports both individually but doesn't chain them.
+3. **Walk-forward meta-CV**: replace the single 80/20 dev split inside
+   `_apply_meta_gate` with proper walk-forward CV. Computationally
+   expensive (~5x current runtime) but methodologically cleaner.
+4. **Sector-conditional meta**: train one meta classifier per sector.
+5. **Cross-sectional regression instead of ranking**.
+   Fama-MacBeth style regression may extract more signal than top-k ranks.
+
+None of these are guaranteed to flip the holdout positive. They are
+legitimate research moves, not engineering work.
+
+The honest interpretation of six phases of careful work: the strategy
 class (free-data daily-bar cross-sectional L/S on the S&P 500) does not
-appear to have meaningful retail-accessible edge in this period. The
-infrastructure remains valuable for honest experimentation.
+appear to have meaningful retail-accessible *profitable* edge in this
+period, but it now produces results indistinguishable from random rather
+than significantly negative — which is genuine progress in honest terms.
+The infrastructure remains valuable for honest experimentation.

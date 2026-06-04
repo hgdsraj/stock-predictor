@@ -241,6 +241,36 @@ accessible edge in this period.** The infrastructure remains valuable for
 honest experimentation. See [`docs/PROJECT_LOG.md`](docs/PROJECT_LOG.md)
 for the full Phase 7 write-up and Phase 8+ roadmap.
 
+### Phase 8: meta-labelling + triple-barrier + per-feature audit + ranks_only
+
+Added: meta-labelling gate (López de Prado Ch. 3.6) — secondary binary
+classifier that gates trades on P(correct); triple-barrier labels as an
+optional regression target; `ranks_only` flag to keep only cross-sectional
+rank features; per-feature leakage audit which confirmed raw features
+degrade ~100% under hard-cutoff while their ranked versions degrade only
+15-50%.
+
+**Phase 8 corrected real-data result** (150 current S&P names, 2014-2024,
+h=5, HRP + meta-gating + ranks-only):
+
+| Metric                | Phase 7 | Phase 8 (corrected) |
+| --------------------- | ------- | ------------------- |
+| HOLDOUT Sharpe        | −0.69   | **−0.16**           |
+| HOLDOUT 95% block-CI  | [−1.12, −0.24] | **[−0.67, +0.29]** |
+| HOLDOUT max DD        | −29.6%  | **−16.0%**          |
+
+**For the first time in the project, the holdout 95% CI straddles zero**
+rather than sitting entirely below. The point estimate is still negative
+but no longer statistically distinguishable from random. Max drawdown was
+halved. A sub-agent reviewer caught two critical bugs in the initial
+Phase 8 wiring (double z-scoring of gated zeros, holdout meta trained on
+gated dev); the corrected −0.16 above is the honest number.
+
+**The bottom line after six phases: the strategy class does not produce
+statistically significant *positive* risk-adjusted return on unseen data,
+but it now produces results indistinguishable from zero rather than
+significantly negative — which is genuine progress.**
+
 ```bash
 uv run python scripts/run_phase5.py \
     --start 2018-01-01 \
