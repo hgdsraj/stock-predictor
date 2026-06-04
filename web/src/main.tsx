@@ -8,6 +8,7 @@ import { Home } from "./pages/Home";
 import { Screener } from "./pages/Screener";
 import { Ticker } from "./pages/Ticker";
 import { Backtest } from "./pages/Backtest";
+import { Jobs } from "./pages/Jobs";
 import "./index.css";
 
 const queryClient = new QueryClient({
@@ -31,6 +32,7 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
               <Route path="/screener" element={<Screener />} />
               <Route path="/ticker/:ticker" element={<Ticker />} />
               <Route path="/backtest" element={<Backtest />} />
+              <Route path="/jobs" element={<Jobs />} />
               <Route path="*" element={<Home />} />
             </Routes>
           </Layout>

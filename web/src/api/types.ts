@@ -85,6 +85,28 @@ export interface JobResponse {
   detail: string | null;
 }
 
+export interface JobDetail {
+  job_id: string;
+  status: string;
+  started_at: string | null;
+  updated_at: string | null;
+  config: Record<string, unknown>;
+  logs: string[];
+  run_id: number | null;
+  elapsed_s: number | null;
+  error: string | null;
+}
+
+export interface QueuedJob {
+  id: string;
+  created_at: string;
+  config: Record<string, unknown>;
+  label: string | null;
+  status: "pending" | "launched" | "cancelled";
+  launched_at: string | null;
+  job_id: string | null;
+}
+
 export interface HealthResponse {
   status: string;
   db: string;

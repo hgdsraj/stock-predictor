@@ -6,8 +6,10 @@
 import type {
   BacktestSummary,
   HealthResponse,
+  JobDetail,
   JobResponse,
   NewsHeadline,
+  QueuedJob,
   RunSummary,
   TickerDetail,
   TickerSummary,
@@ -24,28 +26,45 @@ async function get<T>(path: string): Promise<T> {
     headers: { Accept: "application/json" },
   });
   if (!res.ok) {
-    throw new Error(`GET ${path} -> ${res.status} ${res.statusText}`);
+    const body = await res.json().catch(() => ({}));
+    throw new Error((body as any).detail || `GET ${path} → ${res.status} ${res.statusText}`);
   }
   return (await res.json()) as T;
 }
 
-async function post<T>(path: string, body?: unknown): Promise<T> {
+async function post<T>(path: string, body?: unknown, headers?: Record<string, string>): Promise<T> {
   const url = `${API_BASE}${path}`;
   const res = await fetch(url, {
     method: "POST",
     headers: {
       Accept: "application/json",
       "Content-Type": "application/json",
+      ...headers,
     },
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
   if (!res.ok) {
-    throw new Error(`POST ${path} -> ${res.status} ${res.statusText}`);
+    const errBody = await res.json().catch(() => ({}));
+    throw new Error((errBody as any).detail || `POST ${path} → ${res.status} ${res.statusText}`);
+  }
+  return (await res.json()) as T;
+}
+
+async function del<T>(path: string, headers?: Record<string, string>): Promise<T> {
+  const url = `${API_BASE}${path}`;
+  const res = await fetch(url, {
+    method: "DELETE",
+    headers: { Accept: "application/json", ...headers },
+  });
+  if (!res.ok) {
+    const errBody = await res.json().catch(() => ({}));
+    throw new Error((errBody as any).detail || `DELETE ${path} → ${res.status} ${res.statusText}`);
   }
   return (await res.json()) as T;
 }
 
 export const api = {
+  // ── Existing read endpoints ────────────────────────────────────────────
   health: () => get<HealthResponse>("/healthz"),
   tickers: () => get<TickerSummary[]>("/tickers"),
   tickerDetail: (ticker: string, days = 365) =>
@@ -60,7 +79,46 @@ export const api = {
       `/runs/${run_id}/equity`,
     ),
   backtestSummary: () => get<BacktestSummary>("/backtest/summary"),
-  refresh: () => post<JobResponse>("/jobs/refresh"),
-  jobStatus: (job_id: string) => get<JobResponse>(`/jobs/${encodeURIComponent(job_id)}`),
   watchlist: () => get<WatchedItem[]>("/watchlist"),
+
+  // ── Jobs (read) ────────────────────────────────────────────────────────
+  /** List recent in-flight / completed jobs (no logs in list). */
+  listJobs: (limit = 25) => get<JobDetail[]>(`/jobs?limit=${limit}`),
+  /** Full detail for one job including logs. Polls for running jobs. */
+  jobDetail: (job_id: string) => get<JobDetail>(`/jobs/${encodeURIComponent(job_id)}`),
+
+  // ── Queue (read) ───────────────────────────────────────────────────────
+  /** List all queued jobs (pending + launched + cancelled). */
+  listQueued: () => get<QueuedJob[]>("/jobs/queue"),
+
+  // ── Existing privileged trigger (X-API-Key) ────────────────────────────
+  /** Immediate trigger — requires STOCKPRED_API_KEY via X-API-Key header. */
+  refresh: (apiKey?: string) =>
+    post<JobResponse>("/jobs/refresh", undefined, apiKey ? { "X-API-Key": apiKey } : {}),
+
+  // ── Queue management (no auth needed to queue; password needed to run) ─
+  /** Submit a job to the queue. No auth required. Max 5 pending at once. */
+  queueJob: (config: Record<string, unknown>) =>
+    post<QueuedJob>("/jobs/queue", config),
+
+  /** Launch a pending queued job. Requires STOCKPRED_PW via X-Password. */
+  launchQueued: (queue_id: string, password: string) =>
+    post<JobResponse>(`/jobs/run/${encodeURIComponent(queue_id)}`, undefined, {
+      "X-Password": password,
+    }),
+
+  /** Delete a pending queued job. Requires X-Password. */
+  deleteQueued: (queue_id: string, password: string) =>
+    del<{ ok: boolean }>(`/jobs/queue/${encodeURIComponent(queue_id)}`, {
+      "X-Password": password,
+    }),
+
+  /** Soft-cancel a running job. Requires X-Password. */
+  cancelJob: (job_id: string, password: string) =>
+    del<{ ok: boolean }>(`/jobs/${encodeURIComponent(job_id)}/cancel`, {
+      "X-Password": password,
+    }),
+
+  /** Job status (legacy single-field response). */
+  jobStatus: (job_id: string) => get<JobDetail>(`/jobs/${encodeURIComponent(job_id)}`),
 };

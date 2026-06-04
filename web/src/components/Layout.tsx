@@ -1,28 +1,18 @@
 import { ReactNode } from "react";
-import { Link, NavLink, useLocation } from "react-router-dom";
-import { Moon, Sun, RefreshCw, LineChart, Search, BarChart3, Home } from "lucide-react";
+import { Link, NavLink } from "react-router-dom";
+import { Moon, Sun, LineChart, Search, BarChart3, Home, Briefcase } from "lucide-react";
 import { useTheme } from "./ThemeProvider";
 import { Button } from "./ui/Button";
-import { api } from "@/api/client";
 import { cn } from "@/lib/cn";
 
 export function Layout({ children }: { children: ReactNode }) {
   const { theme, toggle } = useTheme();
-  const location = useLocation();
-
-  async function triggerRefresh() {
-    try {
-      const r = await api.refresh();
-      alert(`Refresh job started (${r.job_id}). Reload in a few minutes.`);
-    } catch (e: any) {
-      alert(`Refresh failed: ${e.message}`);
-    }
-  }
 
   const nav = [
     { to: "/", label: "Home", icon: Home },
     { to: "/screener", label: "Screener", icon: Search },
     { to: "/backtest", label: "Backtest", icon: BarChart3 },
+    { to: "/jobs", label: "Jobs", icon: Briefcase },
   ];
 
   return (
@@ -55,10 +45,6 @@ export function Layout({ children }: { children: ReactNode }) {
             ))}
           </nav>
           <div className="flex items-center gap-2">
-            <Button variant="ghost" size="sm" onClick={triggerRefresh} title="Trigger pipeline refresh">
-              <RefreshCw className="h-4 w-4" />
-              <span className="hidden sm:inline">Refresh</span>
-            </Button>
             <Button variant="ghost" size="icon" onClick={toggle} title="Toggle theme">
               {theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
             </Button>
@@ -73,7 +59,7 @@ export function Layout({ children }: { children: ReactNode }) {
               end={to === "/"}
               className={({ isActive }) =>
                 cn(
-                  "inline-flex flex-1 items-center justify-center gap-2 rounded-md px-2 py-2 text-xs font-medium",
+                  "inline-flex flex-1 items-center justify-center gap-1 rounded-md px-2 py-2 text-xs font-medium",
                   isActive ? "bg-accent text-accent-foreground" : "text-muted-foreground",
                 )
               }
