@@ -97,7 +97,7 @@ def snapshot_run(
     bt = pipeline_result["backtest"]
     eq_rows = []
     cum = 1.0
-    daily_returns = bt.returns.fillna(0.0)
+    daily_returns = bt.returns.fillna(0.0).clip(-5.0, 5.0)
     cum_curve = (1 + daily_returns).cumprod()
     peak = cum_curve.cummax()
     dd = cum_curve / peak - 1

@@ -69,7 +69,7 @@ def annualised_return(returns: pd.Series, periods_per_year: int = 252) -> float:
     r = returns.dropna()
     if r.empty:
         return float("nan")
-    return float((1 + r).prod() ** (periods_per_year / len(r)) - 1)
+    return float((1 + r.clip(-0.99, 5.0)).prod() ** (periods_per_year / len(r)) - 1)
 
 
 def annualised_vol(returns: pd.Series, periods_per_year: int = 252) -> float:
@@ -92,7 +92,7 @@ def sortino(returns: pd.Series, periods_per_year: int = 252, rf: float = 0.0) ->
 
 
 def max_drawdown(returns: pd.Series) -> float:
-    cum = (1 + returns.fillna(0)).cumprod()
+    cum = (1 + returns.fillna(0).clip(-5.0, 5.0)).cumprod()
     peak = cum.cummax()
     dd = cum / peak - 1
     return float(dd.min())
