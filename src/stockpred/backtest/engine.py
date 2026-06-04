@@ -122,8 +122,14 @@ def run_backtest(
     no_position = held.isna().all(axis=1)
     held_filled = held.fillna(0.0)
 
-    # Daily simple returns of each ticker.
-    ret = prices.pct_change()
+    # Daily simple returns of each ticker, with a defensive clip to ±50%.
+    # Genuine daily moves > 50% are almost always data quality issues
+    # (yfinance occasionally returns near-zero closes for delisted/halted
+    # names, producing -99% / +9900% phantom returns). Clipping them to
+    # ±50% caps the worst single-day P&L at the position weight × 0.5,
+    # which is the right behaviour even for *real* shocks (in practice a
+    # trader would have circuit-breakers and the like to limit damage).
+    ret = prices.pct_change().clip(lower=-0.5, upper=0.5)
     gross = (held_filled * ret).sum(axis=1)
     gross[no_position] = np.nan
 

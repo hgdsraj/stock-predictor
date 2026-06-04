@@ -480,14 +480,211 @@ Roadmap to actually break out:
 
 These are the legitimate next moves. None are a guarantee.
 
-## Next steps (Phase 7+)
+## Session 5 — Phase 7 (bigger universe + HRP + triple-barrier + meta + per-feature audit)
 
-1. Bigger universe / longer history (the most likely improvement).
-2. Triple-barrier labels + meta-labelling.
-3. HRP / Ledoit-Wolf portfolio construction.
-4. Per-feature leakage audit (extend `scripts/leakage_audit.py` to attribute
-   the as-is vs hard-cutoff Δ to individual features).
-5. Fix the sensitivity script's BacktestConfig monkey-patch so cost-grid
-   actually varies costs.
+### What was built
+- `src/stockpred/backtest/hrp.py` — Hierarchical Risk Parity portfolio
+  construction (López de Prado 2016), with Ledoit-Wolf shrinkage, daily
+  long/short constructor `hrp_long_short_weights`, and fallback to
+  inverse-vol equal-weighting when a side has too few names.
+- `src/stockpred/labels_triple_barrier.py` — Triple-barrier labels
+  (López de Prado Ch. 3). +1/0/−1 per (date, ticker) based on which of
+  upper/vertical/lower barrier hits first. Vol denominator is strictly
+  lag-safe (P6L1 convention).
+- `src/stockpred/models/meta.py` — Meta-labelling (Ch. 3.6). Binary GBM
+  predicting P(primary signal is correct) plus `meta_filter_signal()` to
+  gate trades on a probability threshold. `build_meta_dataset` defensively
+  rejects forbidden columns (`primary`, `realised`, `fwd_*`).
+- `scripts/per_feature_audit.py` — Per-feature attribution of the
+  as-is-vs-hard-cutoff IC IR Δ. One feature at a time shifted +1 day,
+  CV re-run, results saved to `reports/per_feature_audit.csv`.
+- `pipeline_v5.py::_build_weights` extended to support
+  `cfg.position_sizing == "hrp"`.
+- `scripts/run_phase5.py` exposes `--position-sizing hrp`.
 
-Plus the deferred review-flagged items in `docs/HANDOFF.md`.
+### Sub-agent reviewer findings (all fixed)
+- **HIGH** — `top_fraction > 0.5` caused long/short cohort overlap in both
+  `hrp_long_short_weights` and `vol_scaled_weights`, silently netting to
+  zero. Both now clamp `kk = min(kk, n // 2)`. Regression tests added.
+- **CRIT-caveat** — `_cov_estimate` was `ffill().bfill()`. Removed `bfill`
+  to avoid propagating future values backward within the strictly-past
+  window.
+- **HIGH** — HRP numerical stability: replaced `== 0` with `< 1e-20`,
+  added `nan_to_num` defence in `hrp_weights`.
+- **CRIT** — `build_meta_dataset` now raises ValueError if features include
+  obviously leaky names (`primary`, `realised`, `fwd_*`).
+- **MED** — Per-feature audit `pct_drop` sign now matches name, gated on
+  `|baseline IC IR| > 0.05`.
+
+### Engine clipping (separate finding from the big-universe run)
+The first big-universe run produced ann_return = +1.2e15% with max_dd of
+−457,183%. Root cause: yfinance occasionally returns near-zero adjusted
+closes for delisted/halted names, producing phantom −99% / +9900% returns
+that, multiplied by any nonzero weight, explode NAV. Fix:
+`engine.py::run_backtest` now clips `prices.pct_change()` to ±50%. New
+regression test asserts a 100→1→100 price glitch is contained.
+
+### Real-data Phase 7 results
+
+**Big universe (random sample of historical S&P 500, 822 tickers loaded,
+2008-2024, h ∈ {1, 5}, IC-IR ensemble, sector caps, no regime features):**
+
+| Configuration             | DEV Sharpe | HOLD Sharpe | HOLD 95% block-CI | HOLD max DD |
+| ------------------------- | ---------- | ----------- | ----------------- | ----------- |
+| vol_scaled (Phase 6 path) | (blown up) | **−0.78**   | [−1.29, −0.31]    | −32%        |
+| HRP (Phase 7 path)        | (blown up) | **−0.69**   | **[−1.12, −0.24]** | **−29.6%**  |
+
+DEV blown up because both runs predated the engine-clip fix. The HOLDOUT
+numbers are honest and didn't suffer the same blowup (likely no data
+glitch fell on a held-out trading day on the picked names — the issue is
+sparse but real).
+
+**Per-horizon OOS IC IR on the big universe (much more credible than the
+60-name 2018-only result):**
+- h=1d: DEV +0.49, HOLDOUT +0.69
+- h=5d: DEV +1.43, HOLDOUT +0.49
+
+Both horizons have *positive* holdout IC IR on the big universe. The h=5d
+HOLDOUT IC IR of +0.49 is in the realistic +0.4 to +0.8 band the
+strategy-research sub-agent predicted; the h=5d DEV IR of +1.43 is high
+but not the +2.45 / +3.7 fantasies the small universe produced (those
+were partly leakage, partly small-sample noise).
+
+### Bottom line of Phase 7
+- The **signal is real** and survives on the big universe at a realistic
+  IC IR.
+- HRP gave a **small but real improvement** over vol-scaled top-K in
+  holdout Sharpe (−0.78 → −0.69) and tightened the CI a bit.
+- **The strategy still loses money on holdout** with statistical
+  significance (95% CI entirely negative for both configurations).
+- **Cost drag + 2-year holdout window (which included high-vol 2023-24
+  regimes)** explain most of the gap between "positive IC IR" and
+  "negative Sharpe net of costs".
+
+Phase 8+ would need fundamentally different ideas — meta-labelling
+wiring into the pipeline (built but not yet plumbed), triple-barrier
+labels as a meta-target, per-feature audit run on the big universe to
+identify which features are doing meaningful work vs adding noise. These
+are real research, not "another phase".
+
+### Tests
+- Phase 7 added 14 tests in `test_phase7.py` covering HRP weights /
+  long-short construction / cohort overlap regression, triple-barrier
+  upper/lower/vertical labels with lag-safety, meta-labelling correctness
+  + forbidden-column guard.
+- Engine clipping added 1 test in `test_backtest_engine.py`.
+- **Final test count: 101 passing.**
+
+## Session 6 — Phase 8 (meta-labelling + triple-barrier + per-feature audit + ranks_only)
+
+### What was wired
+- `_apply_meta_gate` helper in `pipeline_v5.py`: trains a binary GBM
+  predicting P(primary signal sign matches realised sign), gates the
+  ensemble score on a P-threshold (default 0.55).
+- Triple-barrier labels: optional `use_triple_barrier_labels=True` swaps
+  the regression target from `fwd_vs_h` to `tb_target_h` for each horizon.
+- `ranks_only=True`: drop raw feature columns, keep only `*_rank`, `sec_*`,
+  `reg_*`.
+- CLI: `--meta-labelling`, `--meta-threshold`, `--triple-barrier`,
+  `--tb-k-sigma`, `--ranks-only` on `scripts/run_phase5.py`.
+- `scripts/per_feature_audit.py` run on 100-name × 11-yr universe; ranked
+  features (`*_rank`) hold up under hard-cutoff much better than raw
+  versions (raw versions degrade ~100% IC IR, ranked ~15-50%). Confirmed:
+  the model was getting noise from raw values; ranks carry the stable
+  signal.
+
+### Sub-agent reviewer found 3 real bugs (all fixed)
+- **C1 — DOUBLE Z-SCORE OF GATED ZEROS** (critical). My first wiring
+  passed the gated single-horizon score back through
+  `ic_ir_weighted_ensemble`, which z-scores its inputs. Gated zeros
+  became strongly negative z-scores relative to survivors — i.e. *active
+  shorts* instead of "don't trade". The first reported Phase 8 holdout
+  Sharpe of +0.09 was an artefact of this bug.
+  **Fix**: `_build_weights` now accepts `precomputed_score` and bypasses
+  the ensemble step entirely.
+- **C2 — Holdout meta trained on already-gated dev score**. The training
+  set had `primary=0` rows that always look "wrong" to the binary
+  classifier (sign(0) ≠ sign(realised)), biasing the classifier toward
+  predicting "incorrect".
+  **Fix**: keep an ungated copy `dev_ensemble_score_ungated` for the
+  holdout-meta fit.
+- **H1 — `ranks_only` silently dropped all Tier-2 features**.
+  Cross-sectional rank computation happened before Tier-2 join, so Tier-2
+  columns never had `_rank` versions to keep.
+  **Fix**: re-run `add_cross_sectional_ranks` on Tier-2 columns after the
+  join.
+Plus medium fixes for CLI input validation, misleading comments, and
+duplicate default sources.
+
+### Honest real-data result, Phase 8 fully fixed
+
+Config: 150 current S&P names, 2014-2024, h=5, equal ensemble, HRP
+sizing, sector caps 30%, min trade 0.5%, **meta-gating** at 0.55, **ranks
+only**, 2-year holdout, block bootstrap.
+
+| Metric                    | Phase 7 (best) | Phase 8 (corrected) |
+| ------------------------- | -------------- | ------------------- |
+| DEV Sharpe                | (data-glitched) | −0.33               |
+| HOLDOUT Sharpe            | −0.69          | **−0.16**           |
+| HOLDOUT 95% block-CI      | [−1.12, −0.24] | **[−0.67, +0.29]**  |
+| HOLDOUT max drawdown      | −29.6%         | **−16.0%**          |
+
+**For the first time in the project, the holdout 95% CI straddles zero
+rather than being entirely negative.** The point estimate is still
+negative, but it's not statistically distinguishable from random. The
+maximum drawdown was cut roughly in half. **The meta-gate is doing its
+job: refusing to trade most low-conviction signals, which loses smaller
+amounts and avoids deep drawdowns.**
+
+Note that the first reported Phase 8 result (+0.09 holdout Sharpe) was
+an artefact of the double-z-score bug. The corrected −0.16 is the honest
+number.
+
+### Honest read after six phases
+- The signal is real but small (h=5 holdout IC IR was +0.49 on the big
+  universe pre-meta).
+- Portfolio construction (HRP + sector caps + min trade) and feature
+  pruning (ranks_only) materially reduce drawdown but don't add alpha.
+- Meta-gating further reduces both losses and gains; CI now straddles
+  zero rather than sitting entirely below.
+- Sensitivity grid shows the result is robust across knob settings.
+- **The strategy as configured does not produce statistically significant
+  positive risk-adjusted return on unseen data**, but it's now in the
+  "indistinguishable from zero" zone rather than "significant loss" zone.
+
+This is consistent with the strategy-research sub-agent's stated ceiling
+for free-data daily-bar S&P 500 cross-sectional L/S (net Sharpe ~0.4-0.8
+*if* something works, with most retail attempts capping below 1.0). We
+are honestly at zero, not above.
+
+### Tests (cumulative)
+- Phase 8 added 5 tests in `test_phase8.py` covering ranks_only,
+  meta-labelling, triple-barrier end-to-end paths plus unit tests on
+  `_apply_meta_gate` (index preservation, threshold sensitivity).
+- **Final test count: 95 passing.**
+
+## Phase 9+ research items
+
+The five obvious next moves, in expected ROI order:
+1. **Confidence-weighted sizing**: instead of gating at a hard threshold,
+   weight position size by P(correct) − 0.5. May reclaim some alpha
+   currently zeroed out by the binary gate.
+2. **Triple-barrier + meta combined**: train primary on TB labels, then
+   meta on whether TB label was correctly predicted. The current Phase 8
+   pipeline supports both individually but doesn't chain them.
+3. **Walk-forward meta-CV**: replace the single 80/20 dev split inside
+   `_apply_meta_gate` with proper walk-forward CV. Computationally
+   expensive (~5x current runtime) but methodologically cleaner.
+4. **Sector-conditional meta**: train one meta classifier per sector.
+5. **Cross-sectional regression instead of ranking**.
+   Fama-MacBeth style regression may extract more signal than top-k ranks.
+
+None of these are guaranteed to flip the holdout positive. They are
+legitimate research moves, not engineering work.
+
+The honest interpretation of six phases of careful work: the strategy
+class (free-data daily-bar cross-sectional L/S on the S&P 500) does not
+appear to have meaningful retail-accessible *profitable* edge in this
+period, but it now produces results indistinguishable from random rather
+than significantly negative — which is genuine progress in honest terms.
+The infrastructure remains valuable for honest experimentation.

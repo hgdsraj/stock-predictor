@@ -253,12 +253,68 @@ Stack: Vite + React 18 + TypeScript + Tailwind + shadcn/ui + TanStack Query + Ta
 28. Update README + PROJECT_LOG
 29. Final code-review sub-agent + final E2E + commit + push instructions
 
-## Last-known-good test snapshot (Session 4 end)
+## Last-known-good test snapshot (Session 6 end)
 
 ```
 $ uv run pytest tests/ -q
-75 passed in ~125s
+95 passed in ~180s
 ```
+
+(The 101 in Session 5 included some tests that were redundant; Session 6
+consolidated and added Phase 8 tests, netting 95.)
+
+Session 6 added:
+- `_apply_meta_gate` in pipeline_v5.py — gates ensemble score on meta P(correct)
+- Triple-barrier label injection in pipeline_v5.py
+- `ranks_only` config option to drop raw cols
+- CLI: `--meta-labelling`, `--meta-threshold`, `--triple-barrier`,
+  `--tb-k-sigma`, `--ranks-only`
+- `_build_weights` now accepts `precomputed_score` (review C1 fix)
+- 5 new tests in test_phase8.py
+
+Sub-agent reviewer fixes applied:
+- C1: precomputed_score bypass for gated scores (no double z-score)
+- C2: ungated dev score retained for holdout-meta training
+- H1: re-rank Tier-2 features so ranks_only doesn't drop them
+- M7: CLI input validation for `--meta-threshold` and `--k-pct`
+
+Phase 8 honest result (best config: 150 names, h=5, HRP, meta-gating,
+ranks_only):
+- HOLDOUT Sharpe: **−0.16** (was −0.69 pre-Phase 8)
+- HOLDOUT 95% block-CI: **[−0.67, +0.29]** — *straddles zero* for the
+  first time in the project
+- HOLDOUT max DD: **−16.0%** (was −29.6%)
+
+The earlier "Phase 8 = +0.09 Sharpe" claim was an artefact of the C1
+double-z-score bug. Corrected number is honest.
+
+Session 5 added:
+- `src/stockpred/backtest/hrp.py` — Hierarchical Risk Parity
+- `src/stockpred/labels_triple_barrier.py` — Triple-barrier labels
+- `src/stockpred/models/meta.py` — Meta-labelling
+- `scripts/per_feature_audit.py` — Per-feature leakage attribution
+- Engine: `pct_change` now clipped to ±50% (data-glitch defence)
+- 14 new tests in `test_phase7.py`, 1 new in `test_backtest_engine.py`
+
+Phase 7 reviewer fixes applied:
+- HRP/vol_scaled `kk <= n//2` clamp
+- `_cov_estimate` drops `bfill`
+- HRP numerical stability hardening
+- `build_meta_dataset` forbidden-column guard
+
+Big-universe Phase 7 result:
+- 822 historical S&P 500 tickers, 2008-2024, h={1,5}
+- HOLDOUT Sharpe: vol_scaled −0.78, HRP **−0.69** (HRP slightly better)
+- HOLDOUT 95% block-CI for HRP: [−1.12, −0.24] (still entirely negative)
+- Per-horizon HOLDOUT IC IR: h=1 +0.69, h=5 +0.49 (real signal!)
+- The signal is real; portfolio construction is reasonable; but the
+  strategy still loses money on holdout after costs.
+
+Phase 8+ research items (in PROJECT_LOG):
+- Wire meta-labelling as a primary-signal gate
+- Wire triple-barrier as an alternate training target
+- Run per_feature_audit on the big universe
+- Try longer horizons (h=21+) on the big universe
 
 Phase 6 additions (this session):
 - `src/stockpred/features/tier2.py` — momentum_12_1, st_reversal_5,

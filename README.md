@@ -216,12 +216,60 @@ not the forward return. **Fix:** the denominator is now strictly t-1 lagged.
 - combos with HOLDOUT Sharpe > 0: **0 / 8**
 - combos with bootstrap CI lower > 0: **0 / 8**
 
-**The strategy as currently configured does not produce a positive
-risk-adjusted return on unseen data.** This is the honest outcome of a
-free-data, daily-bar, 60-name research project — and is in line with the
-strategy-research sub-agent's stated realistic ceiling. The infrastructure
-correctly surfaces this rather than hiding it. See [`docs/PROJECT_LOG.md`](docs/PROJECT_LOG.md)
-for the full Phase 6 write-up and Phase 7+ roadmap.
+### Phase 7: HRP + triple-barrier + meta-labelling + per-feature audit + big-universe run
+
+Added: Hierarchical Risk Parity portfolio construction (López de Prado 2016),
+triple-barrier labels (Ch. 3), meta-labelling (Ch. 3.6), per-feature leakage
+audit, and a defensive ±50% clip on daily returns to handle yfinance
+data-quality glitches.
+
+**Big universe (822 historical S&P 500 tickers, 2008-2024) result:**
+
+| Configuration                    | HOLDOUT Sharpe | HOLDOUT 95% block-CI | HOLDOUT max DD |
+| -------------------------------- | -------------- | -------------------- | -------------- |
+| Phase 6 vol_scaled               | −0.78          | [−1.29, −0.31]       | −32%           |
+| Phase 7 HRP                      | **−0.69**      | **[−1.12, −0.24]**   | **−29.6%**     |
+
+Per-horizon HOLDOUT IC IR is now **positive on both horizons** (h=1d +0.69,
+h=5d +0.49) on the big universe — the signal is real and survives the
+honest out-of-sample test. But the strategy still loses money after costs.
+HRP gave a small but real improvement over vol-scaled top-K.
+
+**The bottom line after four phases of careful work: the strategy class
+(free-data daily-bar cross-sectional L/S) does not have meaningful retail-
+accessible edge in this period.** The infrastructure remains valuable for
+honest experimentation. See [`docs/PROJECT_LOG.md`](docs/PROJECT_LOG.md)
+for the full Phase 7 write-up and Phase 8+ roadmap.
+
+### Phase 8: meta-labelling + triple-barrier + per-feature audit + ranks_only
+
+Added: meta-labelling gate (López de Prado Ch. 3.6) — secondary binary
+classifier that gates trades on P(correct); triple-barrier labels as an
+optional regression target; `ranks_only` flag to keep only cross-sectional
+rank features; per-feature leakage audit which confirmed raw features
+degrade ~100% under hard-cutoff while their ranked versions degrade only
+15-50%.
+
+**Phase 8 corrected real-data result** (150 current S&P names, 2014-2024,
+h=5, HRP + meta-gating + ranks-only):
+
+| Metric                | Phase 7 | Phase 8 (corrected) |
+| --------------------- | ------- | ------------------- |
+| HOLDOUT Sharpe        | −0.69   | **−0.16**           |
+| HOLDOUT 95% block-CI  | [−1.12, −0.24] | **[−0.67, +0.29]** |
+| HOLDOUT max DD        | −29.6%  | **−16.0%**          |
+
+**For the first time in the project, the holdout 95% CI straddles zero**
+rather than sitting entirely below. The point estimate is still negative
+but no longer statistically distinguishable from random. Max drawdown was
+halved. A sub-agent reviewer caught two critical bugs in the initial
+Phase 8 wiring (double z-scoring of gated zeros, holdout meta trained on
+gated dev); the corrected −0.16 above is the honest number.
+
+**The bottom line after six phases: the strategy class does not produce
+statistically significant *positive* risk-adjusted return on unseen data,
+but it now produces results indistinguishable from zero rather than
+significantly negative — which is genuine progress.**
 
 ```bash
 uv run python scripts/run_phase5.py \

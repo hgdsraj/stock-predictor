@@ -130,8 +130,8 @@ class PipelineV5Config:
     )
     holdout_years: int = 2  # last N years untouched by CV / model selection
 
-    # Portfolio construction (the heart of Phase 5)
-    position_sizing: str = "vol_scaled"  # {"vol_scaled", "top_k"}
+    # Portfolio construction (the heart of Phase 5/6/7)
+    position_sizing: str = "vol_scaled"  # {"vol_scaled", "top_k", "hrp"} — "hrp" is Phase 7
     k_per_side_pct: float = 0.15  # top/bottom 15% per side
     leverage_per_side: float = 1.0
     sector_cap_gross: float | None = 0.30
@@ -139,6 +139,30 @@ class PipelineV5Config:
 
     # Ensemble
     ensemble_weighting: str = "ic_ir"  # {"ic_ir", "equal"}
+
+    # Phase 8: meta-labelling (López de Prado Ch. 3.6)
+    # When enabled, a secondary binary GBM is trained per fold predicting
+    # P(primary ensemble score has correct sign). The primary score is
+    # then gated: rows with P(correct) < meta_threshold are zeroed out.
+    # This typically reduces turnover and improves precision at the cost
+    # of recall — useful when transaction costs dominate.
+    use_meta_labelling: bool = False
+    meta_threshold: float = 0.55
+
+    # Phase 8: triple-barrier labels (López de Prado Ch. 3)
+    # When enabled, the regression target switches from `fwd_vs_h` to the
+    # triple-barrier signed return `tb_return * tb_label` per horizon.
+    # The barriers are set at ±tb_k_sigma trailing-vol units; the vertical
+    # barrier is at the horizon's max_horizon (defaults to h).
+    use_triple_barrier_labels: bool = False
+    tb_k_sigma: float = 2.0
+
+    # Phase 8: drop raw feature columns, keep only cross-sectional ranks
+    # (and sector dummies + regime broadcasts). Per-feature audit showed
+    # raw columns degrade much more under hard-cutoff than their ranked
+    # versions, suggesting the ranks carry the stable signal and the raw
+    # versions add noise + same-day regime-level dependence.
+    ranks_only: bool = False
 
     # Stress
     bootstrap_n: int = 500
@@ -176,10 +200,21 @@ def _build_weights(
     close: pd.DataFrame,
     sector_map: dict[str, str],
     asset_betas: pd.DataFrame | None = None,
+    precomputed_score: pd.Series | None = None,
 ) -> pd.DataFrame:
-    """Compose per-horizon predictions into the final wide weights frame."""
-    # 1) Ensemble.
-    if cfg.ensemble_weighting == "ic_ir":
+    """Compose per-horizon predictions into the final wide weights frame.
+
+    Phase 8 (review C1 fix): callers that have already gated / processed an
+    ensemble score (e.g. via meta-labelling) can pass `precomputed_score`
+    directly. We then skip the per-horizon ensemble step entirely so that
+    gated zeros aren't re-z-scored against survivors (which would silently
+    flip "don't trade" into "active short" via the top-k ranking).
+    """
+    # 1) Ensemble (skipped when caller supplied a precomputed score).
+    if precomputed_score is not None:
+        score = precomputed_score
+        log.info("Using precomputed score (ensemble step skipped)")
+    elif cfg.ensemble_weighting == "ic_ir":
         ic_ir = {h: float(per_horizon_diag.get(h, {}).get("ic_ir", 0.0)) for h in per_horizon_preds}
         log.info("IC-IR ensemble weights (pre-normalisation): %s", ic_ir)
         score = ic_ir_weighted_ensemble(per_horizon_preds, ic_ir)
@@ -198,8 +233,17 @@ def _build_weights(
             leverage_per_side=cfg.leverage_per_side,
             top_fraction=cfg.k_per_side_pct,
         )
+    elif cfg.position_sizing == "hrp":
+        from stockpred.backtest.hrp import HRPConfig, hrp_long_short_weights
+
+        hcfg = HRPConfig(
+            cov_window=60,
+            top_fraction=cfg.k_per_side_pct,
+            leverage_per_side=cfg.leverage_per_side,
+            use_ledoit_wolf=True,
+        )
+        weights = hrp_long_short_weights(score, close, cfg=hcfg)
     else:
-        # interpret k_per_side_pct as a fraction of the universe per side
         kk = max(1, int(close.shape[1] * cfg.k_per_side_pct))
         weights = top_bottom_k_weights(score, k=kk, leverage_per_side=cfg.leverage_per_side)
 
@@ -221,6 +265,95 @@ def _build_weights(
 # --------------------------------------------------------------------- #
 # Holdout helpers
 # --------------------------------------------------------------------- #
+
+
+def _apply_meta_gate(
+    ensemble_score: pd.Series,
+    feats: pd.DataFrame,
+    labels: pd.DataFrame,
+    *,
+    bt_horizon_for_meta: int,
+    threshold: float,
+    gbm_cfg,
+    log,
+) -> pd.Series:
+    """Phase 8: train a binary GBM to predict P(ensemble_score is correct)
+    and gate the score on that probability.
+
+    Splits the input window into 80% train / 20% predict by date. Trains
+    meta on train, predicts on predict. The early-train portion (no meta
+    prediction) is returned unmodified — we only gate where we have a
+    prediction.
+
+    This is a single-pass implementation: for stricter walk-forward you
+    would loop folds inside here. The 80/20 single-pass is enough to give
+    a sense of whether the meta layer helps at all without quintupling
+    runtime.
+    """
+    from stockpred.models.meta import (
+        build_meta_dataset,
+        fit_meta,
+        meta_filter_signal,
+        predict_meta,
+    )
+
+    realised_col = f"fwd_return_{bt_horizon_for_meta}"
+    if realised_col not in labels.columns:
+        log.warning(
+            "meta-gate: realised return column %s not in labels; skipping gate",
+            realised_col,
+        )
+        return ensemble_score
+
+    realised = labels[realised_col]
+    # Forbid any column that obviously leaks. The meta module also enforces
+    # this, but pre-filtering keeps the error message clean.
+    forbidden_prefixes = ("fwd_", "tb_")
+    safe_feats = feats[[c for c in feats.columns if not c.startswith(forbidden_prefixes)]]
+
+    # Date-based 80/20 split.
+    all_dates = ensemble_score.index.get_level_values("date").unique().sort_values()
+    if len(all_dates) < 20:
+        log.warning("meta-gate: not enough dates; skipping gate")
+        return ensemble_score
+    split_idx = int(len(all_dates) * 0.8)
+    train_dates = all_dates[:split_idx]
+    pred_dates = all_dates[split_idx:]
+
+    train_mask = ensemble_score.index.get_level_values("date").isin(train_dates)
+    pred_mask = ensemble_score.index.get_level_values("date").isin(pred_dates)
+
+    score_train = ensemble_score[train_mask]
+    score_pred = ensemble_score[pred_mask]
+
+    try:
+        X_meta_train, y_meta_train = build_meta_dataset(
+            score_train,
+            realised.reindex(score_train.index),
+            safe_feats.loc[score_train.index],
+            use_primary_score=True,
+        )
+        if y_meta_train.empty or y_meta_train.nunique() < 2:
+            log.warning("meta-gate: insufficient class diversity; skipping gate")
+            return ensemble_score
+        booster = fit_meta(X_meta_train, y_meta_train, cfg=gbm_cfg)
+        X_meta_pred = safe_feats.loc[score_pred.index].copy()
+        X_meta_pred["primary_abs"] = score_pred.abs()
+        proba = predict_meta(booster, X_meta_pred)
+        # Gate only the prediction window; leave train as-is.
+        gated_pred = meta_filter_signal(score_pred, proba, p_threshold=threshold)
+        log.info(
+            "meta-gate: trained on %d obs, predicted on %d obs; "
+            "%.1f%% of pred window survived gate (threshold=%.2f)",
+            len(y_meta_train),
+            len(score_pred),
+            100 * (gated_pred != 0).mean(),
+            threshold,
+        )
+        return pd.concat([score_train, gated_pred]).sort_index()
+    except Exception as e:  # noqa: BLE001
+        log.warning("meta-gate failed (%s); returning ungated score", e)
+        return ensemble_score
 
 
 def _split_holdout(
@@ -315,7 +448,13 @@ def run_pipeline_v5(cfg: PipelineV5Config | None = None) -> dict:
         t2 = compute_tier2_features(close, volume, bench_close=spy_close)
         if not t2.empty:
             feats = feats.join(t2, how="left")
-            log.info("After tier-2: %s rows x %s cols", *feats.shape)
+            # Review H1 fix: also produce *_rank versions of Tier-2 columns so
+            # `ranks_only=True` doesn't silently drop them all.
+            from stockpred.features.cross_sectional import add_cross_sectional_ranks
+
+            t2_cols = list(t2.columns)
+            feats = add_cross_sectional_ranks(feats, cols=t2_cols)
+            log.info("After tier-2 (with ranks): %s rows x %s cols", *feats.shape)
 
     if cfg.use_regime_features:
         log.info("Building regime features (VIX, term spread, USD, xs dispersion)...")
@@ -328,10 +467,58 @@ def run_pipeline_v5(cfg: PipelineV5Config | None = None) -> dict:
         except Exception as e:  # noqa: BLE001
             log.warning("Regime features failed (%s); continuing.", e)
 
+    # Phase 8: optionally drop the raw (non-rank) numeric columns. Per-feature
+    # audit on the medium universe showed raw versions degrade ~100% under
+    # the hard-cutoff audit while their _rank versions degrade only ~15-50%;
+    # keeping only ranks is a defensible noise-reduction move.
+    if cfg.ranks_only:
+        # Keep: anything ending in _rank, anything prefixed sec_ (sector dummies),
+        # anything prefixed reg_ (regime broadcasts). Drop the rest.
+        keep_cols = [
+            c for c in feats.columns if c.endswith("_rank") or c.startswith(("sec_", "reg_"))
+        ]
+        if keep_cols:
+            log.info(
+                "ranks_only: dropping %d raw cols, keeping %d",
+                feats.shape[1] - len(keep_cols),
+                len(keep_cols),
+            )
+            feats = feats[keep_cols]
+        else:
+            log.warning("ranks_only: no rank/sec/reg columns found; keeping all")
+
     log.info("Final feature matrix: %s rows x %s cols", *feats.shape)
 
     log.info("Building labels for horizons %s...", cfg.horizons)
     labels = long_labels(close, horizons=tuple(cfg.horizons), include_vol_scaled=True)
+
+    # Phase 8: optional triple-barrier labels. We compute per-horizon and
+    # join into `labels` under the name `tb_target_{h}` (signed return,
+    # i.e. tb_label * |tb_return|, clipped to ±k_sigma window so the
+    # magnitude is bounded by construction).
+    if cfg.use_triple_barrier_labels:
+        from stockpred.labels_triple_barrier import (
+            TripleBarrierConfig,
+            compute_triple_barrier_labels,
+        )
+
+        for h in cfg.horizons:
+            tb_cfg = TripleBarrierConfig(
+                max_horizon=h,
+                k_up=cfg.tb_k_sigma,
+                k_dn=cfg.tb_k_sigma,
+                vol_window=21,
+            )
+            tb = compute_triple_barrier_labels(close, tb_cfg)
+            if tb.empty:
+                continue
+            # Signed target: positive when upper barrier hit, negative when
+            # lower hit; vertical-barrier rows take the realised path return
+            # (already in tb_return). NaN preserved.
+            target = tb["tb_return"].copy()
+            target.name = f"tb_target_{h}"
+            labels = labels.join(target, how="left")
+        log.info("Triple-barrier targets added for horizons %s", cfg.horizons)
 
     # ---------------- Holdout split (touch dev only for training) -----
     dev_feats, dev_labels, hold_feats, hold_labels = _split_holdout(
@@ -351,6 +538,23 @@ def run_pipeline_v5(cfg: PipelineV5Config | None = None) -> dict:
         log.info("=== Horizon %d ===", h)
         target = "vs" if cfg.model == "gbm" else "dir"
         X, y_target, y_return, y_bin = assemble_dataset(dev_feats, dev_labels, h, target=target)
+        # Phase 8: if triple-barrier labels are enabled, swap y_target for
+        # the triple-barrier signed return. Realised return (y_return) and
+        # binary direction (y_bin) stay on the original forward-return
+        # convention so IC and hit-rate diagnostics remain comparable.
+        if cfg.use_triple_barrier_labels:
+            tb_col = f"tb_target_{h}"
+            if tb_col in dev_labels.columns:
+                tb_target = dev_labels[tb_col].reindex(X.index)
+                # Drop rows where the TB target is NaN (insufficient warmup).
+                keep = tb_target.notna()
+                X = X[keep]
+                y_target = tb_target[keep]
+                y_return = y_return.reindex(X.index)
+                y_bin = y_bin.reindex(X.index)
+                log.info("h=%d using triple-barrier target; %d rows after NaN drop", h, len(X))
+            else:
+                log.warning("h=%d: requested triple-barrier but column %s not found", h, tb_col)
         log.info("Dev dataset h=%d: X=%s", h, X.shape)
 
         pred = walk_forward_predict(X, y_target, cfg.cv, model=cfg.model, gbm_cfg=cfg.gbm)
@@ -386,7 +590,40 @@ def run_pipeline_v5(cfg: PipelineV5Config | None = None) -> dict:
         except Exception as e:  # noqa: BLE001
             log.warning("Could not compute asset betas (%s); skipping beta-neutralise.", e)
 
+    # ---------------- Build DEV ensemble score (pre-gating) ----------
+    if cfg.ensemble_weighting == "ic_ir":
+        ic_ir_d = {
+            h: float(per_horizon_diag.get(h, {}).get("ic_ir", 0.0)) for h in per_horizon_preds
+        }
+        dev_ensemble_score = ic_ir_weighted_ensemble(per_horizon_preds, ic_ir_d)
+    else:
+        from stockpred.pipeline import ensemble_predictions
+
+        dev_ensemble_score = ensemble_predictions(per_horizon_preds)
+
+    # ---------------- Phase 8: optional meta-labelling gate -----------
+    # Train a binary GBM predicting P(primary signal is correct) on the
+    # first 80% of dev, evaluate on last 20% + use that fit to gate the
+    # dev portfolio. Holdout gets its own fit using all of dev.
+    # Review C2 fix: keep an UNGATED copy of the dev score for the holdout
+    # meta-fit; otherwise the holdout classifier trains on data where
+    # gated-out rows have primary=0 (which always look "incorrect" because
+    # sign(0) != sign(realised)), biasing the meta toward "predict wrong".
+    dev_ensemble_score_ungated = dev_ensemble_score.copy()
+    if cfg.use_meta_labelling:
+        dev_ensemble_score = _apply_meta_gate(
+            dev_ensemble_score,
+            dev_feats,
+            dev_labels,
+            bt_horizon_for_meta=min(per_horizon_preds.keys()),
+            threshold=cfg.meta_threshold,
+            gbm_cfg=cfg.gbm,
+            log=log,
+        )
+
     # ---------------- Portfolio + backtest on the DEV span -----------
+    # Review C1 fix: when we have a gated score, pass it directly via
+    # precomputed_score so _build_weights doesn't re-z-score the zeros.
     dev_weights = _build_weights(
         cfg,
         per_horizon_preds,
@@ -394,6 +631,7 @@ def run_pipeline_v5(cfg: PipelineV5Config | None = None) -> dict:
         close,
         sector_map,
         asset_betas=asset_betas,
+        precomputed_score=dev_ensemble_score if cfg.use_meta_labelling else None,
     )
     if dev_weights.empty:
         raise RuntimeError("Dev portfolio is empty.")
@@ -469,6 +707,75 @@ def run_pipeline_v5(cfg: PipelineV5Config | None = None) -> dict:
     hold_bt = None
     hold_score = pd.Series(dtype=float, name="ensemble_score")
     if hold_preds:
+        # Phase 8: holdout meta-gating. Train meta on ALL of dev (using
+        # the dev ensemble score we already built), then apply to the
+        # holdout ensemble score before weight construction.
+        if cfg.use_meta_labelling:
+            # Build holdout ensemble score first.
+            if cfg.ensemble_weighting == "ic_ir":
+                ic_ir_h = {
+                    h: float(per_horizon_diag.get(h, {}).get("ic_ir", 0.0)) for h in hold_preds
+                }
+                hold_ensemble_pre = ic_ir_weighted_ensemble(hold_preds, ic_ir_h)
+            else:
+                from stockpred.pipeline import ensemble_predictions
+
+                hold_ensemble_pre = ensemble_predictions(hold_preds)
+
+            from stockpred.models.meta import (
+                build_meta_dataset,
+                fit_meta,
+                meta_filter_signal,
+                predict_meta,
+            )
+
+            realised_col = f"fwd_return_{bt_horizon}"
+            if realised_col in dev_labels.columns and realised_col in hold_labels.columns:
+                forbidden_prefixes = ("fwd_", "tb_")
+                safe_dev = dev_feats[
+                    [c for c in dev_feats.columns if not c.startswith(forbidden_prefixes)]
+                ]
+                safe_hold = hold_feats[
+                    [c for c in hold_feats.columns if not c.startswith(forbidden_prefixes)]
+                ]
+                try:
+                    # Review C2 fix: train the holdout meta on the UNGATED
+                    # dev score (not the gated one, which has zeros that
+                    # always look "wrong" to the binary classifier).
+                    X_dev_m, y_dev_m = build_meta_dataset(
+                        dev_ensemble_score_ungated,
+                        dev_labels[realised_col].reindex(dev_ensemble_score_ungated.index),
+                        safe_dev.loc[dev_ensemble_score_ungated.index],
+                        use_primary_score=True,
+                    )
+                    if y_dev_m.nunique() >= 2:
+                        booster_h = fit_meta(X_dev_m, y_dev_m, cfg=cfg.gbm)
+                        X_hold_m = safe_hold.reindex(hold_ensemble_pre.index).copy()
+                        X_hold_m["primary_abs"] = hold_ensemble_pre.abs()
+                        proba_h = predict_meta(booster_h, X_hold_m)
+                        gated_hold = meta_filter_signal(
+                            hold_ensemble_pre,
+                            proba_h,
+                            p_threshold=cfg.meta_threshold,
+                        )
+                        log.info(
+                            "HOLDOUT meta-gate: %.1f%% of obs survived gate",
+                            100 * (gated_hold != 0).mean(),
+                        )
+                        # Store the gated score for downstream snapshot
+                        # writers; we pass it directly to _build_weights via
+                        # precomputed_score below (Review C1 fix).
+                        hold_gated_score = gated_hold
+                    else:
+                        hold_gated_score = None
+                except Exception as e:  # noqa: BLE001
+                    log.warning("HOLDOUT meta-gate failed (%s); ungated", e)
+                    hold_gated_score = None
+            else:
+                hold_gated_score = None
+        else:
+            hold_gated_score = None
+
         hold_weights = _build_weights(
             cfg,
             hold_preds,
@@ -476,6 +783,7 @@ def run_pipeline_v5(cfg: PipelineV5Config | None = None) -> dict:
             close,
             sector_map,
             asset_betas=asset_betas,
+            precomputed_score=hold_gated_score,
         )
         if not hold_weights.empty:
             hold_bt = run_backtest(hold_weights, close, cfg=bt_cfg, horizon=bt_horizon, trade_lag=1)

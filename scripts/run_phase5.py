@@ -48,7 +48,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--position-sizing",
-        choices=("vol_scaled", "top_k"),
+        choices=("vol_scaled", "top_k", "hrp"),
         default="vol_scaled",
     )
     p.add_argument("--k-pct", type=float, default=0.15, help="Top/bottom fraction per side")
@@ -61,6 +61,33 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min-trade-threshold", type=float, default=0.005)
     p.add_argument("--holdout-years", type=int, default=2)
     p.add_argument("--bootstrap-n", type=int, default=500)
+    p.add_argument(
+        "--meta-labelling",
+        action="store_true",
+        help="Phase 8: gate signals on meta-classifier P(correct)",
+    )
+    p.add_argument(
+        "--meta-threshold",
+        type=float,
+        default=0.55,
+        help="P(correct) threshold for meta gate (default 0.55)",
+    )
+    p.add_argument(
+        "--triple-barrier",
+        action="store_true",
+        help="Phase 8: use triple-barrier labels instead of fwd_vs_h",
+    )
+    p.add_argument(
+        "--tb-k-sigma",
+        type=float,
+        default=2.0,
+        help="Triple-barrier upper/lower barrier in sigma units",
+    )
+    p.add_argument(
+        "--ranks-only",
+        action="store_true",
+        help="Phase 8: drop raw feature columns; keep only _rank/sec_/reg_",
+    )
     p.add_argument("--no-sector", action="store_true")
     p.add_argument("--no-tier2", action="store_true", help="Disable Phase 6 tier-2 features")
     p.add_argument("--no-regime", action="store_true", help="Disable Phase 6 regime features")
@@ -88,6 +115,12 @@ def main() -> int:
         datefmt="%H:%M:%S",
     )
 
+    # Lightweight CLI validation (review M7).
+    if not 0.0 <= args.meta_threshold <= 1.0:
+        raise SystemExit(f"--meta-threshold must be in [0, 1]; got {args.meta_threshold}")
+    if args.k_pct <= 0 or args.k_pct >= 1:
+        raise SystemExit(f"--k-pct must be in (0, 1); got {args.k_pct}")
+
     cfg = PipelineV5Config(
         start_date=args.start,
         end_date=args.end,
@@ -107,6 +140,11 @@ def main() -> int:
         use_regime_features=not args.no_regime,
         beta_neutralise=args.beta_neutralise,
         bootstrap_method=args.bootstrap_method,
+        use_meta_labelling=args.meta_labelling,
+        meta_threshold=args.meta_threshold,
+        use_triple_barrier_labels=args.triple_barrier,
+        tb_k_sigma=args.tb_k_sigma,
+        ranks_only=args.ranks_only,
         refresh_data=args.refresh,
     )
     r = run_pipeline_v5(cfg)
