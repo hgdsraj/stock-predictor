@@ -49,13 +49,35 @@ uv run python scripts/run_phase5.py \
 
 ## Hard constraints (don't violate)
 
-1. **Free data only.** yfinance (delayed daily bars), Wikipedia (S&P 500 changes), FRED CSV, FINRA flat files, SEC EDGAR JSON. No paid APIs.
+1. **Free data only.** yfinance (delayed daily bars), Wikipedia (S&P 500 changes), FRED CSV, FINRA flat files, SEC EDGAR JSON, GDELT 2.0 (free). No paid APIs.
 2. **No corp / Google-internal services.** Pure PyPI, public Internet only.
 3. **Honest results.** If the strategy loses money, show that. Never optimise for win rate. Always report HOLDOUT (not DEV) Sharpe with bootstrap CI.
 4. **No account creation in user's name** on hosting platforms.
 5. **No git push by us.** User does it manually via PAT.
 6. **No intraday / real-time.** yfinance is 15+ min delayed; out of scope without paid data.
 7. **No leakage.** Every new feature/label must pass the leakage audit (`scripts/leakage_audit.py`). Same-day shared inputs between feature and label are the #1 failure mode.
+8. **8 GB / 8 vCPU RAM budget (user direction 2026-06-04).** Production
+   deploy target is an 8 GB / 8 vCPU box. Every new code path MUST:
+   (a) read source data in chunks (`pd.read_csv(..., chunksize=...)`),
+   (b) cache to gzipped parquet (`compression="snappy"` or `"gzip"`),
+   (c) shrink dtypes where safe (`float32` for features, `int16/int32`
+       for counts, `category` for ticker strings),
+   (d) `del` intermediate DataFrames + `gc.collect()` between phases,
+   (e) NEVER hold the full GDELT CSV in memory uncompressed,
+   (f) log peak RSS via `psutil` at the end of each phase so we catch
+       regressions early. See "Memory discipline" section below.
+9. **End-to-end smoke test after every phase (user direction 2026-06-04).**
+   Before declaring a phase done, run `uv run python scripts/run_phase5.py`
+   with the new feature ENABLED on a tiny universe (--n-tickers 40,
+   --start 2020-01-01) AND on the production config (150 names × 11yr).
+   Verify the pipeline completes, holdout metrics are present, and peak
+   RSS stays under 6 GB (1 GB headroom). If either check fails, the
+   phase is not done.
+10. **Docs must stay in sync (user direction 2026-06-04).** Any new CLI
+    flag, env var, or required system step (e.g. `curl` to fetch a
+    bulk file, or `pip install` of a heavy model) MUST land in
+    `docs/USAGE.md` in the same commit. The user's deploy box won't
+    have access to my session memory.
 
 ## Architecture (top-level)
 
@@ -209,6 +231,65 @@ event flags first (most-defensible, full history); GDELT tone second
 (layered on, ~2015 boundary); FinBERT third (live-mode only, dashboard
 panel, NOT a backtest feature — yfinance shallow history would cause
 catastrophic walk-forward bias).
+
+## Memory discipline (8 GB RAM target)
+
+The user's deploy box has 8 GB RAM and 8 vCPU. The current pipeline
+peaks at ~3 GB during the Phase 8 best config (150 names × 11 yr). News
+features risk doubling this. Rules for every new data source:
+
+1. **Cache to gzipped/snappy parquet on disk.** A 5 GB GDELT CSV
+   compresses to ~400 MB parquet. Always:
+   ```python
+   df.to_parquet(path, compression="snappy", index=False)
+   ```
+2. **Stream/chunked reads for large source files.** Never `pd.read_csv`
+   a multi-GB file in one shot. Use `chunksize=200_000` and concatenate
+   only the rows that pass an early `query`.
+3. **Shrink dtypes after load.**
+   ```python
+   df["ticker"] = df["ticker"].astype("category")
+   df["count_8k_21d"] = df["count_8k_21d"].astype("int16")
+   df["tone"] = df["tone"].astype("float32")
+   ```
+4. **Free intermediates explicitly.** After joining a news DataFrame
+   into the master feature matrix, `del news_df` + `gc.collect()`.
+5. **Log peak RSS at end of each pipeline phase.** Add to
+   `pipeline_v5.run_pipeline_v5`:
+   ```python
+   import psutil
+   rss_gb = psutil.Process().memory_info().rss / 1024**3
+   log.info("Peak RSS for this phase: %.2f GB", rss_gb)
+   ```
+6. **`PipelineV5Config.refresh_data=False` is the default for a reason.**
+   News fetch + score loops should ALWAYS be cache-first; force-refresh
+   only when explicitly asked.
+
+If a new feature ever causes peak RSS to exceed 6 GB (leaving 1 GB for
+the OS + 1 GB headroom), the phase is not done; profile + fix BEFORE
+committing.
+
+## End-to-end smoke-test checklist
+
+Before declaring any phase done, run BOTH:
+
+```bash
+# 1. Tiny smoke (5-10 min): does it complete + produce holdout metrics?
+uv run python scripts/run_phase5.py \
+    --start 2020-01-01 --end 2023-12-31 \
+    --n-tickers 40 --bootstrap-n 100 \
+    [your new flag]
+
+# 2. Production smoke (30-60 min): does it scale + stay under RAM budget?
+nohup uv run python scripts/run_phase5.py \
+    --start 2014-01-01 --end 2024-12-31 \
+    --n-tickers 150 \
+    [your new flag] > logs/phaseN_smoke.log 2>&1 &
+# After:  grep -E "Peak RSS|HOLDOUT" logs/phaseN_smoke.log | tail -10
+```
+
+If either run crashes, OOMs, or produces no holdout metrics, the phase
+is not done — fix BEFORE updating the ledger.
 
 ## Known issues / wart list (don't add to roadmap; just be aware)
 

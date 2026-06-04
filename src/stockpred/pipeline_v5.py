@@ -1121,7 +1121,20 @@ def run_pipeline_v5(cfg: PipelineV5Config | None = None) -> dict:
     )
 
     elapsed = time.time() - t0
-    log.info("Phase 5 complete in %.1fs", elapsed)
+    # User direction 2026-06-04: log peak RSS so 8 GB RAM budget can be
+    # verified by smoke tests. psutil is a transitive dep (yfinance).
+    try:
+        import psutil
+
+        rss_gb = psutil.Process().memory_info().rss / 1024**3
+        log.info("Phase 5 complete in %.1fs (peak RSS: %.2f GB)", elapsed, rss_gb)
+        if rss_gb > 6.0:
+            log.warning(
+                "Peak RSS %.2f GB exceeds 6 GB budget (8 GB box, 2 GB headroom).",
+                rss_gb,
+            )
+    except Exception:  # noqa: BLE001
+        log.info("Phase 5 complete in %.1fs", elapsed)
 
     # Make the score schema compatible with the snapshot writer.
     if cfg.ensemble_weighting == "ic_ir":
