@@ -27,6 +27,13 @@ from stockpred.backend.models import (
 
 log = logging.getLogger(__name__)
 
+# SQLite hard-limits bound variables to 999 per statement.
+# Use this helper to split any bulk payload into safe chunks.
+def _chunks(payload: list, n_cols: int):
+    size = 999 // n_cols
+    for i in range(0, len(payload), size):
+        yield payload[i : i + size]
+
 
 # --------------------------------------------------------------------- #
 # Runs
@@ -85,10 +92,10 @@ def upsert_predictions(s: Session, run: Run, rows: Iterable[dict]) -> int:
     payload = [{**r, "run_id": run.id} for r in rows]
     if not payload:
         return 0
-    stmt = sqlite_insert(Prediction).values(payload)
-    # If the same run re-inserts (unlikely), ignore conflicts.
-    stmt = stmt.on_conflict_do_nothing(index_elements=["run_id", "date", "ticker"])
-    s.execute(stmt)
+    for chunk in _chunks(payload, 8):
+        stmt = sqlite_insert(Prediction).values(chunk)
+        stmt = stmt.on_conflict_do_nothing(index_elements=["run_id", "date", "ticker"])
+        s.execute(stmt)
     return len(payload)
 
 
@@ -142,19 +149,20 @@ def upsert_prices(s: Session, rows: Iterable[dict]) -> int:
     payload = list(rows)
     if not payload:
         return 0
-    stmt = sqlite_insert(PriceBar).values(payload)
-    stmt = stmt.on_conflict_do_update(
-        index_elements=["ticker", "date"],
-        set_={
-            "open": stmt.excluded.open,
-            "high": stmt.excluded.high,
-            "low": stmt.excluded.low,
-            "close": stmt.excluded.close,
-            "adj_close": stmt.excluded.adj_close,
-            "volume": stmt.excluded.volume,
-        },
-    )
-    s.execute(stmt)
+    for chunk in _chunks(payload, 8):
+        stmt = sqlite_insert(PriceBar).values(chunk)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["ticker", "date"],
+            set_={
+                "open": stmt.excluded.open,
+                "high": stmt.excluded.high,
+                "low": stmt.excluded.low,
+                "close": stmt.excluded.close,
+                "adj_close": stmt.excluded.adj_close,
+                "volume": stmt.excluded.volume,
+            },
+        )
+        s.execute(stmt)
     return len(payload)
 
 
@@ -187,12 +195,16 @@ def upsert_fundamentals(s: Session, rows: Iterable[dict]) -> int:
     payload = list(rows)
     if not payload:
         return 0
-    stmt = sqlite_insert(Fundamental).values(payload)
-    excluded_cols = {
-        c.name: stmt.excluded[c.name] for c in Fundamental.__table__.columns if c.name != "ticker"
-    }
-    stmt = stmt.on_conflict_do_update(index_elements=["ticker"], set_=excluded_cols)
-    s.execute(stmt)
+    # Fundamental has 14 columns → chunk_size = 71
+    for chunk in _chunks(payload, 14):
+        stmt = sqlite_insert(Fundamental).values(chunk)
+        excluded_cols = {
+            c.name: stmt.excluded[c.name]
+            for c in Fundamental.__table__.columns
+            if c.name != "ticker"
+        }
+        stmt = stmt.on_conflict_do_update(index_elements=["ticker"], set_=excluded_cols)
+        s.execute(stmt)
     return len(payload)
 
 
@@ -209,9 +221,11 @@ def upsert_equity(s: Session, run: Run, rows: Iterable[dict]) -> int:
     payload = [{**r, "run_id": run.id} for r in rows]
     if not payload:
         return 0
-    stmt = sqlite_insert(EquitySample).values(payload)
-    stmt = stmt.on_conflict_do_nothing(index_elements=["run_id", "date"])
-    s.execute(stmt)
+    # EquitySample has 7 non-autoincrement columns → chunk_size = 142
+    for chunk in _chunks(payload, 7):
+        stmt = sqlite_insert(EquitySample).values(chunk)
+        stmt = stmt.on_conflict_do_nothing(index_elements=["run_id", "date"])
+        s.execute(stmt)
     return len(payload)
 
 
@@ -331,19 +345,20 @@ def upsert_news(s: Session, ticker: str, items: Iterable[dict]) -> int:
         )
     if not payload:
         return 0
-    stmt = sqlite_insert(NewsItem).values(payload)
-    stmt = stmt.on_conflict_do_update(
-        index_elements=["ticker", "uuid"],
-        set_={
-            "title": stmt.excluded.title,
-            "publisher": stmt.excluded.publisher,
-            "link": stmt.excluded.link,
-            "type": stmt.excluded.type,
-            "published_at": stmt.excluded.published_at,
-            "fetched_at": stmt.excluded.fetched_at,
-        },
-    )
-    s.execute(stmt)
+    for chunk in _chunks(payload, 8):
+        stmt = sqlite_insert(NewsItem).values(chunk)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["ticker", "uuid"],
+            set_={
+                "title": stmt.excluded.title,
+                "publisher": stmt.excluded.publisher,
+                "link": stmt.excluded.link,
+                "type": stmt.excluded.type,
+                "published_at": stmt.excluded.published_at,
+                "fetched_at": stmt.excluded.fetched_at,
+            },
+        )
+        s.execute(stmt)
     return len(payload)
 
 
