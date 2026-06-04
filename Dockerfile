@@ -32,12 +32,12 @@ WORKDIR /app
 
 # Cache deps: copy pyproject + uv.lock first.
 COPY pyproject.toml uv.lock* ./
+COPY README.md ./
 RUN uv sync --frozen --no-dev || uv sync --no-dev
 
 # Copy the rest of the project source.
 COPY src/ ./src/
 COPY scripts/ ./scripts/
-COPY README.md ./
 
 # Copy the built frontend from the previous stage.
 COPY --from=web-build /web/dist /app/web/dist
