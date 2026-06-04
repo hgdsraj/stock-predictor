@@ -48,7 +48,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--position-sizing",
-        choices=("vol_scaled", "top_k"),
+        choices=("vol_scaled", "top_k", "hrp"),
         default="vol_scaled",
     )
     p.add_argument("--k-pct", type=float, default=0.15, help="Top/bottom fraction per side")

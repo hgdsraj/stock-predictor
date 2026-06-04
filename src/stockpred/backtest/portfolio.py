@@ -122,7 +122,9 @@ def vol_scaled_weights(
         g = group.dropna(subset=["vol"])
         if len(g) < 10:
             return pd.Series(dtype=float)
-        kk = max(1, int(len(g) * top_fraction))
+        # Clamp kk <= len(g)//2 so long and short cohorts are disjoint
+        # even when top_fraction > 0.5 (review fix matching the HRP path).
+        kk = max(1, min(int(len(g) * top_fraction), len(g) // 2))
         ranked = g["score"].rank(method="first")
         long_mask = ranked > len(g) - kk
         short_mask = ranked <= kk

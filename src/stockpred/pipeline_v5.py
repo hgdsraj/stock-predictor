@@ -130,8 +130,8 @@ class PipelineV5Config:
     )
     holdout_years: int = 2  # last N years untouched by CV / model selection
 
-    # Portfolio construction (the heart of Phase 5)
-    position_sizing: str = "vol_scaled"  # {"vol_scaled", "top_k"}
+    # Portfolio construction (the heart of Phase 5/6/7)
+    position_sizing: str = "vol_scaled"  # {"vol_scaled", "top_k", "hrp"} — "hrp" is Phase 7
     k_per_side_pct: float = 0.15  # top/bottom 15% per side
     leverage_per_side: float = 1.0
     sector_cap_gross: float | None = 0.30
@@ -198,8 +198,17 @@ def _build_weights(
             leverage_per_side=cfg.leverage_per_side,
             top_fraction=cfg.k_per_side_pct,
         )
+    elif cfg.position_sizing == "hrp":
+        from stockpred.backtest.hrp import HRPConfig, hrp_long_short_weights
+
+        hcfg = HRPConfig(
+            cov_window=60,
+            top_fraction=cfg.k_per_side_pct,
+            leverage_per_side=cfg.leverage_per_side,
+            use_ledoit_wolf=True,
+        )
+        weights = hrp_long_short_weights(score, close, cfg=hcfg)
     else:
-        # interpret k_per_side_pct as a fraction of the universe per side
         kk = max(1, int(close.shape[1] * cfg.k_per_side_pct))
         weights = top_bottom_k_weights(score, k=kk, leverage_per_side=cfg.leverage_per_side)
 
