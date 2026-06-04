@@ -142,9 +142,13 @@ class RefreshRequest(BaseModel):
     refresh_data: bool = Field(default=False, description="Force-refetch cached price/fundamental data")
 
     # --- Horizons + model ---
-    horizons: list[int] = Field(
-        default=[1, 5, 21],
-        description="Forecast horizons in trading days. Phase 5 default is [1, 5].",
+    horizons: list[int] | None = Field(
+        default=None,
+        description=(
+            "Forecast horizons in trading days. "
+            "Defaults to [1, 5, 21] for phase 1 and [1, 5] for phase 5 "
+            "(21d showed no signal in Phase 2 evaluation)."
+        ),
     )
     model: Literal["gbm", "logistic"] = Field(default="gbm")
     use_sector_features: bool = Field(default=True)

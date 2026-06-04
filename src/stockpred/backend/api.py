@@ -428,13 +428,14 @@ def register_routes(app: FastAPI) -> None:
         )
 
         if body.phase == 5:
+            horizons = tuple(body.horizons) if body.horizons is not None else (1, 5)
             pipeline_cfg = PipelineV5Config(
                 start_date=body.start_date,
                 end_date=body.end_date,
                 n_tickers=body.n_tickers,
                 universe_sampling=body.universe_sampling,
                 refresh_data=body.refresh_data,
-                horizons=tuple(body.horizons),
+                horizons=horizons,
                 model=body.model,
                 gbm=gbm_cfg,
                 use_sector_features=body.use_sector_features,
@@ -453,13 +454,14 @@ def register_routes(app: FastAPI) -> None:
                 bootstrap_n=body.bootstrap_n,
             )
         else:
+            horizons = tuple(body.horizons) if body.horizons is not None else (1, 5, 21)
             pipeline_cfg = PipelineConfig(
                 start_date=body.start_date,
                 end_date=body.end_date,
                 n_tickers=body.n_tickers,
                 universe_sampling=body.universe_sampling,
                 refresh_data=body.refresh_data,
-                horizons=tuple(body.horizons),
+                horizons=horizons,
                 k_per_side=body.k_per_side,
                 cv=cv_cfg,
                 model=body.model,
