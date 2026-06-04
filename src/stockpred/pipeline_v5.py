@@ -413,6 +413,7 @@ def run_pipeline_v5(cfg: PipelineV5Config | None = None) -> dict:
         raise RuntimeError("No price data retrieved.")
     close = raw_panel["adj_close"].unstack("ticker").sort_index()
     volume = raw_panel["volume"].unstack("ticker").sort_index()
+    del raw_panel  # free long-format panel (~300 MB for full S&P 500)
     log.info("Loaded prices: %d dates x %d tickers", close.shape[0], close.shape[1])
 
     sector_map: dict[str, str] = {}
@@ -454,6 +455,7 @@ def run_pipeline_v5(cfg: PipelineV5Config | None = None) -> dict:
 
             t2_cols = list(t2.columns)
             feats = add_cross_sectional_ranks(feats, cols=t2_cols)
+            del t2  # free tier-2 intermediate (~200 MB for full S&P 500)
             log.info("After tier-2 (with ranks): %s rows x %s cols", *feats.shape)
 
     if cfg.use_regime_features:
@@ -463,6 +465,7 @@ def run_pipeline_v5(cfg: PipelineV5Config | None = None) -> dict:
             if not regime_wide.empty:
                 reg_long = broadcast_to_panel(regime_wide, feats.index)
                 feats = feats.join(reg_long, how="left")
+                del reg_long, regime_wide  # free regime intermediates
                 log.info("After regime: %s rows x %s cols", *feats.shape)
         except Exception as e:  # noqa: BLE001
             log.warning("Regime features failed (%s); continuing.", e)

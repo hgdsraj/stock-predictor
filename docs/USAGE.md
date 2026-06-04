@@ -376,7 +376,82 @@ Responses are always JSON. NaN and Infinity values are serialised as `null`
 
 ---
 
-## 9. Common operations
+## 9. Recommended parameters for production (Railway / 8 GB)
+
+The request below runs Phase 5 on the full S&P 500 with the best
+signal-quality settings that fit comfortably in 8 GB RAM. Replace
+`$STOCKPRED_API_KEY` and the host as needed.
+
+```bash
+curl -X POST \
+     -H "X-API-Key: $STOCKPRED_API_KEY" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "phase": 5,
+       "n_tickers": null,
+       "start_date": "2013-01-01",
+       "end_date": null,
+       "universe_sampling": "current",
+       "refresh_data": false,
+       "model": "gbm",
+       "use_sector_features": true,
+       "cv": {
+         "train_years": 5,
+         "test_months": 6,
+         "embargo_days": 25,
+         "min_train_obs": 1000
+       },
+       "gbm": {
+         "num_leaves": 63,
+         "learning_rate": 0.03,
+         "n_estimators": 800,
+         "min_data_in_leaf": 200,
+         "feature_fraction": 0.7,
+         "bagging_fraction": 0.8,
+         "bagging_freq": 5,
+         "reg_lambda": 2.0,
+         "early_stopping_rounds": 50
+       },
+       "use_tier2_features": true,
+       "use_regime_features": true,
+       "beta_neutralise": true,
+       "bootstrap_method": "block",
+       "holdout_years": 2,
+       "position_sizing": "vol_scaled",
+       "k_per_side_pct": 0.10,
+       "leverage_per_side": 1.0,
+       "sector_cap_gross": 0.25,
+       "min_trade_threshold": 0.005,
+       "ensemble_weighting": "ic_ir",
+       "bootstrap_n": 500
+     }' \
+     https://stock-predictor-production-d4d4.up.railway.app/jobs/refresh
+```
+
+Key choices vs the defaults:
+
+| Parameter | Default | Here | Why |
+|---|---|---|---|
+| `n_tickers` | 100 | null | Full S&P 500 for maximum universe breadth |
+| `start_date` | 2010-01-01 | 2013-01-01 | Drops pre-2013 data to cut ~20% of memory with minimal signal loss |
+| `universe_sampling` | random | current | Uses actual current S&P 500 members |
+| `cv.train_years` | 3 | 5 | More history → better regime coverage in each fold |
+| `feature_fraction` | 0.8 | 0.7 | More feature dropout → less correlated trees |
+| `reg_lambda` | 1.0 | 2.0 | Stronger L2 regularization for the larger universe |
+| `beta_neutralise` | false | true | Strips SPY beta so results reflect alpha, not market exposure |
+| `k_per_side_pct` | 0.15 | 0.10 | Tighter book = higher conviction positions |
+| `sector_cap_gross` | 0.30 | 0.25 | Tighter sector cap reduces concentration risk |
+
+`n_estimators` and `num_leaves` are left at defaults (800 / 63). Doubling
+them increases model memory ~4× across the walk-forward folds and caused
+OOM on the 8 GB Railway instance without a meaningful signal improvement.
+
+Expected runtime on Railway (8 vCPU / 8 GB): **30–50 minutes** on a warm
+cache, **50–80 minutes** on first run (data fetch included).
+
+---
+
+## 10. Common operations
 
 ### Reset everything
 
@@ -427,7 +502,7 @@ sqlite> SELECT id, status, started_at, completed_at,
 
 ---
 
-## 10. Extending the project
+## 11. Extending the project
 
 ### Add a new feature
 
@@ -468,7 +543,7 @@ sqlite> SELECT id, status, started_at, completed_at,
 
 ---
 
-## 11. Troubleshooting
+## 12. Troubleshooting
 
 ### "No tickers in the universe"
 
@@ -523,7 +598,7 @@ If it still fails, check Node version: `node --version` should be 20+.
 
 ---
 
-## 12. Performance benchmarks
+## 13. Performance benchmarks
 
 Rough timings on a 2024-vintage laptop (Apple M2 / 16 GB):
 
@@ -542,7 +617,7 @@ Rough timings on a 2024-vintage laptop (Apple M2 / 16 GB):
 
 ---
 
-## 13. Where to read more
+## 14. Where to read more
 
 - [`CONCEPTS.md`](CONCEPTS.md) — every metric, term, and design decision
   explained.
