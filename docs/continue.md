@@ -30,6 +30,7 @@ Each phase commit is on `main`. `git log --oneline` shows them in reverse order.
 | 7 | DONE | **−0.69** (HRP, big universe 822 names) | [−1.12, −0.24] | HRP, triple-barrier scaffold, meta-labelling scaffold, per-feature audit, engine ±50% clip |
 | 8 | DONE | **−0.16** ← **BEST RESULT** | **[−0.67, +0.29]** ← straddles zero | Wired meta-labelling + triple-barrier + ranks_only. Reviewer caught 3 CRIT (double z-score, holdout meta on gated dev, ranks_only dropped tier-2). All fixed. |
 | 9 | DONE | −0.57 (made things worse) | [−1.03, −0.15] | Confidence sizing + walk-forward meta-CV + per-sector meta. Real code-rigor improvements but did not improve backtest. Best remains Phase 8. |
+| 10 | DONE | **+0.08** (confidence floor=0.60); −0.16 (binary) | [−0.38, +0.49] (best); [−0.67, +0.29] (binary) | Confidence-floor sweep on Phase 8 best config. Hypothesis confirmed: high floor (≥ 0.55) DOES recover Phase-8-like behavior; default Phase 9 floor=0.50 was the regression. **Best point estimate** at floor=0.60 (+0.077) but CI still straddles zero. NO config has CI strictly above zero. Reproducibility ✓: binary baseline matched documented Phase 8 (−0.158 vs −0.16); floor=0.50 matched documented Phase 9 (−0.570 vs −0.57). Reviewer caught C1 (baseline drift risk) + H1 (dead CLI flag) + 3 MED; all fixed. |
 
 **Best honest config (Phase 8)**:
 ```bash
@@ -135,33 +136,44 @@ unset GH_TOKEN
 
 ## Phase 10+ roadmap (in expected ROI order)
 
-These are the candidates for the next phases. Status: planned / not started.
+These are the candidates for the next phases. Status: planned / not started
+except as noted.
 
-1. **Phase 10 — confidence floor sweep**: Phase 9 confidence mode lost
-   money because the default floor=0.5 was too permissive. Try sweeping
-   floor ∈ {0.55, 0.60, 0.65, 0.70} on the best Phase 8 config. If a
-   higher floor recovers Phase 8 behaviour smoothly, that's a useful
-   default; if not, deprecate confidence mode in favour of binary.
-2. **Phase 11 — feature pruning from per-feature audit**: re-run
+**Phase 10 results (DONE)**: confidence floor ∈ {0.50, 0.55, 0.60, 0.65,
+0.70, 0.75} sweep on Phase 8 best config. Driver: `scripts/phase10_conf_
+floor_sweep.py`. Output: `reports/phase10_conf_floor_sweep.csv`.
+- Reproducibility verified: binary baseline matched documented Phase 8
+  (−0.158 vs −0.16); floor=0.50 matched documented Phase 9 (−0.570 vs −0.57).
+- **Best**: floor=0.60 → +0.077 hold Sharpe, CI [−0.38, +0.49]. **CI still
+  straddles zero; not significant.** Smallest holdout DD (−14.2%) too.
+- All floors ≥ 0.55 recover Phase-8-like behavior. The Phase 9 default
+  floor=0.50 was indeed the culprit for the Phase 9 regression.
+- **No config has CI strictly above zero. The honest result is unchanged.**
+
+Next candidates:
+
+1. **Phase 11 — feature pruning from per-feature audit**: re-run
    `per_feature_audit.py` on the big universe (currently it's 100-name),
    then drop the bottom-quartile by `pct_drop`. Test whether removing
    noisy features improves holdout.
-3. **Phase 12 — chained TB + meta on the best config**: `--triple-barrier`
+2. **Phase 12 — chained TB + meta on the best config**: `--triple-barrier`
    + `--meta-labelling --ranks-only --position-sizing hrp` together.
    Currently neither has been tested in combination on the big universe.
-4. **Phase 13 — Fama-MacBeth cross-sectional regression**: replace the
+   Consider also pinning `--meta-mode confidence --meta-conf-floor 0.60`
+   (the Phase 10 sweet spot) as a third leg.
+3. **Phase 13 — Fama-MacBeth cross-sectional regression**: replace the
    per-date GBM-then-rank with a daily Fama-MacBeth regression of returns
    on factor exposures. Different model class, less prone to overfit on
    tabular data with weak signals.
-5. **Phase 14 — hyperparameter sweep on the best config**: with the
+4. **Phase 14 — hyperparameter sweep on the best config**: with the
    sensitivity grid runner, sweep GBM `num_leaves`, `learning_rate`,
    `n_estimators`, `min_data_in_leaf` on Phase 8 config. Report best
    holdout Sharpe + CI.
-6. **Phase 15 — robust signal aggregation**: replace `top_bottom_k` per
+5. **Phase 15 — robust signal aggregation**: replace `top_bottom_k` per
    day with a daily Bayesian shrinkage of the GBM output toward zero,
    weighted by historical sign-precision per ticker. Lopez de Prado
    Ch. 4 style.
-7. **Phase 16 (out of scope without budget)**: news + sentiment via
+6. **Phase 16 (out of scope without budget)**: news + sentiment via
    local FinBERT (~500 MB model), event flags from EDGAR 8-K, intraday
    data via Alpaca/Polygon (paid).
 
@@ -180,8 +192,12 @@ with most retail attempts capping below 1.0. We are at 0 (CI straddles).
   expected noise; nothing to fix.
 - yfinance occasionally returns 404 for delisted tickers; pipeline handles
   it but warning spam is loud. Cosmetic.
-- The `psf-mode: Confidence` mode is documented but in practice produces
-  worse results than binary on this data. Document but don't remove.
+- The `--meta-mode confidence` mode is highly floor-sensitive on this
+  data (Phase 10): floor=0.50 (Phase 9 default) clearly underperforms
+  binary; floor ∈ [0.55, 0.75] is roughly equivalent to binary with
+  floor=0.60 giving the best point estimate (+0.077) but a CI that
+  still straddles zero. If you ship a default, ship floor=0.60; do not
+  ship floor=0.50.
 
 ## Sub-agent dispatch pattern (proven to find real bugs)
 
