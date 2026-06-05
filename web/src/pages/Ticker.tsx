@@ -322,30 +322,37 @@ function LiveQuote({
   if (price == null) return null;
   const up = (change ?? 0) >= 0;
   return (
-    <div className="flex items-center gap-2">
-      <span className="text-2xl font-semibold tabular">${price.toFixed(2)}</span>
-      {change != null && (
-        <span className={cn("text-sm font-medium tabular", up ? "text-positive" : "text-negative")}>
-          {up ? "▲" : "▼"} {formatNumber(Math.abs(change), { maximumFractionDigits: 2 })}
-          {changePct != null && ` (${formatPercentSigned(changePct)})`}
-        </span>
-      )}
-      <InfoTooltip
-        title="Live (delayed) quote"
-        body={
-          <>
-            <span className="inline-flex items-center gap-1">
-              <Radio className="h-3 w-3 animate-pulse text-positive" /> Auto-refreshes every 10s.
-            </span>{" "}
-            Source is yfinance, which is ~15 minutes delayed and only moves during market hours. Not a
-            real-time feed. {asOf && `Last fetched ${formatDateTime(asOf)}.`}
-          </>
-        }
-      >
-        <span className="inline-flex items-center gap-1 rounded-full bg-positive/10 px-2 py-0.5 text-[10px] font-medium text-positive">
-          <Radio className="h-3 w-3 animate-pulse" /> LIVE
-        </span>
-      </InfoTooltip>
+    <div className="flex flex-col gap-0.5">
+      <div className="flex items-center gap-2">
+        <span className="text-2xl font-semibold tabular">${price.toFixed(2)}</span>
+        {change != null && (
+          <span className={cn("text-sm font-medium tabular", up ? "text-positive" : "text-negative")}>
+            {up ? "▲" : "▼"} {formatNumber(Math.abs(change), { maximumFractionDigits: 2 })}
+            {changePct != null && ` (${formatPercentSigned(changePct)})`}
+          </span>
+        )}
+        {/* Pulsing badge — click/hover for full explanation */}
+        <InfoTooltip
+          title="About this price"
+          body={
+            <>
+              <strong>~15-minute delayed.</strong> Source is yfinance, an unofficial scraper — not a
+              real-time feed. Prices only update during market hours (NYSE: 9:30 AM–4:00 PM ET,
+              Mon–Fri). Outside those hours the quote shows the last close.{" "}
+              {asOf && <>Last fetched at {formatDateTime(asOf)} (server time).</>}
+            </>
+          }
+        >
+          <span className="inline-flex items-center gap-1 rounded-full bg-positive/10 px-2 py-0.5 text-[10px] font-medium text-positive">
+            <Radio className="h-3 w-3 animate-pulse" /> LIVE
+          </span>
+        </InfoTooltip>
+      </div>
+      {/* Always-visible delay notice — no hover required */}
+      <p className="text-[11px] text-muted-foreground">
+        ~15 min delayed · market hours only · refreshes every 10s
+        {asOf && <> · fetched {formatDateTime(asOf)}</>}
+      </p>
     </div>
   );
 }
