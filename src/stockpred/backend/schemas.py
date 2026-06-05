@@ -185,9 +185,9 @@ class RefreshRequest(BaseModel):
     holdout_years: int = Field(
         default=2, ge=0, description="[Phase 5] Years held out from CV / model selection."
     )
-    position_sizing: Literal["vol_scaled", "top_k"] = Field(
+    position_sizing: Literal["vol_scaled", "top_k", "hrp"] = Field(
         default="vol_scaled",
-        description="[Phase 5] Portfolio construction method.",
+        description="[Phase 5] Portfolio construction method. hrp = Hierarchical Risk Parity (Phase 7).",
     )
     k_per_side_pct: float = Field(
         default=0.15,

@@ -131,6 +131,7 @@ def _ensure_log_handler() -> None:
         )
         handler.setLevel(logging.INFO)
         logging.getLogger().addHandler(handler)
+        logging.getLogger("stockpred").setLevel(logging.INFO)
         _log_handler_installed = True
 
 
