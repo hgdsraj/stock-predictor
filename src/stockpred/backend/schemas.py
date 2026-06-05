@@ -152,7 +152,16 @@ class RefreshRequest(BaseModel):
             "(21d showed no signal in Phase 2 evaluation)."
         ),
     )
-    model: Literal["gbm", "logistic"] = Field(default="gbm")
+    model: Literal["gbm", "logistic", "fama_macbeth"] = Field(
+        default="gbm",
+        description=(
+            "Model class. 'gbm' (default) = LightGBM regressor on the "
+            "(vol-scaled) forward return. 'logistic' = sklearn LogReg on "
+            "the binary direction label. 'fama_macbeth' (Phase 17) = "
+            "per-date cross-sectional OLS, time-series-averaged factor "
+            "returns -- robust alternative to GBM for weak signals."
+        ),
+    )
     use_sector_features: bool = Field(default=True)
 
     # --- CV ---

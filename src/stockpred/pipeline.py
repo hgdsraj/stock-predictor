@@ -254,6 +254,15 @@ def _fit_and_predict_fold(
         pipe = make_baseline_pipeline()
         return fit_predict_proba(pipe, X_tr, y_tr, X_te)
 
+    if model == "fama_macbeth":
+        # Phase 17: cross-sectional OLS per training date, average the
+        # daily factor returns, predict OOS as X_te @ lambda_hat.
+        # Different model class than tree-based; useful as a robustness
+        # check against GBM over-fitting on weak signals.
+        from stockpred.models.fama_macbeth import fit_predict_fama_macbeth
+
+        return fit_predict_fama_macbeth(X_tr, y_tr, X_te)
+
     # Default: LightGBM regressor on the (vol-scaled) forward return.
     # Use the last 10% of train as an internal validation slice for early stop.
     n_tr = len(X_tr)

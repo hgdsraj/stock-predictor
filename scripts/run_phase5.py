@@ -39,7 +39,16 @@ def parse_args() -> argparse.Namespace:
         default="random",
     )
     p.add_argument("--horizons", type=int, nargs="+", default=[1, 5])
-    p.add_argument("--model", choices=("gbm", "logistic"), default="gbm")
+    p.add_argument(
+        "--model",
+        choices=("gbm", "logistic", "fama_macbeth"),
+        default="gbm",
+        help=(
+            "gbm (default) | logistic | fama_macbeth. fama_macbeth "
+            "(Phase 17) runs per-date cross-sectional OLS and time-series-"
+            "averages the factor returns; less prone to over-fit than gbm."
+        ),
+    )
     p.add_argument(
         "--weighting",
         choices=("ic_ir", "equal"),
