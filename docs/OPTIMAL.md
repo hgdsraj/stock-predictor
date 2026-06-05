@@ -293,7 +293,7 @@ guaranteed to flip the holdout CI strictly above zero.
 | 16 | Stack triple-barrier + confidence-sizing on top of Phase 13 | **Done — none of the additions beat Phase 13 baseline** (see ledger row 16). Phase 13 remains optimal. |
 | 17 | Fama-MacBeth model class (less prone to overfit than GBM) | Smoke verified; production smoke pending |
 | 18 | GBM hyperparameter grid sweep on Phase 13 best | Driver ready; production sweep pending |
-| 19 | Per-ticker Bayesian shrinkage of ensemble score | **Production sweep running** |
+| 19 | Per-ticker Bayesian shrinkage of ensemble score | **Done — every alpha > 0 hurt** (see ledger row 19). Phase 13 remains optimal. |
 
 Phase 16 result (completed 2026-06-05) confirmed Phase 13 is locally
 optimal among the {+TB, +conf, +TB+conf} alternatives. If Phase 14
