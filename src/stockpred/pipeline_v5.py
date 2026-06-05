@@ -204,6 +204,12 @@ class PipelineV5Config:
     # / User-Agent rules apply.
     use_edgar_item_features: bool = False
 
+    # Phase 14: GDELT GKG daily tone + mention features. Reads ONLY
+    # from per-day parquet caches (bulk fetch done overnight by
+    # `scripts/phase14_gdelt_bulk_fetch.py`). Columns prefixed `gdelt_`
+    # so they survive ranks_only via the shared `gdelt` prefix.
+    use_gdelt_features: bool = False
+
     # Stress
     bootstrap_n: int = 500
 
@@ -792,19 +798,61 @@ def run_pipeline_v5(cfg: PipelineV5Config | None = None) -> dict:
         ) as e:
             log.warning("EDGAR item-code features failed (%s); continuing.", e)
 
+    # Phase 14: GDELT GKG daily tone + mention features. Reads ONLY
+    # from per-day parquet caches; operator runs `scripts/phase14_
+    # gdelt_bulk_fetch.py` overnight to populate them. If caches are
+    # missing the join silently fills zeros + emits a coverage warning.
+    if cfg.use_gdelt_features:
+        log.info("Building GDELT GKG tone+mention features...")
+        try:
+            from stockpred.data import edgar as edgar_mod
+            from stockpred.data import gdelt as gdelt_mod
+
+            ticker_to_cik = edgar_mod.fetch_ticker_to_cik(refresh=cfg.refresh_data)
+            gdelt_panel = gdelt_mod.build_gdelt_features(
+                tickers=list(close.columns),
+                trading_days=close.index,
+                start=cfg.start_date,
+                end=cfg.end_date,
+                refresh=cfg.refresh_data,
+                ticker_to_cik=ticker_to_cik,
+            )
+            if not gdelt_panel.empty:
+                feats = feats.join(gdelt_panel, how="left")
+                gdelt_cols = [c for c in feats.columns if c.startswith("gdelt_")]
+                for c in gdelt_cols:
+                    feats[c] = feats[c].fillna(0)
+                log.info("After GDELT: %s rows x %s cols", *feats.shape)
+                del gdelt_panel
+                import gc as _gc
+
+                _gc.collect()
+            else:
+                log.warning(
+                    "GDELT features: empty panel returned. Did you run "
+                    "scripts/phase14_gdelt_bulk_fetch.py to populate the cache?"
+                )
+        except (
+            _requests.RequestException,
+            OSError,
+            ValueError,
+            RuntimeError,
+        ) as e:
+            log.warning("GDELT features failed (%s); continuing without.", e)
+
     # Phase 8: optionally drop the raw (non-rank) numeric columns. Per-feature
     # audit on the medium universe showed raw versions degrade ~100% under
     # the hard-cutoff audit while their _rank versions degrade only ~15-50%;
     # keeping only ranks is a defensible noise-reduction move.
     if cfg.ranks_only:
         # Keep: anything ending in _rank, anything prefixed sec_ (sector
-        # dummies), anything prefixed reg_ (regime broadcasts), anything
-        # prefixed edgar (Phase 12 has_8k/count_8k OR Phase 13
-        # edgaritem_). Drop the rest.
+        # dummies), reg_ (regime broadcasts), edgar (Phase 12 has_8k /
+        # count_8k OR Phase 13 edgaritem_), gdelt_ (Phase 14 GDELT).
+        # Drop the rest.
         keep_cols = [
             c
             for c in feats.columns
-            if c.endswith("_rank") or c.startswith(("sec_", "reg_", "edgar"))
+            if c.endswith("_rank") or c.startswith(("sec_", "reg_", "edgar", "gdelt_"))
         ]
         if keep_cols:
             log.info(

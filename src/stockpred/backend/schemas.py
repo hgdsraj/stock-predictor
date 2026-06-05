@@ -330,6 +330,17 @@ class RefreshRequest(BaseModel):
         ),
     )
 
+    # --- Phase 14 GDELT GKG tone + mentions ------------------------------
+    use_gdelt_features: bool = Field(
+        default=False,
+        description=(
+            "[Phase 14] Enable GDELT GKG daily tone + mention features. "
+            "Reads ONLY from per-day parquet caches; operator must populate "
+            "them first via `scripts/phase14_gdelt_bulk_fetch.py` overnight. "
+            "If caches are missing, emits a coverage warning + fills zeros."
+        ),
+    )
+
 
 class JobResponse(BaseModel):
     job_id: str

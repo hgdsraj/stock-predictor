@@ -170,6 +170,13 @@ def fetch_ticker_to_cik(*, refresh: bool = False) -> dict[str, str]:
             f"{_TICKER_JSON_URL}. Refusing to cache."
         )
     TICKER_CIK_CACHE.write_text(json.dumps(out, indent=0))
+    # Also persist the FULL raw JSON (with titles) so Phase 14 GDELT
+    # can build a company-name -> ticker map without re-fetching.
+    raw_cache = TICKER_CIK_CACHE.parent / "company_tickers.json"
+    try:
+        raw_cache.write_text(json.dumps(raw, indent=0))
+    except Exception as e:  # noqa: BLE001
+        log.warning("Could not persist raw company_tickers.json: %s", e)
     log.info("Cached %d ticker->CIK mappings to %s", len(out), TICKER_CIK_CACHE)
     return out
 

@@ -262,6 +262,8 @@ def _build_pipeline_cfg(
             # Phase 12 / 13 EDGAR
             use_edgar_features=body.use_edgar_features,
             use_edgar_item_features=body.use_edgar_item_features,
+            # Phase 14 GDELT
+            use_gdelt_features=body.use_gdelt_features,
         )
     else:
         horizons = tuple(body.horizons) if body.horizons is not None else (1, 5, 21)

@@ -153,6 +153,17 @@ def parse_args() -> argparse.Namespace:
             "both can be enabled together."
         ),
     )
+    p.add_argument(
+        "--gdelt",
+        action="store_true",
+        help=(
+            "Phase 14: enable GDELT GKG daily tone + mention features. "
+            "Reads ONLY from per-day parquet caches (no HTTP); operator "
+            "must populate them first via scripts/phase14_gdelt_bulk_fetch.py. "
+            "If caches are missing, the pipeline emits a coverage warning "
+            "and silently fills zeros."
+        ),
+    )
     p.add_argument("--refresh", action="store_true")
     p.add_argument("--verbose", "-v", action="store_true")
     return p.parse_args()
@@ -210,6 +221,7 @@ def main() -> int:
         ranks_only=args.ranks_only,
         use_edgar_features=args.edgar_events,
         use_edgar_item_features=args.edgar_items,
+        use_gdelt_features=args.gdelt,
         refresh_data=args.refresh,
     )
     r = run_pipeline_v5(cfg)
