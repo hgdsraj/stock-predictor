@@ -100,6 +100,7 @@ def _sanitize(value):
 class SafeJSONResponse(JSONResponse):
     def render(self, content) -> bytes:
         import json
+
         return json.dumps(
             _sanitize(content),
             allow_nan=False,
@@ -244,6 +245,23 @@ def _build_pipeline_cfg(
             min_trade_threshold=body.min_trade_threshold,
             ensemble_weighting=body.ensemble_weighting,
             bootstrap_n=body.bootstrap_n,
+            # Phase 8 meta-labelling + ranks-only
+            use_meta_labelling=body.use_meta_labelling,
+            meta_threshold=body.meta_threshold,
+            ranks_only=body.ranks_only,
+            # Phase 9 confidence-weighted sizing + walk-forward meta-CV
+            meta_mode=body.meta_mode,
+            meta_conf_floor=body.meta_conf_floor,
+            meta_conf_cap=body.meta_conf_cap,
+            meta_walk_forward_folds=body.meta_walk_forward_folds,
+            meta_per_sector=body.meta_per_sector,
+            # Phase 7 triple-barrier
+            use_triple_barrier_labels=body.use_triple_barrier_labels,
+            # Phase 11 feature pruning
+            feature_exclude=tuple(body.feature_exclude),
+            # Phase 12 / 13 EDGAR
+            use_edgar_features=body.use_edgar_features,
+            use_edgar_item_features=body.use_edgar_item_features,
         )
     else:
         horizons = tuple(body.horizons) if body.horizons is not None else (1, 5, 21)
@@ -265,11 +283,13 @@ def _build_pipeline_cfg(
 
 def _launch_pipeline(pipeline_cfg, job_id: str) -> None:
     """Start a background thread that acquires _refresh_lock and runs the pipeline."""
+
     def _run():
         with _refresh_lock:
             jobs_mod.run_pipeline_job(
                 AppState.SessionLocal, pipeline_cfg=pipeline_cfg, job_id=job_id
             )
+
     threading.Thread(target=_run, daemon=True).start()
 
 
@@ -442,15 +462,25 @@ def register_routes(app: FastAPI) -> None:
             date=date_val,
             long=[
                 schemas.PredictionOut(
-                    date=p.date, ticker=p.ticker, score=p.score, rank=p.rank,
-                    side=p.side, weight=p.weight, per_horizon=p.per_horizon_json or {},
+                    date=p.date,
+                    ticker=p.ticker,
+                    score=p.score,
+                    rank=p.rank,
+                    side=p.side,
+                    weight=p.weight,
+                    per_horizon=p.per_horizon_json or {},
                 )
                 for p in data["long"]
             ],
             short=[
                 schemas.PredictionOut(
-                    date=p.date, ticker=p.ticker, score=p.score, rank=p.rank,
-                    side=p.side, weight=p.weight, per_horizon=p.per_horizon_json or {},
+                    date=p.date,
+                    ticker=p.ticker,
+                    score=p.score,
+                    rank=p.rank,
+                    side=p.side,
+                    weight=p.weight,
+                    per_horizon=p.per_horizon_json or {},
                 )
                 for p in data["short"]
             ],
