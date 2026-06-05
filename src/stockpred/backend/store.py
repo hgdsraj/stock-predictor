@@ -456,6 +456,7 @@ def upsert_job_record(
     run_id=None,
     error=None,
     config=None,
+    logs=None,
 ) -> None:
     stmt = sqlite_insert(JobRecord).values(
         job_id=job_id,
@@ -466,6 +467,7 @@ def upsert_job_record(
         run_id=run_id,
         error=error,
         config_json=config,
+        logs_json=logs,
     )
     stmt = stmt.on_conflict_do_update(
         index_elements=["job_id"],
@@ -477,6 +479,7 @@ def upsert_job_record(
             "run_id": stmt.excluded.run_id,
             "error": stmt.excluded.error,
             "config_json": stmt.excluded.config_json,
+            "logs_json": stmt.excluded.logs_json,
         },
     )
     s.execute(stmt)

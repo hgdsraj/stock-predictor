@@ -200,7 +200,7 @@ def get_job_status(job_id: str, session_factory=None) -> dict | None:
                         "run_id": db_rec.run_id,
                         "error": db_rec.error,
                         "config": db_rec.config_json or {},
-                        "logs": [],
+                        "logs": db_rec.logs_json or [],
                     }
         except Exception:  # noqa: BLE001
             pass
@@ -288,6 +288,9 @@ def run_pipeline_job(
     except Exception:  # noqa: BLE001
         pass
 
+    def _current_logs() -> list[str]:
+        return get_job_logs(job_id)
+
     def _persist_cancelled(elapsed: float) -> None:
         _record_job(job_id, "cancelled", started_at=started_at, elapsed_s=elapsed)
         try:
@@ -295,7 +298,7 @@ def run_pipeline_job(
                 store.upsert_job_record(
                     s, job_id, "cancelled",
                     started_at=started_at, updated_at=_now(),
-                    elapsed_s=elapsed, config=cfg_dict,
+                    elapsed_s=elapsed, config=cfg_dict, logs=_current_logs(),
                 )
         except Exception:  # noqa: BLE001
             pass
@@ -318,7 +321,7 @@ def run_pipeline_job(
             store.upsert_job_record(
                 s, job_id, "ok",
                 started_at=started_at, updated_at=_now(),
-                elapsed_s=elapsed, run_id=run.id, config=cfg_dict,
+                elapsed_s=elapsed, run_id=run.id, config=cfg_dict, logs=_current_logs(),
             )
         _record_job(job_id, "ok", run_id=run.id, started_at=started_at, elapsed_s=elapsed)
         log.info("job %s → run %d ok (%.0fs)", job_id, run.id, elapsed)
@@ -341,7 +344,8 @@ def run_pipeline_job(
                 store.upsert_job_record(
                     s, job_id, "failed",
                     started_at=started_at, updated_at=_now(),
-                    elapsed_s=elapsed, run_id=run.id, error=str(e), config=cfg_dict,
+                    elapsed_s=elapsed, run_id=run.id, error=str(e),
+                    config=cfg_dict, logs=_current_logs(),
                 )
         except Exception:  # noqa: BLE001
             pass

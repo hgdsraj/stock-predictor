@@ -176,6 +176,7 @@ class JobRecord(Base):
     run_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     error: Mapped[str | None] = mapped_column(String(4096), nullable=True)
     config_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    logs_json: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
 
 
 class NewsItem(Base):
