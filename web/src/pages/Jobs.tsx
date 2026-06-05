@@ -868,15 +868,17 @@ export function Jobs() {
         </CardContent>
       </Card>
 
-      {/* Queued jobs */}
+      {/* Queue. Includes pending entries (with Launch/Delete actions) AND
+          launched-history entries (status='launched', read-only, with a
+          link to the live job row). The 5-cap only counts pending. */}
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center justify-between text-base">
             <span>
-              Pending (awaiting launch)
+              Queue
               {queued.filter(j => j.status === "pending").length > 0 && (
                 <span className="ml-2 rounded-full bg-yellow-100 px-2 py-0.5 text-xs text-yellow-800 dark:bg-yellow-900/40 dark:text-yellow-300">
-                  {queued.filter(j => j.status === "pending").length} / 5
+                  {queued.filter(j => j.status === "pending").length} / 5 pending
                 </span>
               )}
             </span>
@@ -897,7 +899,8 @@ export function Jobs() {
                     <th className="px-4 py-2">Status</th>
                     <th className="px-4 py-2">Summary</th>
                     <th className="px-4 py-2">Created</th>
-                    <th className="px-4 py-2">Actions</th>
+                    <th className="px-4 py-2">Job</th>
+                    <th className="px-4 py-2 text-right">Actions</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -910,9 +913,30 @@ export function Jobs() {
                         {(q.config.horizons as number[] | null)?.length ? ` · h=${(q.config.horizons as number[]).join(",")}` : ""}
                       </td>
                       <td className="px-4 py-2 text-xs">{fmtTs(q.created_at)}</td>
+                      <td className="px-4 py-2 text-xs">
+                        {q.job_id ? (
+                          <button
+                            onClick={() => {
+                              setSelectedJobId(q.job_id);
+                              setParams((prev) => {
+                                const p = new URLSearchParams(prev);
+                                p.set("job", q.job_id as string);
+                                return p;
+                              }, { replace: true });
+                            }}
+                            className="inline-flex items-center gap-1 font-mono text-primary hover:underline"
+                            title="Jump to the live job"
+                          >
+                            <ExternalLink className="h-3 w-3" />
+                            {q.job_id.slice(0, 8)}…
+                          </button>
+                        ) : (
+                          <span className="text-muted-foreground">—</span>
+                        )}
+                      </td>
                       <td className="px-4 py-2">
-                        {q.status === "pending" && (
-                          <div className="flex gap-1">
+                        {q.status === "pending" ? (
+                          <div className="flex items-center justify-end gap-1">
                             <Button variant="default" size="sm" onClick={() => { setPwError(null); setPwAction({ type: "launch", queueId: q.id }); }}>
                               <Play className="h-3 w-3" /> Launch
                             </Button>
@@ -920,6 +944,8 @@ export function Jobs() {
                               <Trash2 className="h-3 w-3" />
                             </Button>
                           </div>
+                        ) : (
+                          <div className="text-right text-xs text-muted-foreground">—</div>
                         )}
                       </td>
                     </tr>

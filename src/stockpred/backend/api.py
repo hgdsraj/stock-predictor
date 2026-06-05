@@ -727,7 +727,14 @@ def register_routes(app: FastAPI) -> None:
         dependencies=[Depends(_require_password)],
     )
     def run_queued_job(queue_id: str, s: Session = Depends(get_db)):
-        """Launch a pending queued job. Requires X-Password header."""
+        """Launch a pending queued job. Requires X-Password header.
+
+        The queue entry transitions `pending` → `launched` and stays in the
+        listing as an audit trail (with `job_id` populated so the UI can
+        cross-link to the live job). It does NOT count toward the 5-pending
+        cap any more because `count_pending_queued_jobs` filters by
+        `status='pending'`.
+        """
         if AppState.SessionLocal is None:
             raise HTTPException(500, "DB not initialised")
         qj = store.get_queued_job(s, queue_id)
@@ -742,7 +749,9 @@ def register_routes(app: FastAPI) -> None:
         pipeline_cfg = _build_pipeline_cfg(body)
         job_id = str(_uuid.uuid4())
 
-        store.delete_queued_job(s, queue_id)
+        # Keep the queue row (status='launched', job_id set) so the Jobs UI
+        # can show the trail "queued at X → launched at Y → job <uuid>".
+        store.mark_queued_launched(s, queue_id, job_id)
         jobs_mod._record_job(job_id, "queued")
         _launch_pipeline(pipeline_cfg, job_id)
         return schemas.JobResponse(job_id=job_id, status="queued")
