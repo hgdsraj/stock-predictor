@@ -782,23 +782,50 @@ Responses are always JSON. NaN and Infinity values are serialised as `null`
 
 ## 9. Recommended parameters for production (Railway / 8 GB)
 
-The request below runs Phase 5 on the full S&P 500 with the best
-signal-quality settings that fit comfortably in 8 GB RAM. Replace
-`$STOCKPRED_API_KEY` and the host as needed.
+> **Updated for Phase 13** — the config below reflects the highest documented
+> holdout Sharpe (+0.173, DD −8.2%) across all research phases. It supersedes
+> the pre-Phase-8 config that was here previously.
+>
+> **Honest context**: the 95% bootstrap CI is [−0.32, +0.58] — it straddles
+> zero, so this is not a statistically proven edge. It is the best result
+> the research has produced so far. A simple S&P 500 buy-and-hold has a
+> long-run Sharpe of ~0.5–0.6, so do not treat +0.17 as a finished product.
+
+### Queue the job (no auth required)
 
 ```bash
 curl -X POST \
-     -H "X-API-Key: $STOCKPRED_API_KEY" \
      -H "Content-Type: application/json" \
      -d '{
        "phase": 5,
+       "start_date": "2014-01-01",
        "n_tickers": null,
-       "start_date": "2013-01-01",
-       "end_date": null,
        "universe_sampling": "current",
-       "refresh_data": false,
-       "model": "gbm",
-       "use_sector_features": true,
+       "horizons": [5],
+
+       "use_sector_features": false,
+       "use_tier2_features": false,
+       "use_regime_features": false,
+       "beta_neutralise": false,
+
+       "ensemble_weighting": "equal",
+       "position_sizing": "hrp",
+       "k_per_side_pct": 0.15,
+       "leverage_per_side": 1.0,
+       "sector_cap_gross": 0.30,
+       "min_trade_threshold": 0.005,
+       "holdout_years": 2,
+
+       "ranks_only": true,
+       "use_meta_labelling": true,
+       "meta_threshold": 0.55,
+       "meta_mode": "binary",
+       "meta_walk_forward_folds": 1,
+
+       "use_edgar_features": false,
+       "use_edgar_item_features": true,
+
+       "bootstrap_n": 200,
        "cv": {
          "train_years": 5,
          "test_months": 6,
@@ -807,51 +834,59 @@ curl -X POST \
        },
        "gbm": {
          "num_leaves": 63,
-         "learning_rate": 0.03,
-         "n_estimators": 800,
-         "min_data_in_leaf": 200,
+         "learning_rate": 0.05,
+         "n_estimators": 600,
+         "min_data_in_leaf": 500,
          "feature_fraction": 0.7,
          "bagging_fraction": 0.8,
          "bagging_freq": 5,
          "reg_lambda": 2.0,
-         "early_stopping_rounds": 50
-       },
-       "use_tier2_features": true,
-       "use_regime_features": true,
-       "beta_neutralise": true,
-       "bootstrap_method": "block",
-       "holdout_years": 2,
-       "position_sizing": "vol_scaled",
-       "k_per_side_pct": 0.10,
-       "leverage_per_side": 1.0,
-       "sector_cap_gross": 0.25,
-       "min_trade_threshold": 0.005,
-       "ensemble_weighting": "ic_ir",
-       "bootstrap_n": 500
+         "early_stopping_rounds": 30
+       }
      }' \
-     https://stock-predictor-production-d4d4.up.railway.app/jobs/refresh
+     https://stock-predictor-production-d4d4.up.railway.app/jobs/queue
 ```
 
-Key choices vs the defaults:
+This returns a `{"id": "<queue_id>", ...}`. Then launch it with your password:
 
-| Parameter | Default | Here | Why |
-|---|---|---|---|
-| `n_tickers` | 100 | null | Full S&P 500 for maximum universe breadth |
-| `start_date` | 2010-01-01 | 2013-01-01 | Drops pre-2013 data to cut ~20% of memory with minimal signal loss |
-| `universe_sampling` | random | current | Uses actual current S&P 500 members |
-| `cv.train_years` | 3 | 5 | More history → better regime coverage in each fold |
-| `feature_fraction` | 0.8 | 0.7 | More feature dropout → less correlated trees |
-| `reg_lambda` | 1.0 | 2.0 | Stronger L2 regularization for the larger universe |
-| `beta_neutralise` | false | true | Strips SPY beta so results reflect alpha, not market exposure |
-| `k_per_side_pct` | 0.15 | 0.10 | Tighter book = higher conviction positions |
-| `sector_cap_gross` | 0.30 | 0.25 | Tighter sector cap reduces concentration risk |
+```bash
+curl -X POST \
+     -H "X-Password: $STOCKPRED_PW" \
+     https://stock-predictor-production-d4d4.up.railway.app/jobs/run/<queue_id>
+```
 
-`n_estimators` and `num_leaves` are left at defaults (800 / 63). Doubling
-them increases model memory ~4× across the walk-forward folds and caused
-OOM on the 8 GB Railway instance without a meaningful signal improvement.
+### Why each choice (Phase 13 research findings)
 
-Expected runtime on Railway (8 vCPU / 8 GB): **30–50 minutes** on a warm
-cache, **50–80 minutes** on first run (data fetch included).
+| Parameter | Value | Reason |
+|---|---|---|
+| `horizons` | `[5]` | h=5d has IC IR 1.18 in live data; h=1d (IR 0.61) adds noise and turnover; h=21d adds little when running walk-forward cadence at 5d |
+| `position_sizing` | `hrp` | Hierarchical Risk Parity (Phase 7) beat vol_scaled in holdout |
+| `ensemble_weighting` | `equal` | Single horizon → weighting is moot; matches documented Phase 13 config |
+| `use_*_features` | all `false` | **Counter-intuitive**: Phase 13 found that stripping sector/regime/tier2 features and keeping only price-derived cross-sectional ranks improved holdout Sharpe. The additional features were adding noise and overfitting surface for the walk-forward folds |
+| `ranks_only` | `true` | Phase 8 finding: cross-sectional rank columns carry the durable signal; raw feature values add regime-level dependence that doesn't generalise |
+| `use_meta_labelling` | `true` (binary @ 0.55) | Phase 8/13 best config; binary gate outperformed confidence mode (Phase 10 confidence gave +0.08 vs +0.17 binary) |
+| `use_edgar_item_features` | `true` | Phase 13: per-item 8-K codes (CEO change 5.02, earnings 2.02, M&A 1.01/2.01/8.01) carry directional signal raw counts don't |
+| `use_edgar_features` | `false` | **Do NOT enable** — Phase 12 raw 8-K event counts hurt the strategy |
+| `start_date` | `2014-01-01` | Walk-forward burn-in means 2010–2013 produce zero positions anyway; dropping them cuts memory ~25% |
+| `min_data_in_leaf` | `500` | Scaled up from 200 (research used 150 tickers); with ~500 tickers you have ~3× more rows per fold — higher floor prevents overfitting |
+| `learning_rate` | `0.05` | Slightly higher for larger dataset; early stopping at 30 rounds handles convergence |
+| `bootstrap_n` | `200` | Reduced from 500 — stress test is informative but not the bottleneck |
+
+### Memory and runtime (8 vCPU / 8 GB RAM)
+
+| Component | 150 tickers (research) | ~500 tickers (this run) |
+|---|---|---|
+| Prices + features | ~0.4 GB | ~1.3 GB |
+| EDGAR item fetch | ~0.1 GB | ~0.3 GB |
+| LightGBM training | ~0.3 GB | ~0.9 GB |
+| Python + OS | ~0.3 GB | ~0.3 GB |
+| **Peak total** | **~1.0 GB** | **~2.5–3 GB** |
+
+8 GB RAM: ✅ comfortable headroom.
+
+LightGBM uses all available threads — 8 vCPUs makes training ~5× faster than
+the 1–2 vCPU baseline. Expected runtime: **1–2 hours** (warm cache) or
+**1.5–2.5 hours** on first run including EDGAR and price fetches for 500 tickers.
 
 ---
 
