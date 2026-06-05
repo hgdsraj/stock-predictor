@@ -288,19 +288,20 @@ guaranteed to flip the holdout CI strictly above zero.
 
 | Phase | What it tests | Status |
 |---|---|---|
-| 14 | GDELT daily tone + mention features (independent from SEC) | Bulk fetch running (~37% complete, ~3 hr remaining) |
+| 14 | GDELT daily tone + mention features (independent from SEC) | Bulk fetch **DONE** (3922/4018 days cached, 55 MB on disk); production smoke running |
 | 15 | FinBERT live-mode sentiment (dashboard only, not a backtest feature) | **Done** |
 | 16 | Stack triple-barrier + confidence-sizing on top of Phase 13 | **Done — none of the additions beat Phase 13 baseline** (see ledger row 16). Phase 13 remains optimal. |
-| 17 | Fama-MacBeth model class (less prone to overfit than GBM) | Smoke verified; production smoke pending |
-| 18 | GBM hyperparameter grid sweep on Phase 13 best | Driver ready; production sweep pending |
+| 17 | Fama-MacBeth model class (less prone to overfit than GBM) | **Done — Sharpe +0.087 < Phase 13's +0.173, BUT widest CI upper bound (+0.60) across all phases** (see ledger row 17). GBM stays. |
+| 18 | GBM hyperparameter grid sweep on Phase 13 best | **Done — no HP combination beats Phase 13 defaults** (see ledger row 18). Best alternative +0.121 vs Phase 13 +0.173. |
 | 19 | Per-ticker Bayesian shrinkage of ensemble score | **Done — every alpha > 0 hurt** (see ledger row 19). Phase 13 remains optimal. |
 
-Phase 16 result (completed 2026-06-05) confirmed Phase 13 is locally
-optimal among the {+TB, +conf, +TB+conf} alternatives. If Phase 14
-GDELT delivers material lift, the optimal config will become
-`Phase 13 + GDELT`. If Phase 18 hyperparameter sweep finds a
-clearly-better GBM config (with CI > 0), that becomes the new
-optimal. **This doc will be updated after each phase completes.**
+Phases 16-19 all completed (2026-06-05) and **all confirmed Phase 13
+is the optimal config**. Phase 14 (GDELT) production smoke is the
+last outstanding experiment that could displace Phase 13. If GDELT
+delivers material lift, the optimal config will become `Phase 13 +
+GDELT`. Otherwise, Phase 13 is the final answer for this strategy
+class on free data. **This doc will be updated as soon as the Phase 14
+production smoke finishes.**
 
 ---
 
