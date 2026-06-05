@@ -1,8 +1,20 @@
 import { ReactNode } from "react";
 import { Link, NavLink } from "react-router-dom";
-import { Moon, Sun, LineChart, Search, BarChart3, Home, Briefcase, BookOpen, Zap } from "lucide-react";
+import {
+  Moon,
+  Sun,
+  LineChart,
+  Search,
+  BarChart3,
+  Home,
+  Briefcase,
+  BookOpen,
+  History,
+  Zap,
+} from "lucide-react";
 import { useTheme } from "./ThemeProvider";
 import { Button } from "./ui/Button";
+import { RunPicker } from "./RunPicker";
 import { cn } from "@/lib/cn";
 
 export function Layout({ children }: { children: ReactNode }) {
@@ -12,6 +24,7 @@ export function Layout({ children }: { children: ReactNode }) {
     { to: "/", label: "Home", icon: Home },
     { to: "/screener", label: "Screener", icon: Search },
     { to: "/backtest", label: "Backtest", icon: BarChart3 },
+    { to: "/runs", label: "Runs", icon: History },
     { to: "/jobs", label: "Jobs", icon: Briefcase },
     { to: "/hypersearch", label: "Hypersearch", icon: Zap },
     { to: "/about", label: "About", icon: BookOpen },
@@ -47,6 +60,7 @@ export function Layout({ children }: { children: ReactNode }) {
             ))}
           </nav>
           <div className="flex items-center gap-2">
+            <RunPicker />
             <Button variant="ghost" size="icon" onClick={toggle} title="Toggle theme">
               {theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
             </Button>

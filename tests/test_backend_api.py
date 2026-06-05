@@ -323,3 +323,86 @@ def test_concurrent_refresh_returns_409(app_client):
         assert r.status_code == 409
     finally:
         api_mod._refresh_lock.release()
+
+
+def test_refresh_request_includes_phase_8_through_13_flags():
+    """REGRESSION: the Phase 8-13 flags (meta-labelling, ranks_only, HRP,
+    confidence sizing, triple-barrier, feature pruning, EDGAR events/items)
+    must be exposed by RefreshRequest so the HTTP API can drive the
+    documented best config without operators having to SSH and run the
+    CLI directly."""
+    from stockpred.backend.schemas import RefreshRequest
+
+    # Build the documented Phase 13 best config via the schema.
+    body = RefreshRequest(
+        phase=5,
+        start_date="2014-01-01",
+        n_tickers=150,
+        universe_sampling="current",
+        horizons=[5],
+        model="gbm",
+        use_sector_features=False,
+        use_tier2_features=False,
+        use_regime_features=False,
+        ensemble_weighting="equal",
+        position_sizing="hrp",
+        k_per_side_pct=0.15,
+        sector_cap_gross=0.30,
+        min_trade_threshold=0.005,
+        holdout_years=2,
+        bootstrap_method="block",
+        bootstrap_n=500,
+        # Phase 8
+        use_meta_labelling=True,
+        meta_threshold=0.55,
+        ranks_only=True,
+        # Phase 9 (defaults are safe: binary mode, conf-floor 0.60)
+        meta_mode="binary",
+        # Phase 13
+        use_edgar_item_features=True,
+    )
+    assert body.use_meta_labelling is True
+    assert body.ranks_only is True
+    assert body.position_sizing == "hrp"
+    assert body.meta_conf_floor == 0.60  # default must be the Phase 10 sweet spot
+    assert body.use_edgar_item_features is True
+
+
+def test_build_pipeline_cfg_passes_phase_8_through_13_fields_through():
+    """REGRESSION: every new RefreshRequest field must reach the
+    PipelineV5Config _build_pipeline_cfg constructs."""
+    from stockpred.backend.api import _build_pipeline_cfg
+    from stockpred.backend.schemas import RefreshRequest
+    from stockpred.pipeline_v5 import PipelineV5Config
+
+    body = RefreshRequest(
+        phase=5,
+        use_meta_labelling=True,
+        meta_threshold=0.60,
+        ranks_only=True,
+        meta_mode="confidence",
+        meta_conf_floor=0.65,
+        meta_conf_cap=0.95,
+        meta_walk_forward_folds=3,
+        meta_per_sector=True,
+        use_triple_barrier_labels=True,
+        feature_exclude=["adv_proxy_21", "kurt_63"],
+        use_edgar_features=False,
+        use_edgar_item_features=True,
+        position_sizing="hrp",
+    )
+    cfg = _build_pipeline_cfg(body)
+    assert isinstance(cfg, PipelineV5Config)
+    assert cfg.use_meta_labelling is True
+    assert cfg.meta_threshold == 0.60
+    assert cfg.ranks_only is True
+    assert cfg.meta_mode == "confidence"
+    assert cfg.meta_conf_floor == 0.65
+    assert cfg.meta_conf_cap == 0.95
+    assert cfg.meta_walk_forward_folds == 3
+    assert cfg.meta_per_sector is True
+    assert cfg.use_triple_barrier_labels is True
+    assert cfg.feature_exclude == ("adv_proxy_21", "kurt_63")
+    assert cfg.use_edgar_features is False
+    assert cfg.use_edgar_item_features is True
+    assert cfg.position_sizing == "hrp"

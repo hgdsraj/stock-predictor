@@ -1,14 +1,22 @@
 import { useState, useRef, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { Link, useSearchParams } from "react-router-dom";
 import {
   Play, Trash2, XCircle, Plus, ChevronDown, ChevronUp, RefreshCw,
   Clock, CheckCircle, AlertCircle, Loader2, ExternalLink, Copy,
+  RotateCcw, History,
 } from "lucide-react";
 import { api } from "@/api/client";
 import type { JobDetail, QueuedJob } from "@/api/types";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { cn } from "@/lib/cn";
+
+// Status values that mean "this job ended without producing a usable run" —
+// the eligibility set for the Restart button on the Active & History table.
+// "ok" is excluded by design: restart-from-success would silently re-spend
+// hours of compute to produce a near-identical run.
+const RESTARTABLE_STATUSES = new Set(["failed", "cancelled", "crashed"]);
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -438,6 +446,20 @@ function NewJobForm({ onClose, onQueued }: { onClose: () => void; onQueued: () =
                         <input type="number" min={0} max={5} value={cfg.holdout_years as number}
                           onChange={e => set("holdout_years", parseInt(e.target.value))} className={inp} />
                       </Field>
+                      <Field label="Rebalance every (days)">
+                        <input type="number" min={1} placeholder="max(horizons)"
+                          value={(cfg.rebalance_every as number | null) ?? ""}
+                          onChange={e => set("rebalance_every", e.target.value === "" ? null : parseInt(e.target.value))}
+                          className={inp} />
+                        <p className="mt-0.5 text-xs text-muted-foreground">null=max(horizons). 5=weekly, 21=monthly</p>
+                      </Field>
+                      <Field label="Weight smoothing α">
+                        <input type="number" step={0.05} min={0} max={0.95}
+                          value={(cfg.weight_smoothing_alpha as number) ?? 0}
+                          onChange={e => set("weight_smoothing_alpha", parseFloat(e.target.value))}
+                          className={inp} />
+                        <p className="mt-0.5 text-xs text-muted-foreground">0=off, 0.3=blend 30% new signal/day</p>
+                      </Field>
                     </div>
                     <Checkbox label="Beta-neutralise vs SPY" checked={!!(cfg.beta_neutralise)} onChange={v => set("beta_neutralise", v)}
                       note="Recommended: eliminates market-beta drag on short book in bull markets" />
@@ -641,7 +663,20 @@ function JobDetailPanel({ jobId, onClose, onCancel }: { jobId: string; onClose: 
 
 export function Jobs() {
   const qc = useQueryClient();
-  const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
+  const [params, setParams] = useSearchParams();
+  // Deep-link support: /jobs?job=<id> auto-opens that job's detail panel.
+  // We mirror the URL into selectedJobId so existing click-to-toggle code
+  // keeps working without rewriting it.
+  const deepLinkedJob = params.get("job");
+  const [selectedJobId, setSelectedJobId] = useState<string | null>(deepLinkedJob);
+  useEffect(() => {
+    if (deepLinkedJob && deepLinkedJob !== selectedJobId) {
+      setSelectedJobId(deepLinkedJob);
+    }
+    // intentionally only react to URL changes, not local state toggles
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [deepLinkedJob]);
+
   const [showNewJobForm, setShowNewJobForm] = useState(false);
   const [pwAction, setPwAction] = useState<
     | { type: "cancel"; jobId: string }
@@ -651,6 +686,27 @@ export function Jobs() {
   >(null);
   const [pwError, setPwError] = useState<string | null>(null);
   const [pwLoading, setPwLoading] = useState(false);
+
+  // Restart UX: clone a terminal job's config into the queue, then immediately
+  // open the password modal targeted at the new queue entry so the user can
+  // launch with a single confirmation. We keep restart state simple — it just
+  // chains queue → setPwAction({launch, queueId}) — so it shares the existing
+  // launch/cancel modal plumbing.
+  const [restartError, setRestartError] = useState<string | null>(null);
+  const [restartingJobId, setRestartingJobId] = useState<string | null>(null);
+  const restartMut = useMutation({
+    mutationFn: (job: JobDetail) => api.queueJob(job.config),
+    onMutate: (job) => setRestartingJobId(job.job_id),
+    onSuccess: (qj) => {
+      qc.invalidateQueries({ queryKey: ["queued"] });
+      // Open the launch modal targeting the just-created queue entry so the
+      // user can confirm with their password in one step.
+      setPwError(null);
+      setPwAction({ type: "launch", queueId: qj.id });
+    },
+    onError: (e: Error) => setRestartError(e.message),
+    onSettled: () => setRestartingJobId(null),
+  });
 
   const hasActive = (jobs: JobDetail[]) => jobs.some(j => ["running","queued","cancelling"].includes(j.status));
 
@@ -701,6 +757,13 @@ export function Jobs() {
         <Button onClick={() => setShowNewJobForm(true)}><Plus className="h-4 w-4" /> New Job</Button>
       </div>
 
+      {restartError && (
+        <div className="rounded-lg border border-red-300 bg-red-50 p-3 text-sm text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300">
+          <strong>Restart failed:</strong> {restartError}{" "}
+          <button onClick={() => setRestartError(null)} className="ml-2 underline">dismiss</button>
+        </div>
+      )}
+
       {/* Active & History */}
       <Card>
         <CardHeader>
@@ -725,16 +788,27 @@ export function Jobs() {
                     <th className="px-4 py-2">Tickers</th>
                     <th className="px-4 py-2">Started</th>
                     <th className="px-4 py-2">Runtime</th>
-                    <th className="px-4 py-2">Run ID</th>
+                    <th className="px-4 py-2">Run</th>
+                    <th className="px-4 py-2 text-right">Actions</th>
                   </tr>
                 </thead>
                 <tbody>
                   {jobs.map(j => {
                     const isSelected = selectedJobId === j.job_id;
                     const isActive = ["running","queued","cancelling"].includes(j.status);
+                    const canRestart = RESTARTABLE_STATUSES.has(j.status) && j.config && Object.keys(j.config).length > 0;
                     return (
                       <tr key={j.job_id}
-                        onClick={() => setSelectedJobId(isSelected ? null : j.job_id)}
+                        onClick={() => {
+                          const next = isSelected ? null : j.job_id;
+                          setSelectedJobId(next);
+                          // Keep URL in sync so the panel state is shareable.
+                          setParams((prev) => {
+                            const p = new URLSearchParams(prev);
+                            if (next) p.set("job", next); else p.delete("job");
+                            return p;
+                          }, { replace: true });
+                        }}
                         className={cn("cursor-pointer border-b border-border/50 transition-colors hover:bg-accent/50", isSelected && "bg-accent")}>
                         <td className="px-4 py-2">
                           <JobIdCell jobId={j.job_id} onClick={() => setSelectedJobId(isSelected ? null : j.job_id)} />
@@ -744,7 +818,44 @@ export function Jobs() {
                         <td className="px-4 py-2">{String(j.config.n_tickers ?? "all")}</td>
                         <td className="px-4 py-2 text-xs">{isActive ? fmtElapsed(j.started_at) + " ago" : fmtTs(j.started_at)}</td>
                         <td className="px-4 py-2 text-xs">{fmtDuration(j.elapsed_s)}</td>
-                        <td className="px-4 py-2 text-xs text-muted-foreground">{j.run_id ?? "—"}</td>
+                        <td className="px-4 py-2 text-xs">
+                          {j.run_id != null ? (
+                            <Link
+                              to={`/runs?expanded=${j.run_id}`}
+                              onClick={(e) => e.stopPropagation()}
+                              className="inline-flex items-center gap-1 text-primary hover:underline"
+                              title="Open this run in the Runs history page"
+                            >
+                              <History className="h-3 w-3" /> #{j.run_id}
+                            </Link>
+                          ) : (
+                            <span className="text-muted-foreground">—</span>
+                          )}
+                        </td>
+                        <td className="px-4 py-2">
+                          <div className="flex items-center justify-end gap-1">
+                            {canRestart && (
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                disabled={restartingJobId === j.job_id || restartMut.isPending}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setRestartError(null);
+                                  restartMut.mutate(j);
+                                }}
+                                title="Re-queue this job with the same parameters"
+                              >
+                                {restartingJobId === j.job_id ? (
+                                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                ) : (
+                                  <RotateCcw className="h-3.5 w-3.5" />
+                                )}
+                                Restart
+                              </Button>
+                            )}
+                          </div>
+                        </td>
                       </tr>
                     );
                   })}
@@ -754,22 +865,34 @@ export function Jobs() {
           )}
           {selectedJobId && (
             <div className="px-4 pb-4">
-              <JobDetailPanel jobId={selectedJobId} onClose={() => setSelectedJobId(null)}
-                onCancel={id => { setPwError(null); setPwAction({ type: "cancel", jobId: id }); }} />
+              <JobDetailPanel
+                jobId={selectedJobId}
+                onClose={() => {
+                  setSelectedJobId(null);
+                  setParams((prev) => {
+                    const p = new URLSearchParams(prev);
+                    p.delete("job");
+                    return p;
+                  }, { replace: true });
+                }}
+                onCancel={id => { setPwError(null); setPwAction({ type: "cancel", jobId: id }); }}
+              />
             </div>
           )}
         </CardContent>
       </Card>
 
-      {/* Queued jobs */}
+      {/* Queue. Includes pending entries (with Launch/Delete actions) AND
+          launched-history entries (status='launched', read-only, with a
+          link to the live job row). The 5-cap only counts pending. */}
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center justify-between text-base">
             <span>
-              Pending (awaiting launch)
+              Queue
               {queued.filter(j => j.status === "pending").length > 0 && (
                 <span className="ml-2 rounded-full bg-yellow-100 px-2 py-0.5 text-xs text-yellow-800 dark:bg-yellow-900/40 dark:text-yellow-300">
-                  {queued.filter(j => j.status === "pending").length} / 5
+                  {queued.filter(j => j.status === "pending").length} / 5 pending
                 </span>
               )}
             </span>
@@ -790,7 +913,8 @@ export function Jobs() {
                     <th className="px-4 py-2">Status</th>
                     <th className="px-4 py-2">Summary</th>
                     <th className="px-4 py-2">Created</th>
-                    <th className="px-4 py-2">Actions</th>
+                    <th className="px-4 py-2">Job</th>
+                    <th className="px-4 py-2 text-right">Actions</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -803,9 +927,30 @@ export function Jobs() {
                         {(q.config.horizons as number[] | null)?.length ? ` · h=${(q.config.horizons as number[]).join(",")}` : ""}
                       </td>
                       <td className="px-4 py-2 text-xs">{fmtTs(q.created_at)}</td>
+                      <td className="px-4 py-2 text-xs">
+                        {q.job_id ? (
+                          <button
+                            onClick={() => {
+                              setSelectedJobId(q.job_id);
+                              setParams((prev) => {
+                                const p = new URLSearchParams(prev);
+                                p.set("job", q.job_id as string);
+                                return p;
+                              }, { replace: true });
+                            }}
+                            className="inline-flex items-center gap-1 font-mono text-primary hover:underline"
+                            title="Jump to the live job"
+                          >
+                            <ExternalLink className="h-3 w-3" />
+                            {q.job_id.slice(0, 8)}…
+                          </button>
+                        ) : (
+                          <span className="text-muted-foreground">—</span>
+                        )}
+                      </td>
                       <td className="px-4 py-2">
-                        {q.status === "pending" && (
-                          <div className="flex gap-1">
+                        {q.status === "pending" ? (
+                          <div className="flex items-center justify-end gap-1">
                             <Button variant="default" size="sm" onClick={() => { setPwError(null); setPwAction({ type: "launch", queueId: q.id }); }}>
                               <Play className="h-3 w-3" /> Launch
                             </Button>
@@ -813,6 +958,8 @@ export function Jobs() {
                               <Trash2 className="h-3 w-3" />
                             </Button>
                           </div>
+                        ) : (
+                          <div className="text-right text-xs text-muted-foreground">—</div>
                         )}
                       </td>
                     </tr>

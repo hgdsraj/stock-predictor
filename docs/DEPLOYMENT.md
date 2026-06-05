@@ -220,6 +220,54 @@ curl -X POST \
 curl http://localhost:8000/jobs/<uuid>
 ```
 
+#### Phase 13 BEST honest config — single curl
+
+This is the documented best-known config (HOLDOUT Sharpe +0.173, CI
+[-0.32, +0.58], DD -8.2%). Designed for an 8 GB / 8 vCPU box; peak
+RSS ~1 GB, runtime ~3-7 min (first cold-cache run includes a ~30 sec
+SEC EDGAR submissions fetch + ~4 min EDGAR per-quarter form-index
+fetch if those caches don't exist yet).
+
+```bash
+curl -X POST \
+     -H "X-API-Key: $STOCKPRED_API_KEY" \
+     -H "Content-Type: application/json" \
+     --max-time 1800 \
+     -d '{
+       "phase": 5,
+       "start_date": "2014-01-01",
+       "n_tickers": 150,
+       "universe_sampling": "current",
+       "horizons": [5],
+       "model": "gbm",
+       "use_sector_features": false,
+       "use_tier2_features": false,
+       "use_regime_features": false,
+       "beta_neutralise": false,
+       "bootstrap_method": "block",
+       "holdout_years": 2,
+       "position_sizing": "hrp",
+       "k_per_side_pct": 0.15,
+       "sector_cap_gross": 0.30,
+       "min_trade_threshold": 0.005,
+       "ensemble_weighting": "equal",
+       "bootstrap_n": 500,
+       "use_meta_labelling": true,
+       "meta_threshold": 0.55,
+       "ranks_only": true,
+       "meta_mode": "binary",
+       "use_edgar_item_features": true
+     }' \
+     http://localhost:8000/jobs/refresh
+```
+
+Notes:
+- **Do NOT add `"use_edgar_features": true`** (Phase 12 raw 8-K counts
+  hurt the strategy: Sharpe -0.158 → -0.376).
+- Set env `EDGAR_USER_AGENT="Your Name your-email@example.com"` on the
+  server so SEC has someone to contact.
+- Returns `409` if a pipeline run is already in flight.
+
 #### Full body reference
 
 All fields are optional. Unset fields use the pipeline defaults shown below.

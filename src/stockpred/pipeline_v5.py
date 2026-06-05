@@ -204,6 +204,36 @@ class PipelineV5Config:
     # / User-Agent rules apply.
     use_edgar_item_features: bool = False
 
+    # Phase 14: GDELT GKG daily tone + mention features. Reads ONLY
+    # from per-day parquet caches (bulk fetch done overnight by
+    # `scripts/phase14_gdelt_bulk_fetch.py`). Columns prefixed `gdelt_`
+    # so they survive ranks_only via the shared `gdelt` prefix.
+    use_gdelt_features: bool = False
+
+    # Phase 19: per-ticker Bayesian shrinkage of ensemble score by
+    # historical sign-precision. alpha=0 disables (raw scores pass
+    # through). alpha=1.0 is full shrinkage. Tickers with worse-than-
+    # random sign-precision are dropped entirely (factor = 0).
+    bayesian_shrinkage_alpha: float = 0.0
+    bayesian_shrinkage_min_obs: int = 30
+
+    # Turnover control
+    # weight_smoothing_alpha: EMA blend of old→new weights before the backtest.
+    #   0.0 = no smoothing (full reconstitution each signal day — default, matches
+    #         prior behaviour).
+    #   0.3 = 30 % new signal, 70 % continuation. Cuts noise-trades significantly.
+    #   Smoothing is applied BEFORE cadence enforcement so each rebalance date
+    #   samples a gradually-adjusted weight rather than a hard step.
+    weight_smoothing_alpha: float = 0.0
+
+    # rebalance_every: explicit cadence override in trading days.
+    #   None  = use max(horizons) — rebalance at the slowest signal's cadence.
+    #   1     = daily (old default, highest turnover).
+    #   5     = weekly, 21 = monthly, etc.
+    # Setting this higher than max(horizons) trades signal freshness for lower
+    # turnover; setting it to 1 reproduces the old high-turnover behaviour.
+    rebalance_every: int | None = None
+
     # Stress
     bootstrap_n: int = 500
 
@@ -792,19 +822,61 @@ def run_pipeline_v5(cfg: PipelineV5Config | None = None) -> dict:
         ) as e:
             log.warning("EDGAR item-code features failed (%s); continuing.", e)
 
+    # Phase 14: GDELT GKG daily tone + mention features. Reads ONLY
+    # from per-day parquet caches; operator runs `scripts/phase14_
+    # gdelt_bulk_fetch.py` overnight to populate them. If caches are
+    # missing the join silently fills zeros + emits a coverage warning.
+    if cfg.use_gdelt_features:
+        log.info("Building GDELT GKG tone+mention features...")
+        try:
+            from stockpred.data import edgar as edgar_mod
+            from stockpred.data import gdelt as gdelt_mod
+
+            ticker_to_cik = edgar_mod.fetch_ticker_to_cik(refresh=cfg.refresh_data)
+            gdelt_panel = gdelt_mod.build_gdelt_features(
+                tickers=list(close.columns),
+                trading_days=close.index,
+                start=cfg.start_date,
+                end=cfg.end_date,
+                refresh=cfg.refresh_data,
+                ticker_to_cik=ticker_to_cik,
+            )
+            if not gdelt_panel.empty:
+                feats = feats.join(gdelt_panel, how="left")
+                gdelt_cols = [c for c in feats.columns if c.startswith("gdelt_")]
+                for c in gdelt_cols:
+                    feats[c] = feats[c].fillna(0)
+                log.info("After GDELT: %s rows x %s cols", *feats.shape)
+                del gdelt_panel
+                import gc as _gc
+
+                _gc.collect()
+            else:
+                log.warning(
+                    "GDELT features: empty panel returned. Did you run "
+                    "scripts/phase14_gdelt_bulk_fetch.py to populate the cache?"
+                )
+        except (
+            _requests.RequestException,
+            OSError,
+            ValueError,
+            RuntimeError,
+        ) as e:
+            log.warning("GDELT features failed (%s); continuing without.", e)
+
     # Phase 8: optionally drop the raw (non-rank) numeric columns. Per-feature
     # audit on the medium universe showed raw versions degrade ~100% under
     # the hard-cutoff audit while their _rank versions degrade only ~15-50%;
     # keeping only ranks is a defensible noise-reduction move.
     if cfg.ranks_only:
         # Keep: anything ending in _rank, anything prefixed sec_ (sector
-        # dummies), anything prefixed reg_ (regime broadcasts), anything
-        # prefixed edgar (Phase 12 has_8k/count_8k OR Phase 13
-        # edgaritem_). Drop the rest.
+        # dummies), reg_ (regime broadcasts), edgar (Phase 12 has_8k /
+        # count_8k OR Phase 13 edgaritem_), gdelt_ (Phase 14 GDELT).
+        # Drop the rest.
         keep_cols = [
             c
             for c in feats.columns
-            if c.endswith("_rank") or c.startswith(("sec_", "reg_", "edgar"))
+            if c.endswith("_rank") or c.startswith(("sec_", "reg_", "edgar", "gdelt_"))
         ]
         if keep_cols:
             log.info(
@@ -951,6 +1023,70 @@ def run_pipeline_v5(cfg: PipelineV5Config | None = None) -> dict:
 
         dev_ensemble_score = ensemble_predictions(per_horizon_preds)
 
+    # ---------------- Phase 19: Bayesian per-ticker shrinkage ----------
+    # Drop tickers with worse-than-random historical sign-precision;
+    # downweight tickers proportional to their (precision - 0.5).
+    #
+    # REVIEWER C1 FIX (2026-06-05): we ONLY fit the shrinkage factors here
+    # (to reuse on holdout) and explicitly DO NOT apply them to the dev
+    # ensemble score. Applying shrinkage on the dev window where the
+    # factors were fit is self-reflexively leaky -- it would silently
+    # inflate the dev backtest Sharpe by re-using the same realised
+    # returns that drove the per-ticker precision. The dev backtest must
+    # remain a clean OOS sanity check; only the HOLDOUT backtest carries
+    # the shrunken weights, where the factors are honest OOS.
+    #
+    # Also REVIEWER H1: use a multi-horizon AVERAGE realised return for
+    # the precision computation (not just the shortest horizon), so
+    # tickers active in some horizons but not the shortest don't get
+    # silently dropped from holdout selection. We average per-horizon
+    # vol-scaled returns reindexed onto the ensemble score's index.
+    _shrink_factors_for_holdout = None
+    if cfg.bayesian_shrinkage_alpha > 0.0:
+        try:
+            from stockpred.portfolio.bayesian_shrinkage import (
+                compute_per_ticker_sign_precision,
+                compute_shrinkage_factors,
+            )
+
+            dev_dates_sorted = (
+                dev_ensemble_score.index.get_level_values("date").unique().sort_values()
+            )
+            n_split = max(1, int(0.8 * len(dev_dates_sorted)))
+            fit_dates = dev_dates_sorted[:n_split]
+            fit_mask = dev_ensemble_score.index.get_level_values("date").isin(fit_dates)
+            # H1: multi-horizon-averaged realised return aligned to the
+            # ensemble score's index. Filling missing-horizon rows with
+            # NaN (dropped by sign-precision) is the honest behaviour.
+            realised_frame = pd.concat(
+                {
+                    h: per_horizon_returns[h].reindex(dev_ensemble_score.index)
+                    for h in per_horizon_returns
+                },
+                axis=1,
+            )
+            fit_realised_avg = realised_frame.mean(axis=1, skipna=True)
+            sp = compute_per_ticker_sign_precision(
+                dev_ensemble_score[fit_mask],
+                fit_realised_avg[fit_mask],
+                min_obs=cfg.bayesian_shrinkage_min_obs,
+            )
+            sf = compute_shrinkage_factors(sp, alpha=cfg.bayesian_shrinkage_alpha)
+            _shrink_factors_for_holdout = sf  # reuse on holdout below
+            log.info(
+                "Phase 19 shrinkage (alpha=%.2f) factors fit: n_tickers=%d, "
+                "n_active=%d, n_dropped=%d. NOT applied to dev (leakage-safe); "
+                "will be applied to holdout only.",
+                cfg.bayesian_shrinkage_alpha,
+                len(sf),
+                int((sf > 0).sum()),
+                int((sf == 0).sum()),
+            )
+            # Free intermediate
+            del realised_frame, fit_realised_avg
+        except Exception as e:  # noqa: BLE001
+            log.warning("Phase 19 shrinkage failed (%s); continuing with raw scores.", e)
+
     # ---------------- Phase 8: optional meta-labelling gate -----------
     # Train a binary GBM predicting P(primary signal is correct) on the
     # first 80% of dev, evaluate on last 20% + use that fit to gate the
@@ -1001,9 +1137,22 @@ def run_pipeline_v5(cfg: PipelineV5Config | None = None) -> dict:
     )
     if dev_weights.empty:
         raise RuntimeError("Dev portfolio is empty.")
+
+    # Cadence: rebalance at the slowest signal's horizon by default so a
+    # multi-horizon ensemble (e.g. h=5 + h=21) doesn't degrade to daily
+    # rebalancing. Using min() was the original bug that caused 240×/yr turnover
+    # when any short horizon (h=1 or h=5) was included in the ensemble.
+    bt_horizon = cfg.rebalance_every if cfg.rebalance_every is not None else max(per_horizon_preds.keys())
+
+    # Optional EMA weight smoothing: blend old positions with new signal to
+    # further reduce noise-trades between rebalance dates.
+    if cfg.weight_smoothing_alpha > 0:
+        dev_weights = dev_weights.ewm(alpha=cfg.weight_smoothing_alpha, adjust=False).mean()
+        log.info("Weight smoothing applied (alpha=%.2f)", cfg.weight_smoothing_alpha)
+
     bt_cfg = BacktestConfig()
-    bt_horizon = min(per_horizon_preds.keys())
     dev_bt = run_backtest(dev_weights, close, cfg=bt_cfg, horizon=bt_horizon, trade_lag=1)
+    log.info("Rebalance cadence: every %d trading days", bt_horizon)
     dev_metrics = tearsheet_metrics(dev_bt.returns)
     log.info("DEV backtest metrics: %s", dev_metrics)
 
@@ -1088,6 +1237,22 @@ def run_pipeline_v5(cfg: PipelineV5Config | None = None) -> dict:
 
                 hold_ensemble_pre = ensemble_predictions(hold_preds)
 
+            # Phase 19: apply shrinkage factors fit on DEV to the holdout
+            # ensemble. Leakage-safe: factors were computed from the dev
+            # window (first 80% of dev) and never see holdout.
+            if cfg.bayesian_shrinkage_alpha > 0.0 and _shrink_factors_for_holdout is not None:
+                try:
+                    from stockpred.portfolio.bayesian_shrinkage import (
+                        apply_shrinkage_to_panel,
+                    )
+
+                    hold_ensemble_pre = apply_shrinkage_to_panel(
+                        hold_ensemble_pre, _shrink_factors_for_holdout
+                    )
+                    log.info("Phase 19: applied dev-fit shrinkage factors to holdout.")
+                except Exception as e:  # noqa: BLE001
+                    log.warning("Phase 19 holdout shrinkage failed (%s); using raw scores.", e)
+
             from stockpred.models.meta import (
                 build_meta_dataset,
                 fit_meta,
@@ -1169,6 +1334,8 @@ def run_pipeline_v5(cfg: PipelineV5Config | None = None) -> dict:
             asset_betas=asset_betas,
             precomputed_score=hold_gated_score,
         )
+        if cfg.weight_smoothing_alpha > 0 and not hold_weights.empty:
+            hold_weights = hold_weights.ewm(alpha=cfg.weight_smoothing_alpha, adjust=False).mean()
         if not hold_weights.empty:
             hold_bt = run_backtest(hold_weights, close, cfg=bt_cfg, horizon=bt_horizon, trade_lag=1)
             hold_metrics = tearsheet_metrics(hold_bt.returns)

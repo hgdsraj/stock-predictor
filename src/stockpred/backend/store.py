@@ -30,6 +30,7 @@ from stockpred.backend.models import (
 
 log = logging.getLogger(__name__)
 
+
 # SQLite hard-limits bound variables to 999 per statement.
 # Use this helper to split any bulk payload into safe chunks.
 def _chunks(payload: list, n_cols: int):
@@ -83,6 +84,86 @@ def latest_run(s: Session, *, status: str | None = "ok") -> Run | None:
 
 def list_runs(s: Session, *, limit: int = 20) -> list[Run]:
     return list(s.execute(select(Run).order_by(desc(Run.started_at)).limit(limit)).scalars().all())
+
+
+def get_run(s: Session, run_id: int) -> Run | None:
+    return s.get(Run, run_id)
+
+
+# --------------------------------------------------------------------- #
+# Active-run resolution
+# --------------------------------------------------------------------- #
+#
+# The "active run" is the data source for all read endpoints that don't
+# specify ?run_id=. Resolution order:
+#   1. If a run_id is explicitly requested by the caller, honour it (and
+#      require it to be a successful ok run — fail loudly otherwise).
+#   2. Else if exactly one row has is_active=True AND status='ok', use it.
+#   3. Else fall back to latest_run(status='ok')  (legacy behaviour).
+#
+# Activation and deactivation enforce the single-active invariant; old code
+# paths that never call activate_run() get the legacy "latest ok" behaviour
+# for free.
+
+
+def active_run(s: Session) -> Run | None:
+    """The currently-pinned run, if any, restricted to ok runs."""
+    return s.execute(
+        select(Run).where(Run.is_active.is_(True), Run.status == "ok").limit(1)
+    ).scalar_one_or_none()
+
+
+def resolve_run(s: Session, run_id: int | None = None) -> Run | None:
+    """Resolve which Run the API should serve data from.
+
+    * `run_id` explicit         → that exact run (any status — caller decides
+                                  whether to 404 on bad status).
+    * `run_id` None, active set → the active run.
+    * `run_id` None, no active  → latest ok run.
+    """
+    if run_id is not None:
+        return s.get(Run, run_id)
+    pinned = active_run(s)
+    if pinned is not None:
+        return pinned
+    return latest_run(s, status="ok")
+
+
+def activate_run(s: Session, run_id: int) -> Run | None:
+    """Mark `run_id` as the active run; deactivate all others.
+
+    Returns the activated Run, or None if no such run exists. Refuses to
+    activate a run whose status is not 'ok' (raises ValueError) because
+    pointing the live UI at a failed run is almost always a mistake.
+    """
+    from sqlalchemy import update
+
+    run = s.get(Run, run_id)
+    if run is None:
+        return None
+    if run.status != "ok":
+        raise ValueError(
+            f"refusing to activate run {run_id} (status={run.status!r}); "
+            "only ok runs can be the active data source"
+        )
+    # Single-flip transaction: clear all, then set the one we want. Cheap on
+    # SQLite (the runs table is bounded by cleanup_old_runs ≤ 50).
+    s.execute(update(Run).values(is_active=False).where(Run.is_active.is_(True)))
+    run.is_active = True
+    s.add(run)
+    s.flush()
+    return run
+
+
+def deactivate_all_runs(s: Session) -> int:
+    """Clear is_active on every run (revert to "latest ok" behaviour).
+
+    Returns the count of rows updated.
+    """
+    from sqlalchemy import update
+
+    res = s.execute(update(Run).values(is_active=False).where(Run.is_active.is_(True)))
+    return res.rowcount or 0
 
 
 # --------------------------------------------------------------------- #
@@ -387,14 +468,13 @@ _MAX_PENDING_JOBS = 5
 
 def count_pending_queued_jobs(s: Session) -> int:
     from sqlalchemy import func
+
     return s.execute(
         select(func.count()).select_from(QueuedJob).where(QueuedJob.status == "pending")
     ).scalar_one()
 
 
-def create_queued_job(
-    s: Session, config: dict, *, label: str | None = None
-) -> QueuedJob:
+def create_queued_job(s: Session, config: dict, *, label: str | None = None) -> QueuedJob:
     """Create a pending queued job. Raises ValueError if the pending cap is hit."""
     import uuid as _uuid
 
@@ -413,9 +493,7 @@ def create_queued_job(
 
 
 def list_queued_jobs(s: Session) -> list[QueuedJob]:
-    return list(
-        s.execute(select(QueuedJob).order_by(desc(QueuedJob.created_at))).scalars().all()
-    )
+    return list(s.execute(select(QueuedJob).order_by(desc(QueuedJob.created_at))).scalars().all())
 
 
 def get_queued_job(s: Session, queue_id: str) -> QueuedJob | None:
@@ -492,9 +570,7 @@ def get_job_record(s: Session, job_id: str) -> JobRecord | None:
 
 def list_job_records(s: Session, *, limit: int = 50) -> list[JobRecord]:
     return list(
-        s.execute(
-            select(JobRecord).order_by(desc(JobRecord.updated_at)).limit(limit)
-        )
+        s.execute(select(JobRecord).order_by(desc(JobRecord.updated_at)).limit(limit))
         .scalars()
         .all()
     )

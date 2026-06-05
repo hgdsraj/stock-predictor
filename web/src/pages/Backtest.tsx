@@ -1,11 +1,14 @@
 import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { Link } from "react-router-dom";
+import { Pin } from "lucide-react";
 import { api } from "@/api/client";
 import { Card, CardContent, CardHeader, CardTitle, CardSubtitle } from "@/components/ui/Card";
 import { ZoomableChart, ChartSeries } from "@/components/ui/ZoomableChart";
 import { InfoTooltip, LabelWithInfo } from "@/components/ui/InfoTooltip";
 import { GlossaryKey } from "@/lib/glossary";
 import { formatPercent, formatPercentSigned, formatNumber, signClass } from "@/lib/format";
+import { useActiveRun } from "@/hooks/useActiveRun";
 import { cn } from "@/lib/cn";
 
 // ─── Rolling window computation ──────────────────────────────────────────────
@@ -27,10 +30,13 @@ function rollingStd(vals: number[]): number {
 
 export function Backtest() {
   const [costBps, setCostBps] = useState(0);
+  const { runId, isPinned, queryKeyPart, setRunId } = useActiveRun();
 
+  // Key includes the active run so switching runs in the picker triggers a
+  // fresh fetch instead of returning the wrong-cached payload.
   const { data, isLoading } = useQuery({
-    queryKey: ["bt"],
-    queryFn: () => api.backtestSummary().catch(() => null),
+    queryKey: ["bt", queryKeyPart],
+    queryFn: () => api.backtestSummary(runId).catch(() => null),
   });
 
   const hasSPY = useMemo(
@@ -137,11 +143,41 @@ export function Backtest() {
 
   return (
     <div className="space-y-6">
+      {isPinned && (
+        <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-primary/30 bg-primary/5 px-3 py-2 text-sm">
+          <span className="flex items-center gap-2">
+            <Pin className="h-3.5 w-3.5 text-primary" />
+            Viewing pinned run{" "}
+            <Link to={`/runs?expanded=${data.run.id}`} className="font-mono font-semibold text-primary underline-offset-2 hover:underline">
+              #{data.run.id}
+            </Link>
+            .
+          </span>
+          <button
+            onClick={() => setRunId(null)}
+            className="rounded-md border border-primary/30 px-2 py-0.5 text-xs text-primary hover:bg-primary/10"
+          >
+            Clear pin
+          </button>
+        </div>
+      )}
       <div className="flex flex-wrap items-end justify-between gap-4">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Backtest #{data.run.id}</h1>
           <p className="text-sm text-muted-foreground">
             {data.run.status} · {data.run.tickers_count} tickers · {data.run.note}
+            {data.run.job_id && (
+              <>
+                {" · "}
+                <Link
+                  to={`/jobs?job=${data.run.job_id}`}
+                  className="hover:underline"
+                  title="Triggering job"
+                >
+                  job {data.run.job_id.slice(0, 8)}…
+                </Link>
+              </>
+            )}
           </p>
         </div>
         {/* Cost-adjustment slider */}

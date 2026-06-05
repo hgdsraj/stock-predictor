@@ -89,6 +89,16 @@ class EquityPoint(BaseModel):
 
 
 class RunSummary(BaseModel):
+    """Summary of a single pipeline run. Returned by /runs and embedded in
+    /backtest/summary.
+
+    `config` is the full PipelineConfig snapshot (was previously only on the
+    job record); the Runs history UI surfaces phase / model / feature flags
+    out of it without a second fetch. `job_id` is the originating job's UUID
+    if known — looked up from JobRecord.run_id at serialise time.
+    `is_active` marks the server-side default data source.
+    """
+
     id: int
     started_at: dt.datetime
     completed_at: dt.datetime | None
@@ -97,11 +107,21 @@ class RunSummary(BaseModel):
     per_horizon_diagnostics: dict
     tickers_count: int
     note: str | None
+    config: dict = {}
+    job_id: str | None = None
+    is_active: bool = False
 
 
 class BacktestSummary(BaseModel):
     run: RunSummary
     equity_curve: list[EquityPoint]
+
+
+class ActivateRunResponse(BaseModel):
+    """Returned by POST /runs/{id}/activate and POST /runs/deactivate."""
+
+    active_run_id: int | None
+    message: str
 
 
 class CVParams(BaseModel):
@@ -139,7 +159,9 @@ class RefreshRequest(BaseModel):
         default="current",
         description="How tickers are sampled from S&P 500 membership history.",
     )
-    refresh_data: bool = Field(default=False, description="Force-refetch cached price/fundamental data")
+    refresh_data: bool = Field(
+        default=False, description="Force-refetch cached price/fundamental data"
+    )
 
     # --- Horizons + model ---
     horizons: list[int] | None = Field(
@@ -150,8 +172,17 @@ class RefreshRequest(BaseModel):
             "(21d showed no signal in Phase 2 evaluation)."
         ),
     )
-    model: Literal["gbm", "logistic"] = Field(default="gbm")
-    use_sector_features: bool = Field(default=False)
+    model: Literal["gbm", "logistic", "fama_macbeth"] = Field(
+        default="gbm",
+        description=(
+            "Model class. 'gbm' (default) = LightGBM regressor on the "
+            "(vol-scaled) forward return. 'logistic' = sklearn LogReg on "
+            "the binary direction label. 'fama_macbeth' (Phase 17) = "
+            "per-date cross-sectional OLS, time-series-averaged factor "
+            "returns -- robust alternative to GBM for weak signals."
+        ),
+    )
+    use_sector_features: bool = Field(default=True)
 
     # --- CV ---
     cv: CVParams = Field(default_factory=CVParams)
@@ -187,7 +218,12 @@ class RefreshRequest(BaseModel):
     )
     position_sizing: Literal["vol_scaled", "top_k", "hrp"] = Field(
         default="vol_scaled",
-        description="[Phase 5] Portfolio construction method. hrp = Hierarchical Risk Parity (Phase 7).",
+        description=(
+            "[Phase 5] Portfolio construction method. "
+            "'hrp' (Phase 7) = Hierarchical Risk Parity per-cluster "
+            "inverse-variance allocation; was the best non-meta option on the "
+            "production sweep."
+        ),
     )
     k_per_side_pct: float = Field(
         default=0.15,
@@ -195,7 +231,9 @@ class RefreshRequest(BaseModel):
         le=1,
         description="[Phase 5] Fraction of universe selected per side (vol_scaled mode).",
     )
-    leverage_per_side: float = Field(default=1.0, gt=0, description="[Phase 5] Gross leverage per side.")
+    leverage_per_side: float = Field(
+        default=1.0, gt=0, description="[Phase 5] Gross leverage per side."
+    )
     sector_cap_gross: float | None = Field(
         default=0.30,
         description="[Phase 5] Max gross exposure per GICS sector; None = uncapped.",
@@ -211,68 +249,153 @@ class RefreshRequest(BaseModel):
         default=500, ge=1, description="[Phase 5] Number of bootstrap samples for stress test."
     )
 
-    # --- Phase 8: meta-labelling (López de Prado Ch. 3.6) ---
+    # --- Phase 8: meta-labelling + ranks-only -----------------------------
     use_meta_labelling: bool = Field(
         default=False,
-        description="[Phase 8] Train a secondary classifier to gate signals by P(primary score is correct).",
+        description=(
+            "[Phase 8] Train a binary meta-classifier per fold predicting "
+            "P(primary score has correct sign). Gates the primary score to "
+            "reduce turnover and improve precision."
+        ),
     )
     meta_threshold: float = Field(
-        default=0.55, ge=0, le=1,
-        description="[Phase 8] Min P(correct) required to pass the meta-gate.",
+        default=0.55,
+        ge=0.0,
+        le=1.0,
+        description="[Phase 8] Gate threshold for meta-labelling (binary mode).",
     )
+    ranks_only: bool = Field(
+        default=False,
+        description=(
+            "[Phase 8] Drop raw feature columns, keep only cross-sectional "
+            "rank columns (plus sec_/reg_/edgar_ prefixes). Per-feature audit "
+            "showed raw versions degrade ~100% under hard-cutoff vs ~15-50% "
+            "for the ranked versions."
+        ),
+    )
+
+    # --- Phase 9: confidence-weighted sizing + walk-forward meta-CV ------
     meta_mode: Literal["binary", "confidence"] = Field(
         default="binary",
-        description="[Phase 9] 'binary' = hard gate; 'confidence' = scale signal by P.",
+        description=(
+            "[Phase 9] 'binary' = hard meta-gate at meta_threshold; "
+            "'confidence' = scale signal by clip((P-floor)/(cap-floor), 0, 1). "
+            "Phase 10 sweep: floor 0.60 has the best point estimate; "
+            "DO NOT use the default 0.50 (reproducibly worse than binary)."
+        ),
     )
     meta_conf_floor: float = Field(
-        default=0.5, ge=0, le=1,
-        description="[Phase 9] Lower bound for confidence scaling (P below this → weight 0).",
+        default=0.60,
+        ge=0.0,
+        lt=1.0,
+        description=(
+            "[Phase 9] Lower bound for confidence-weighted sizing. "
+            "0.60 is the Phase 10 sweet spot; 0.50 was the Phase 9 default "
+            "that reproducibly hurt the strategy."
+        ),
     )
     meta_conf_cap: float = Field(
-        default=1.0, ge=0, le=1,
-        description="[Phase 9] Upper bound for confidence scaling (P above this → full weight).",
+        default=1.0,
+        gt=0.0,
+        le=1.0,
+        description="[Phase 9] Upper bound for confidence-weighted sizing.",
     )
     meta_walk_forward_folds: int = Field(
-        default=1, ge=1,
-        description="[Phase 9] CV folds for meta classifier. 1 = single-pass (faster); >1 = proper walk-forward.",
+        default=1,
+        ge=1,
+        description=(
+            "[Phase 9] K-fold expanding-window meta-classifier CV. "
+            "1 = single-pass Phase 8 behaviour."
+        ),
     )
     meta_per_sector: bool = Field(
         default=False,
-        description="[Phase 9] Train one meta classifier per GICS sector instead of globally.",
+        description=(
+            "[Phase 9] One meta classifier per sector (requires fundamentals "
+            "loaded; falls back to global meta if not)."
+        ),
     )
 
-    # --- Phase 8: triple-barrier labels ---
+    # --- Phase 7 triple-barrier labels -----------------------------------
     use_triple_barrier_labels: bool = Field(
         default=False,
-        description="[Phase 8] Use triple-barrier labels instead of forward returns as the regression target.",
+        description=(
+            "[Phase 7] Switch from simple forward-return label to López de "
+            "Prado triple-barrier signed return per horizon."
+        ),
     )
     tb_k_sigma: float = Field(
-        default=2.0, gt=0,
-        description="[Phase 8] Barrier width in trailing-volatility units.",
+        default=2.0,
+        gt=0,
+        description="[Phase 7/8] Triple-barrier width in trailing-volatility units.",
     )
 
-    # --- Phase 8: feature transformations ---
-    ranks_only: bool = Field(
-        default=False,
-        description="[Phase 8] Drop raw feature values; keep only cross-sectional rank columns + EDGAR/regime.",
+    # --- Turnover control ---------------------------------------------------
+    weight_smoothing_alpha: float = Field(
+        default=0.0, ge=0.0, le=1.0,
+        description="EMA blend factor: 0=no smoothing, 0.3=30% new signal per day. Cuts noise trades without discarding signal.",
+    )
+    rebalance_every: int | None = Field(
+        default=None, ge=1,
+        description="Rebalance cadence in trading days. None=max(horizons). 5=weekly, 21=monthly. Overrides the default.",
     )
 
-    # --- Phase 11: feature pruning ---
+    # --- Phase 11 feature pruning ----------------------------------------
     feature_exclude: list[str] = Field(
-        default=[],
-        description="[Phase 11] Feature names to exclude from training (e.g. low-IC features from audit).",
+        default_factory=list,
+        description=(
+            "[Phase 11] Explicit feature-name blocklist applied after ranks_only. "
+            "On the 150-name x 11yr universe, dropping these 5 was the best: "
+            "['adv_proxy_21', 'dist_low_252_rank', 'ret_252d_rank', 'kurt_63', "
+            "'dist_low_252']."
+        ),
     )
 
-    # --- Phase 12: SEC EDGAR 8-K event features ---
+    # --- Phase 12 EDGAR 8-K event flags + counts --------------------------
     use_edgar_features: bool = Field(
         default=False,
-        description="[Phase 12] Add SEC 8-K filing event counts (has_8k, count_5d/21d/63d) as features.",
+        description=(
+            "[Phase 12] Enable SEC EDGAR 8-K event features: has_8k + "
+            "rolling 5d/21d/63d counts. Free, no API key, respects SEC's 10 "
+            "req/sec + User-Agent rule (set EDGAR_USER_AGENT env var). "
+            "WARNING: Phase 12 production smoke showed this HURT the strategy "
+            "(Sharpe -0.16 -> -0.38). Prefer use_edgar_item_features (Phase 13)."
+        ),
     )
 
-    # --- Phase 13: SEC EDGAR 8-K per-item features ---
+    # --- Phase 13 EDGAR 8-K item codes -----------------------------------
     use_edgar_item_features: bool = Field(
         default=False,
-        description="[Phase 13] Add per-item-code 8-K features (CEO changes, earnings releases, etc.).",
+        description=(
+            "[Phase 13] Enable SEC EDGAR 8-K item-code features (earnings, "
+            "CEO change, M&A, guidance, going-concern). Best honest result "
+            "across all 13 phases: Sharpe +0.17 with CI [-0.32, +0.58] and "
+            "smallest holdout DD (-8.2%)."
+        ),
+    )
+
+    # --- Phase 14 GDELT GKG tone + mentions ------------------------------
+    use_gdelt_features: bool = Field(
+        default=False,
+        description=(
+            "[Phase 14] Enable GDELT GKG daily tone + mention features. "
+            "Reads ONLY from per-day parquet caches; operator must populate "
+            "them first via `scripts/phase14_gdelt_bulk_fetch.py` overnight. "
+            "If caches are missing, emits a coverage warning + fills zeros."
+        ),
+    )
+
+    # --- Phase 19 Bayesian per-ticker shrinkage --------------------------
+    bayesian_shrinkage_alpha: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "[Phase 19] Per-ticker shrinkage of ensemble score by historical "
+            "sign-precision. 0 = disabled, 1 = aggressive (drop noise "
+            "tickers, downweight uncertain ones). Computed on the first 80% "
+            "of the dev window only; leakage-safe."
+        ),
     )
 
 
@@ -416,3 +539,12 @@ class NewsHeadline(BaseModel):
     link: str | None
     type: str | None
     published_at: dt.datetime | None
+    # Phase 15 FinBERT sentiment (live-mode, DASHBOARD ONLY).
+    # `sentiment_label`: 'positive'|'neutral'|'negative'|'unavailable'.
+    # `sentiment_net` in [-1, +1] = positive_prob - negative_prob.
+    # All fields None when FinBERT isn't installed.
+    sentiment_label: str | None = None
+    sentiment_net: float | None = None
+    sentiment_positive: float | None = None
+    sentiment_neutral: float | None = None
+    sentiment_negative: float | None = None

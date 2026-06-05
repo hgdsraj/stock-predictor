@@ -3,12 +3,16 @@
 Routes:
   GET  /healthz                     — DB + scheduler health
   GET  /tickers                     — list all tickers with summary
-  GET  /tickers/{ticker}/details    — fundamentals + extended history
+  GET  /tickers/{ticker}/details    — fundamentals + extended history (?run_id= optional)
   GET  /tickers/{ticker}/news       — headlines
-  GET  /predictions/latest          — top-k long / bottom-k short
-  GET  /runs                        — recent runs (metadata)
-  GET  /runs/{run_id}/equity        — backtest equity curve
-  GET  /backtest/summary            — latest backtest tearsheet payload
+  GET  /predictions/latest          — top-k long / bottom-k short (?run_id= optional)
+  GET  /runs                        — recent runs (metadata + config + job_id + is_active)
+  GET  /runs/{run_id}               — single run summary
+  GET  /runs/{run_id}/equity        — backtest equity curve for that run
+  GET  /runs/{run_id}/backtest      — full BacktestSummary for arbitrary run
+  POST /runs/{run_id}/activate      — pin a run as the active data source (X-Password)
+  POST /runs/deactivate             — clear the active-run pin (X-Password)
+  GET  /backtest/summary            — backtest tearsheet (?run_id= optional; default = active/latest)
 
   POST /jobs/refresh                — trigger run (requires X-API-Key)
   GET  /jobs                        — list recent jobs (in-memory)
@@ -104,6 +108,7 @@ def _sanitize(value):
 class SafeJSONResponse(JSONResponse):
     def render(self, content) -> bytes:
         import json
+
         return json.dumps(
             _sanitize(content),
             allow_nan=False,
@@ -200,6 +205,56 @@ def get_db():
         yield s
 
 
+# ----- Run serialisation -------------------------------------------------
+
+
+def _job_id_for_run(s: Session, run_id: int) -> str | None:
+    """Reverse-lookup the JobRecord that owns this run, if any.
+
+    Cheap — JobRecord rows are bounded by retention and we only call this
+    when serialising a small number of RunSummary rows at a time.
+    """
+    from stockpred.backend.models import JobRecord
+
+    return s.execute(
+        select(JobRecord.job_id).where(JobRecord.run_id == run_id).limit(1)
+    ).scalar_one_or_none()
+
+
+def _run_to_summary(s: Session, run) -> "schemas.RunSummary":
+    """Build a RunSummary payload from an ORM Run, including config + job_id."""
+    summary = run.summary_json or {}
+    return schemas.RunSummary(
+        id=run.id,
+        started_at=run.started_at,
+        completed_at=run.completed_at,
+        status=run.status,
+        metrics=summary.get("metrics", {}),
+        per_horizon_diagnostics=summary.get("per_horizon_diagnostics", {}),
+        tickers_count=summary.get("tickers_count", 0),
+        note=run.note,
+        config=run.config_json or {},
+        job_id=_job_id_for_run(s, run.id),
+        # is_active may not exist on rows from very old DBs that predate the
+        # migration; getattr-with-default keeps the API forward-compatible.
+        is_active=bool(getattr(run, "is_active", False)),
+    )
+
+
+def _equity_to_payload(rows) -> list["schemas.EquityPoint"]:
+    return [
+        schemas.EquityPoint(
+            date=r.date,
+            daily_return=r.daily_return,
+            cumulative_return=r.cumulative_return,
+            drawdown=r.drawdown,
+            turnover=r.turnover,
+            benchmark_return=r.benchmark_return,
+        )
+        for r in rows
+    ]
+
+
 # ----- Pipeline config builder (shared by /refresh and /jobs/run) --------
 
 
@@ -248,22 +303,31 @@ def _build_pipeline_cfg(
             min_trade_threshold=body.min_trade_threshold,
             ensemble_weighting=body.ensemble_weighting,
             bootstrap_n=body.bootstrap_n,
-            # Phase 8-9
+            # Phase 8 meta-labelling + ranks-only
             use_meta_labelling=body.use_meta_labelling,
             meta_threshold=body.meta_threshold,
+            ranks_only=body.ranks_only,
+            # Phase 9 confidence-weighted sizing + walk-forward meta-CV
             meta_mode=body.meta_mode,
             meta_conf_floor=body.meta_conf_floor,
             meta_conf_cap=body.meta_conf_cap,
             meta_walk_forward_folds=body.meta_walk_forward_folds,
             meta_per_sector=body.meta_per_sector,
+            # Phase 7/8 triple-barrier
             use_triple_barrier_labels=body.use_triple_barrier_labels,
             tb_k_sigma=body.tb_k_sigma,
-            # Phase 8/11
-            ranks_only=body.ranks_only,
+            # Phase 11 feature pruning
             feature_exclude=tuple(body.feature_exclude),
-            # Phase 12-13
+            # Phase 12 / 13 EDGAR
             use_edgar_features=body.use_edgar_features,
             use_edgar_item_features=body.use_edgar_item_features,
+            # Phase 14 GDELT
+            use_gdelt_features=body.use_gdelt_features,
+            # Phase 19 Bayesian shrinkage
+            bayesian_shrinkage_alpha=body.bayesian_shrinkage_alpha,
+            # Turnover control
+            weight_smoothing_alpha=body.weight_smoothing_alpha,
+            rebalance_every=body.rebalance_every,
         )
     else:
         horizons = tuple(body.horizons) if body.horizons is not None else (1, 5, 21)
@@ -285,11 +349,13 @@ def _build_pipeline_cfg(
 
 def _launch_pipeline(pipeline_cfg, job_id: str) -> None:
     """Start a background thread that acquires _refresh_lock and runs the pipeline."""
+
     def _run():
         with _refresh_lock:
             jobs_mod.run_pipeline_job(
                 AppState.SessionLocal, pipeline_cfg=pipeline_cfg, job_id=job_id
             )
+
     t = threading.Thread(target=_run, daemon=True)
     jobs_mod.register_job_thread(job_id, t)
     t.start()
@@ -368,6 +434,14 @@ def register_routes(app: FastAPI) -> None:
     def ticker_details(
         ticker: str,
         days: int = Query(default=365, ge=1, le=2000),
+        run_id: int | None = Query(
+            default=None,
+            description=(
+                "If set, return predictions from this exact run instead of the "
+                "active/latest run. Lets the UI compare historical model "
+                "predictions for the same ticker across runs."
+            ),
+        ),
         s: Session = Depends(get_db),
     ):
         fund = store.fundamental_for(s, ticker)
@@ -375,7 +449,7 @@ def register_routes(app: FastAPI) -> None:
             raise HTTPException(404, f"unknown ticker {ticker}")
         start = dt.date.today() - dt.timedelta(days=days)
         prices = store.prices_for_ticker(s, ticker, start=start)
-        run = store.latest_run(s)
+        run = store.resolve_run(s, run_id)
         preds_out: list[schemas.PredictionOut] = []
         if run:
             for p in store.predictions_for_ticker(s, run.id, ticker):
@@ -466,8 +540,18 @@ def register_routes(app: FastAPI) -> None:
     # ------------------------------------------------------------------ #
 
     @app.get("/predictions/latest", response_model=schemas.TopMovers, tags=["predictions"])
-    def latest_movers(top_k: int = Query(default=10, ge=1, le=100), s: Session = Depends(get_db)):
-        run = store.latest_run(s)
+    def latest_movers(
+        top_k: int = Query(default=10, ge=1, le=100),
+        run_id: int | None = Query(
+            default=None,
+            description=(
+                "If set, return predictions from this exact run instead of the "
+                "active/latest run. Lets the UI switch its data source live."
+            ),
+        ),
+        s: Session = Depends(get_db),
+    ):
+        run = store.resolve_run(s, run_id)
         if run is None:
             return schemas.TopMovers(date=None, long=[], short=[])
         data = store.latest_predictions(s, run.id, top_k=top_k)
@@ -476,15 +560,25 @@ def register_routes(app: FastAPI) -> None:
             date=date_val,
             long=[
                 schemas.PredictionOut(
-                    date=p.date, ticker=p.ticker, score=p.score, rank=p.rank,
-                    side=p.side, weight=p.weight, per_horizon=p.per_horizon_json or {},
+                    date=p.date,
+                    ticker=p.ticker,
+                    score=p.score,
+                    rank=p.rank,
+                    side=p.side,
+                    weight=p.weight,
+                    per_horizon=p.per_horizon_json or {},
                 )
                 for p in data["long"]
             ],
             short=[
                 schemas.PredictionOut(
-                    date=p.date, ticker=p.ticker, score=p.score, rank=p.rank,
-                    side=p.side, weight=p.weight, per_horizon=p.per_horizon_json or {},
+                    date=p.date,
+                    ticker=p.ticker,
+                    score=p.score,
+                    rank=p.rank,
+                    side=p.side,
+                    weight=p.weight,
+                    per_horizon=p.per_horizon_json or {},
                 )
                 for p in data["short"]
             ],
@@ -497,63 +591,89 @@ def register_routes(app: FastAPI) -> None:
     @app.get("/runs", response_model=list[schemas.RunSummary], tags=["runs"])
     def runs(limit: int = Query(default=20, ge=1, le=100), s: Session = Depends(get_db)):
         rows = store.list_runs(s, limit=limit)
-        return [
-            schemas.RunSummary(
-                id=r.id,
-                started_at=r.started_at,
-                completed_at=r.completed_at,
-                status=r.status,
-                metrics=r.summary_json.get("metrics", {}),
-                per_horizon_diagnostics=r.summary_json.get("per_horizon_diagnostics", {}),
-                tickers_count=r.summary_json.get("tickers_count", 0),
-                note=r.note,
-            )
-            for r in rows
-        ]
+        return [_run_to_summary(s, r) for r in rows]
+
+    @app.get("/runs/{run_id}", response_model=schemas.RunSummary, tags=["runs"])
+    def get_run_endpoint(run_id: int, s: Session = Depends(get_db)):
+        """Single run by id, including config + linked job_id + is_active."""
+        run = store.get_run(s, run_id)
+        if run is None:
+            raise HTTPException(404, f"run {run_id} not found")
+        return _run_to_summary(s, run)
 
     @app.get("/runs/{run_id}/equity", response_model=list[schemas.EquityPoint], tags=["runs"])
     def equity_curve(run_id: int, s: Session = Depends(get_db)):
-        rows = store.equity_for_run(s, run_id)
-        return [
-            schemas.EquityPoint(
-                date=r.date,
-                daily_return=r.daily_return,
-                cumulative_return=r.cumulative_return,
-                drawdown=r.drawdown,
-                turnover=r.turnover,
-                benchmark_return=r.benchmark_return,
-            )
-            for r in rows
-        ]
+        return _equity_to_payload(store.equity_for_run(s, run_id))
+
+    @app.get(
+        "/runs/{run_id}/backtest",
+        response_model=schemas.BacktestSummary,
+        tags=["runs"],
+    )
+    def run_backtest(run_id: int, s: Session = Depends(get_db)):
+        """Full BacktestSummary for an arbitrary run. Used by the Runs history
+        page and by `Backtest.tsx` when the user pins / switches runs."""
+        run = store.get_run(s, run_id)
+        if run is None:
+            raise HTTPException(404, f"run {run_id} not found")
+        return schemas.BacktestSummary(
+            run=_run_to_summary(s, run),
+            equity_curve=_equity_to_payload(store.equity_for_run(s, run.id)),
+        )
+
+    @app.post(
+        "/runs/{run_id}/activate",
+        response_model=schemas.ActivateRunResponse,
+        tags=["runs"],
+        dependencies=[Depends(_require_password)],
+    )
+    def activate_run_endpoint(run_id: int, s: Session = Depends(get_db)):
+        """Pin `run_id` as the global default data source for /predictions/latest,
+        /backtest/summary, etc. Requires X-Password (same as job launch — this
+        affects every viewer of the live site)."""
+        try:
+            run = store.activate_run(s, run_id)
+        except ValueError as e:
+            raise HTTPException(409, str(e)) from None
+        if run is None:
+            raise HTTPException(404, f"run {run_id} not found")
+        return schemas.ActivateRunResponse(
+            active_run_id=run.id,
+            message=f"run {run.id} is now the active data source",
+        )
+
+    @app.post(
+        "/runs/deactivate",
+        response_model=schemas.ActivateRunResponse,
+        tags=["runs"],
+        dependencies=[Depends(_require_password)],
+    )
+    def deactivate_runs_endpoint(s: Session = Depends(get_db)):
+        """Clear the active-run pin. The API reverts to "latest ok run" behaviour.
+        Requires X-Password."""
+        cleared = store.deactivate_all_runs(s)
+        return schemas.ActivateRunResponse(
+            active_run_id=None,
+            message=f"cleared {cleared} active-run pin(s); reverting to latest-ok",
+        )
 
     @app.get("/backtest/summary", response_model=schemas.BacktestSummary, tags=["backtest"])
-    def backtest_summary(s: Session = Depends(get_db)):
-        run = store.latest_run(s)
+    def backtest_summary(
+        run_id: int | None = Query(
+            default=None,
+            description=(
+                "If set, return this exact run's backtest instead of the "
+                "active/latest run. Lets the UI switch its data source live."
+            ),
+        ),
+        s: Session = Depends(get_db),
+    ):
+        run = store.resolve_run(s, run_id)
         if run is None:
             raise HTTPException(404, "no runs yet")
-        equity = store.equity_for_run(s, run.id)
         return schemas.BacktestSummary(
-            run=schemas.RunSummary(
-                id=run.id,
-                started_at=run.started_at,
-                completed_at=run.completed_at,
-                status=run.status,
-                metrics=run.summary_json.get("metrics", {}),
-                per_horizon_diagnostics=run.summary_json.get("per_horizon_diagnostics", {}),
-                tickers_count=run.summary_json.get("tickers_count", 0),
-                note=run.note,
-            ),
-            equity_curve=[
-                schemas.EquityPoint(
-                    date=r.date,
-                    daily_return=r.daily_return,
-                    cumulative_return=r.cumulative_return,
-                    drawdown=r.drawdown,
-                    turnover=r.turnover,
-                    benchmark_return=r.benchmark_return,
-                )
-                for r in equity
-            ],
+            run=_run_to_summary(s, run),
+            equity_curve=_equity_to_payload(store.equity_for_run(s, run.id)),
         )
 
     # ------------------------------------------------------------------ #
@@ -630,7 +750,14 @@ def register_routes(app: FastAPI) -> None:
         dependencies=[Depends(_require_password)],
     )
     def run_queued_job(queue_id: str, s: Session = Depends(get_db)):
-        """Launch a pending queued job (pipeline or hypersearch). Requires X-Password header."""
+        """Launch a pending queued job (pipeline or hypersearch). Requires X-Password header.
+
+        The queue entry transitions `pending` → `launched` and stays in the
+        listing as an audit trail (with `job_id` populated so the UI can
+        cross-link to the live job). It does NOT count toward the 5-pending
+        cap any more because `count_pending_queued_jobs` filters by
+        `status='pending'`.
+        """
         if AppState.SessionLocal is None:
             raise HTTPException(500, "DB not initialised")
         qj = store.get_queued_job(s, queue_id)
@@ -642,7 +769,10 @@ def register_routes(app: FastAPI) -> None:
             raise HTTPException(409, "A job is already in flight")
 
         job_id = str(_uuid.uuid4())
-        store.delete_queued_job(s, queue_id)
+
+        # Keep the queue row (status='launched', job_id set) so the Jobs UI
+        # can show the trail "queued at X → launched at Y → job <uuid>".
+        store.mark_queued_launched(s, queue_id, job_id)
         jobs_mod._record_job(job_id, "queued")
 
         job_type = qj.config_json.get("job_type", "pipeline")
@@ -892,6 +1022,15 @@ def register_routes(app: FastAPI) -> None:
         ticker: str,
         limit: int = Query(default=20, ge=1, le=100),
         refresh: bool = Query(default=False),
+        with_sentiment: bool = Query(
+            default=True,
+            description=(
+                "Phase 15: when True (default), each headline is scored "
+                "with FinBERT (cached). If FinBERT isn't installed the "
+                "score fields are None and the rest of the payload is "
+                "unchanged. Set False to skip sentiment lookup entirely."
+            ),
+        ),
         s: Session = Depends(get_db),
     ):
         try:
@@ -904,17 +1043,70 @@ def register_routes(app: FastAPI) -> None:
             items = news_mod.fetch_one(ticker, max_items=limit, refresh=True)
             store.upsert_news(s, ticker, items)
         rows = store.news_for_ticker(s, ticker, limit=limit)
-        return [
-            schemas.NewsHeadline(
-                uuid=r.uuid,
-                title=r.title,
-                publisher=r.publisher,
-                link=r.link,
-                type=r.type,
-                published_at=r.published_at,
+
+        # Phase 15: score headlines via FinBERT (lazy-loaded; cached
+        # per headline). If not installed, all sentiment_* fields stay
+        # None and the legacy payload is preserved exactly.
+        #
+        # Reviewer C3 (2026-06-05): the try block wraps BOTH the
+        # scorer call AND the serialization step, since malformed
+        # results (truncated list, non-dict entries) would otherwise
+        # raise AttributeError in the list comprehension below.
+        try:
+            scores: list[dict | None] = [None] * len(rows)
+            if with_sentiment and rows:
+                from stockpred.data import sentiment as sent_mod
+
+                titles = [r.title or "" for r in rows]
+                scored = sent_mod.score_headlines(titles)
+                # Defensive: scorer contract says len(scored) == len(titles)
+                # but a future drift would silently truncate / extend.
+                if len(scored) != len(rows):
+                    log.warning(
+                        "Sentiment scorer returned %d items for %d input headlines; "
+                        "skipping sentiment fields.",
+                        len(scored),
+                        len(rows),
+                    )
+                else:
+                    scores = [
+                        (s if isinstance(s, dict) and s.get("label") != "unavailable" else None)
+                        for s in scored
+                    ]
+
+            return [
+                schemas.NewsHeadline(
+                    uuid=r.uuid,
+                    title=r.title,
+                    publisher=r.publisher,
+                    link=r.link,
+                    type=r.type,
+                    published_at=r.published_at,
+                    sentiment_label=(scores[i] or {}).get("label") if scores[i] else None,
+                    sentiment_net=(scores[i] or {}).get("net") if scores[i] else None,
+                    sentiment_positive=(scores[i] or {}).get("positive") if scores[i] else None,
+                    sentiment_neutral=(scores[i] or {}).get("neutral") if scores[i] else None,
+                    sentiment_negative=(scores[i] or {}).get("negative") if scores[i] else None,
+                )
+                for i, r in enumerate(rows)
+            ]
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "Sentiment scoring or serialization failed (%s); "
+                "returning headlines without sentiment.",
+                e,
             )
-            for r in rows
-        ]
+            return [
+                schemas.NewsHeadline(
+                    uuid=r.uuid,
+                    title=r.title,
+                    publisher=r.publisher,
+                    link=r.link,
+                    type=r.type,
+                    published_at=r.published_at,
+                )
+                for r in rows
+            ]
 
 
 # ----- Static frontend ---------------------------------------------------

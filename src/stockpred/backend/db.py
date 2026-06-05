@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
@@ -16,6 +16,52 @@ from stockpred.config import DATA_DIR
 log = logging.getLogger(__name__)
 
 DEFAULT_DB_PATH = DATA_DIR / "app.db"
+
+
+# Lightweight idempotent migrations applied on every startup (after
+# create_all). We keep this here instead of pulling in Alembic since the schema
+# is small and SQLite-only. Each entry: (table_name, column_name, DDL fragment).
+#
+# Rules:
+#   - Never include `NOT NULL` without a `DEFAULT` (SQLite rejects it for
+#     existing rows).
+#   - Adding a column is always safe and idempotent (we check `PRAGMA
+#     table_info` first).
+#   - Schema removals/renames must be done manually with a release note.
+_LIGHTWEIGHT_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
+    # 2026-06: model-run history feature.
+    ("runs", "is_active", "BOOLEAN NOT NULL DEFAULT 0"),
+    # 2026-06: persist pipeline logs across server restarts.
+    ("job_records", "logs_json", "JSON"),
+)
+
+
+def apply_lightweight_migrations(engine: Engine) -> int:
+    """Add any missing columns from _LIGHTWEIGHT_MIGRATIONS. Idempotent.
+
+    Returns the number of columns added (0 = schema already up to date).
+    Logs each addition. Failures on a single column are logged and skipped;
+    they do not abort startup, since the table may not exist yet on a brand
+    new DB (`create_all` runs first so this is only theoretical defence).
+    """
+    insp = inspect(engine)
+    added = 0
+    for table, column, ddl in _LIGHTWEIGHT_MIGRATIONS:
+        try:
+            cols = {c["name"] for c in insp.get_columns(table)}
+        except Exception as e:  # noqa: BLE001 — table may not exist
+            log.warning("migration skip %s.%s: cannot inspect (%s)", table, column, e)
+            continue
+        if column in cols:
+            continue
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(f'ALTER TABLE "{table}" ADD COLUMN "{column}" {ddl}'))
+            log.info("migration: added %s.%s (%s)", table, column, ddl)
+            added += 1
+        except Exception as e:  # noqa: BLE001
+            log.error("migration FAILED for %s.%s: %s", table, column, e)
+    return added
 
 
 class Base(DeclarativeBase):
@@ -62,39 +108,12 @@ def session_scope(SessionLocal: sessionmaker[Session]) -> Iterator[Session]:
 
 
 def create_all(engine: Engine) -> None:
-    """Create every table defined on Base. Idempotent.
-    Also applies lightweight column migrations for tables that already exist."""
+    """Create every table defined on Base, then run lightweight migrations.
+
+    Idempotent. Safe on both fresh and existing databases.
+    """
     Base.metadata.create_all(engine)
-    _migrate_columns(engine)
+    apply_lightweight_migrations(engine)
     log.info("DB ready at %s", engine.url)
 
 
-def _migrate_columns(engine: Engine) -> None:
-    """Add any columns that exist in the ORM models but not yet in the DB.
-    SQLite doesn't support ALTER TABLE DROP/MODIFY, only ADD COLUMN, so this
-    is safe to run on every startup."""
-    _add_column_if_missing = []
-    # job_records.logs_json — added when log persistence was introduced
-    _add_column_if_missing.append(
-        ("job_records", "logs_json", "JSON")
-    )
-
-    with engine.connect() as conn:
-        for table, col, col_type in _add_column_if_missing:
-            try:
-                existing = [
-                    row[1]
-                    for row in conn.execute(
-                        __import__("sqlalchemy").text(f"PRAGMA table_info({table})")
-                    )
-                ]
-                if col not in existing:
-                    conn.execute(
-                        __import__("sqlalchemy").text(
-                            f"ALTER TABLE {table} ADD COLUMN {col} {col_type}"
-                        )
-                    )
-                    conn.commit()
-                    log.info("migration: added column %s.%s", table, col)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("migration: could not add %s.%s: %s", table, col, exc)

@@ -39,7 +39,16 @@ def parse_args() -> argparse.Namespace:
         default="random",
     )
     p.add_argument("--horizons", type=int, nargs="+", default=[1, 5])
-    p.add_argument("--model", choices=("gbm", "logistic"), default="gbm")
+    p.add_argument(
+        "--model",
+        choices=("gbm", "logistic", "fama_macbeth"),
+        default="gbm",
+        help=(
+            "gbm (default) | logistic | fama_macbeth. fama_macbeth "
+            "(Phase 17) runs per-date cross-sectional OLS and time-series-"
+            "averages the factor returns; less prone to over-fit than gbm."
+        ),
+    )
     p.add_argument(
         "--weighting",
         choices=("ic_ir", "equal"),
@@ -153,6 +162,28 @@ def parse_args() -> argparse.Namespace:
             "both can be enabled together."
         ),
     )
+    p.add_argument(
+        "--gdelt",
+        action="store_true",
+        help=(
+            "Phase 14: enable GDELT GKG daily tone + mention features. "
+            "Reads ONLY from per-day parquet caches (no HTTP); operator "
+            "must populate them first via scripts/phase14_gdelt_bulk_fetch.py. "
+            "If caches are missing, the pipeline emits a coverage warning "
+            "and silently fills zeros."
+        ),
+    )
+    p.add_argument(
+        "--bayesian-shrinkage-alpha",
+        type=float,
+        default=0.0,
+        help=(
+            "Phase 19: per-ticker Bayesian shrinkage of ensemble score by "
+            "historical sign-precision. 0.0 (default) disables; 1.0 is full "
+            "shrinkage (drop noise tickers entirely, downweight uncertain "
+            "ones). Tickers with worse-than-random precision get factor 0."
+        ),
+    )
     p.add_argument("--refresh", action="store_true")
     p.add_argument("--verbose", "-v", action="store_true")
     return p.parse_args()
@@ -210,6 +241,8 @@ def main() -> int:
         ranks_only=args.ranks_only,
         use_edgar_features=args.edgar_events,
         use_edgar_item_features=args.edgar_items,
+        use_gdelt_features=args.gdelt,
+        bayesian_shrinkage_alpha=args.bayesian_shrinkage_alpha,
         refresh_data=args.refresh,
     )
     r = run_pipeline_v5(cfg)

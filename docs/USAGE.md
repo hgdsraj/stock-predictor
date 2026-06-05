@@ -62,7 +62,48 @@ curl -X POST -H "X-API-Key: $STOCKPRED_API_KEY" \
      -H "Content-Type: application/json" \
      -d '{"phase": 5, "n_tickers": 50}' \
      http://127.0.0.1:8000/jobs/refresh
+
+# BEST honest config (Phase 13: SEC EDGAR item codes; hold Sharpe +0.17).
+# Designed for 8 GB / 8 vCPU box; peak RSS ~1 GB; runtime ~3-7 min.
+curl -X POST -H "X-API-Key: $STOCKPRED_API_KEY" \
+     -H "Content-Type: application/json" \
+     --max-time 1800 \
+     -d '{
+       "phase": 5,
+       "start_date": "2014-01-01",
+       "n_tickers": 150,
+       "universe_sampling": "current",
+       "horizons": [5],
+       "model": "gbm",
+       "use_sector_features": false,
+       "use_tier2_features": false,
+       "use_regime_features": false,
+       "beta_neutralise": false,
+       "bootstrap_method": "block",
+       "holdout_years": 2,
+       "position_sizing": "hrp",
+       "k_per_side_pct": 0.15,
+       "sector_cap_gross": 0.30,
+       "min_trade_threshold": 0.005,
+       "ensemble_weighting": "equal",
+       "bootstrap_n": 500,
+       "use_meta_labelling": true,
+       "meta_threshold": 0.55,
+       "ranks_only": true,
+       "meta_mode": "binary",
+       "use_edgar_item_features": true
+     }' \
+     http://127.0.0.1:8000/jobs/refresh
 ```
+
+The full body reference is in [DEPLOYMENT.md](DEPLOYMENT.md#trigger-a-refresh-from-cli).
+Honest expectations on the Phase 13 config: HOLDOUT Sharpe **+0.17** with
+95% CI **[-0.32, +0.58]** and DD **-8.2%**. CI still straddles zero so
+not statistically significant, but the smallest holdout DD across all
+13 phases and the only positive point estimate. **Do NOT add
+`"use_edgar_features": true`** — Phase 12 raw 8-K counts hurt the
+strategy (Sharpe -0.16 → -0.38). **Phase 14 (`"use_gdelt_features":
+true`)** requires running the overnight bulk-fetch first (see §6c).
 
 Open <http://127.0.0.1:8000> in a browser. The dashboard will be empty until
 the refresh job completes (1–5 minutes depending on your universe size and
@@ -436,7 +477,20 @@ features.
 
 ---
 
-## 6c. News features (Phase 12–14)
+## 6c. News features (Phase 12–15)
+
+**Want the BEST config in one curl command?** See
+[`docs/OPTIMAL.md`](OPTIMAL.md) — single source of truth for the
+best-known config, full parameter explanation, honest expectations.
+
+**See the dedicated [`docs/NEWS.md`](NEWS.md)** for the complete
+end-to-end guide to the four news data sources (EDGAR 8-K events,
+EDGAR 8-K item codes, GDELT daily tone, FinBERT live-mode sentiment),
+including one-time setup curl commands, daily-run examples, full
+results table, and leakage-safety arguments.
+
+This section is the abbreviated quick-reference; **NEWS.md is the
+canonical doc**.
 
 ### Phase 12 — SEC EDGAR 8-K event flags  *(IMPLEMENTED)*
 
@@ -566,33 +620,83 @@ has come.
 **Default recommendation**: enable `--edgar-items`, do NOT enable
 `--edgar-events` (Phase 12 raw counts hurt the strategy).
 
-### Phase 13 — GDELT 2.0 tone + theme counts
+### Phase 14 — GDELT 1.0 daily tone + mention counts  *(IMPLEMENTED)*
 
-GDELT 2.0 publishes a global event/sentiment dataset every 15 minutes,
-free, no API key. Coverage from 2015-02-18. We aggregate per-ticker
-daily features: average tone, mention count, and theme counts for a
-small set of finance themes (EARNINGS, REGULATION, ACQUISITION).
+GDELT 1.0 publishes one global event/tone CSV per day, free, no API
+key. Coverage from 2013-04 (we honour 2014-01 backtest start).
+Adds 6 features per (date, ticker):
 
-**Required `curl` for the master file list**:
+- `gdelt_mention_count`     (int16)   distinct articles mentioning the ticker
+- `gdelt_article_count`     (int32)   sum of NUMARTS across rows that day
+- `gdelt_tone_mean`         (float32) avg article tone (-100 to +100)
+- `gdelt_tone_std`          (float32) tone dispersion within the day
+- `gdelt_mention_{5,21}d`   (int16)   rolling mention sum
+- `gdelt_tone_{5,21}d`      (float32) rolling tone mean
+
+**Setup — overnight bulk fetch** (~2-3 hr, runs once):
 
 ```bash
-# Master list of every 15-min slice (~5 MB text file, updated daily)
-curl -o data/cache/gdelt/masterfilelist.txt \
-    http://data.gdeltproject.org/gdeltv2/masterfilelist.txt
+# Step 1: ensure SEC EDGAR ticker map is populated (Phase 12 / 13 also
+# need this; if you've run either, you're already done).
+uv run python -c "from stockpred.data import edgar; edgar.fetch_ticker_to_cik(refresh=True)"
+
+# Step 2: bulk-fetch all 4018 daily GKG files (2014-2024).
+nohup uv run python scripts/phase14_gdelt_bulk_fetch.py \
+    --tickers-from-edgar \
+    > logs/phase14_bulk.log 2>&1 &
+
+# Monitor progress
+tail -f logs/phase14_bulk.log
+# At default 0.5s rate-limit sleep: ~33 min sleep + ~1-2 hr network.
 ```
 
-Memory caution: each daily aggregate is ~50 MB compressed; the full
-2015–2024 raw dump is ~18 GB. The agent will stream + filter via
-`pd.read_csv(url, chunksize=200_000)` and keep ONLY rows mentioning
-S&P 500 tickers, persisting the result as gzipped parquet (~1 GB
-final size).
+**Equivalent `curl` to fetch a single daily file directly** (for
+testing or surgical re-fetch):
 
-Planned CLI flags:
+```bash
+# GDELT 1.0 daily GKG (one zip per day, ~5-15 MB compressed)
+DATE=20241001
+curl -o data/cache/gdelt/raw_${DATE}.zip \
+    http://data.gdeltproject.org/gkg/${DATE}.gkg.csv.zip
 
-- `--gdelt-tone`: enable GDELT daily tone + count features.
-- `--gdelt-cache-dir data/cache/gdelt`: where the parquet caches live.
+# The pipeline does NOT use raw zips at backtest time; only the
+# per-day parquet caches written by phase14_gdelt_bulk_fetch.py.
+```
 
-### Phase 14 — FinBERT live-mode sentiment (dashboard ONLY)
+**Memory profile** (per docs/continue.md constraint #8):
+
+- Each daily zip streamed via `requests.get(stream=True)`; safety
+  cap at 200 MB per response (real files are 5-15 MB).
+- GKG CSV parsed via the `csv` module (streaming), never via
+  `pd.read_csv` on the full file.
+- Per-(ticker, date) aggregation kept as a dict during parse; only
+  the final rows materialise as a DataFrame.
+- Each day cached as snappy parquet: ~10-100 KB after S&P-500 filter
+  (vs ~5-15 MB raw zip = 50-1500× compression).
+- Backtest-time peak RSS adds ~50 MB on top of the Phase 13 baseline.
+
+**Run the pipeline with GDELT enabled** (after bulk fetch completes):
+
+```bash
+uv run python scripts/run_phase5.py \
+    --start 2014-01-01 --end 2024-12-31 --n-tickers 150 --horizons 5 \
+    --weighting equal --position-sizing hrp \
+    --k-pct 0.15 --sector-cap 0.30 --min-trade-threshold 0.005 \
+    --holdout-years 2 --no-sector --no-regime --no-tier2 \
+    --universe-sampling current --bootstrap-method block \
+    --meta-labelling --meta-threshold 0.55 --ranks-only \
+    --edgar-items --gdelt
+```
+
+**Honest caveat on GDELT match quality**: GDELT mentions companies by
+NAME (not ticker). We strip common legal suffixes (INC, CORP, etc.)
+and reject names < 4 characters to avoid false positives like "CAT"
+matching the word "cat". Some signal is lost; this is the free-data
+ceiling. If `data/cache/gdelt/*.parquet` is empty when the pipeline
+runs, the GDELT panel returns empty and the pipeline emits a coverage
+warning but continues.
+
+### Phase 15 — FinBERT live-mode sentiment (DASHBOARD ONLY)  *(IMPLEMENTED)*
 
 ProsusAI/FinBERT is a 110-M-parameter financial-domain BERT classifier
 (positive / neutral / negative) fine-tuned on Financial PhraseBank.
@@ -601,31 +705,57 @@ backtest feature, because the underlying yfinance news source only
 has ~30 days of history (using it as a feature would create
 catastrophic walk-forward bias).
 
-**Required model download (one-shot, ~440 MB)**:
+**Setup — model download** (one-shot, ~440 MB + ~1.5 GB deps):
 
 ```bash
-# Hugging Face CLI (preferred)
-pip install huggingface_hub
-huggingface-cli download ProsusAI/finbert --local-dir models/finbert
+# 1. Install heavy deps (transformers + torch) — ~1.5 GB total
+pip install transformers torch huggingface_hub
 
-# OR direct curl (skip CLI)
+# 2. Download the model (~440 MB) once to a local path.
+# Hugging Face CLI (preferred):
+export FINBERT_MODEL_DIR="$PWD/models/finbert"
+huggingface-cli download ProsusAI/finbert --local-dir "$FINBERT_MODEL_DIR"
+
+# OR direct curl (skip CLI):
 mkdir -p models/finbert
 for f in config.json vocab.txt pytorch_model.bin tokenizer.json; do
-    curl -L -o models/finbert/$f \
-        https://huggingface.co/ProsusAI/finbert/resolve/main/$f
+    curl -L -o "models/finbert/$f" \
+        "https://huggingface.co/ProsusAI/finbert/resolve/main/$f"
 done
 ```
 
-Then `pip install transformers torch` (~1.5 GB). The agent will gate
-the import inside `news.py` so the rest of the pipeline doesn't fail
-if these heavy deps aren't installed.
+**Env vars**:
 
-Planned env vars:
+- `FINBERT_MODEL_DIR=models/finbert` — path to local model (default:
+  `ProsusAI/finbert`, which triggers a one-time HF Hub download to
+  `~/.cache/huggingface/...` on first use).
+- `FINBERT_BATCH_SIZE=32` — CPU inference batch size; reduce on
+  RAM-constrained boxes.
+- `FINBERT_ENABLED=auto` — `off` to globally disable scoring even
+  when the model is available.
 
-- `FINBERT_MODEL_DIR=models/finbert` (path to the local model)
-- `FINBERT_BATCH_SIZE=32` (CPU inference; lower if OOMing)
-- `FINBERT_ENABLED=true` (off by default to keep the dashboard
-  lightweight when the model isn't downloaded)
+**Use it via the news endpoint**:
+
+```bash
+# Returns 20 most recent headlines for AAPL, each with
+# sentiment_label / sentiment_net / sentiment_{positive,neutral,negative}
+# fields if FinBERT is installed. Otherwise those fields are null and
+# the rest of the payload is unchanged.
+curl http://localhost:8000/tickers/AAPL/news?limit=20&with_sentiment=true
+
+# Skip sentiment scoring (faster + no model needed):
+curl http://localhost:8000/tickers/AAPL/news?with_sentiment=false
+```
+
+**Graceful degradation**: if `transformers`/`torch` aren't installed,
+the news endpoint still returns headlines (without sentiment fields)
+and a `WARNING` is logged. Operators who don't want the heavy deps
+can leave them out — the backend stays lightweight.
+
+**Cache**: each headline scored is cached on disk by sha256(title) at
+`data/cache/sentiment/{xx}/{full_hash}.json`. Repeat lookups for the
+same headline don't re-invoke the model. Cache is bucketed to avoid
+one mega-directory.
 
 ---
 

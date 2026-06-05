@@ -16,13 +16,17 @@ import {
   formatCompactNumber,
   signClass,
 } from "@/lib/format";
+import { useActiveRun } from "@/hooks/useActiveRun";
 import { cn } from "@/lib/cn";
 
 export function Ticker() {
   const { ticker = "" } = useParams();
+  // Run pinning affects only the predictions block (price/news are run-agnostic).
+  // Keying on `queryKeyPart` ensures switching runs in the header re-fetches.
+  const { runId, queryKeyPart } = useActiveRun();
   const { data, isLoading, error } = useQuery({
-    queryKey: ["ticker", ticker],
-    queryFn: () => api.tickerDetail(ticker, 730),
+    queryKey: ["ticker", ticker, queryKeyPart],
+    queryFn: () => api.tickerDetail(ticker, 730, runId),
     enabled: !!ticker,
   });
   const news = useQuery({
