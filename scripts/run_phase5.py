@@ -173,6 +173,17 @@ def parse_args() -> argparse.Namespace:
             "and silently fills zeros."
         ),
     )
+    p.add_argument(
+        "--bayesian-shrinkage-alpha",
+        type=float,
+        default=0.0,
+        help=(
+            "Phase 19: per-ticker Bayesian shrinkage of ensemble score by "
+            "historical sign-precision. 0.0 (default) disables; 1.0 is full "
+            "shrinkage (drop noise tickers entirely, downweight uncertain "
+            "ones). Tickers with worse-than-random precision get factor 0."
+        ),
+    )
     p.add_argument("--refresh", action="store_true")
     p.add_argument("--verbose", "-v", action="store_true")
     return p.parse_args()
@@ -231,6 +242,7 @@ def main() -> int:
         use_edgar_features=args.edgar_events,
         use_edgar_item_features=args.edgar_items,
         use_gdelt_features=args.gdelt,
+        bayesian_shrinkage_alpha=args.bayesian_shrinkage_alpha,
         refresh_data=args.refresh,
     )
     r = run_pipeline_v5(cfg)

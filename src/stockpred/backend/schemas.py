@@ -350,6 +350,19 @@ class RefreshRequest(BaseModel):
         ),
     )
 
+    # --- Phase 19 Bayesian per-ticker shrinkage --------------------------
+    bayesian_shrinkage_alpha: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "[Phase 19] Per-ticker shrinkage of ensemble score by historical "
+            "sign-precision. 0 = disabled, 1 = aggressive (drop noise "
+            "tickers, downweight uncertain ones). Computed on the first 80% "
+            "of the dev window only; leakage-safe."
+        ),
+    )
+
 
 class JobResponse(BaseModel):
     job_id: str

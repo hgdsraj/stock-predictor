@@ -210,6 +210,13 @@ class PipelineV5Config:
     # so they survive ranks_only via the shared `gdelt` prefix.
     use_gdelt_features: bool = False
 
+    # Phase 19: per-ticker Bayesian shrinkage of ensemble score by
+    # historical sign-precision. alpha=0 disables (raw scores pass
+    # through). alpha=1.0 is full shrinkage. Tickers with worse-than-
+    # random sign-precision are dropped entirely (factor = 0).
+    bayesian_shrinkage_alpha: float = 0.0
+    bayesian_shrinkage_min_obs: int = 30
+
     # Stress
     bootstrap_n: int = 500
 
@@ -999,6 +1006,47 @@ def run_pipeline_v5(cfg: PipelineV5Config | None = None) -> dict:
 
         dev_ensemble_score = ensemble_predictions(per_horizon_preds)
 
+    # ---------------- Phase 19: Bayesian per-ticker shrinkage ----------
+    # Drop tickers with worse-than-random historical sign-precision;
+    # downweight tickers proportional to their (precision - 0.5).
+    # Fit shrinkage on the FIRST 80% of dev, apply to the FULL dev
+    # ensemble. This is leakage-safe because we never look at holdout
+    # to choose the factors.
+    _shrink_factors_for_holdout = None
+    if cfg.bayesian_shrinkage_alpha > 0.0:
+        try:
+            from stockpred.portfolio.bayesian_shrinkage import (
+                compute_per_ticker_sign_precision,
+                compute_shrinkage_factors,
+                apply_shrinkage_to_panel,
+            )
+
+            dev_dates_sorted = (
+                dev_ensemble_score.index.get_level_values("date").unique().sort_values()
+            )
+            n_split = max(1, int(0.8 * len(dev_dates_sorted)))
+            fit_dates = dev_dates_sorted[:n_split]
+            fit_mask = dev_ensemble_score.index.get_level_values("date").isin(fit_dates)
+            shortest_h = min(per_horizon_preds.keys())
+            fit_realised = per_horizon_returns[shortest_h].reindex(dev_ensemble_score.index)
+            sp = compute_per_ticker_sign_precision(
+                dev_ensemble_score[fit_mask],
+                fit_realised[fit_mask],
+                min_obs=cfg.bayesian_shrinkage_min_obs,
+            )
+            sf = compute_shrinkage_factors(sp, alpha=cfg.bayesian_shrinkage_alpha)
+            dev_ensemble_score = apply_shrinkage_to_panel(dev_ensemble_score, sf)
+            _shrink_factors_for_holdout = sf  # reuse on holdout below
+            log.info(
+                "Phase 19 shrinkage (alpha=%.2f): n_tickers=%d, n_active=%d, n_dropped=%d",
+                cfg.bayesian_shrinkage_alpha,
+                len(sf),
+                int((sf > 0).sum()),
+                int((sf == 0).sum()),
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("Phase 19 shrinkage failed (%s); continuing with raw scores.", e)
+
     # ---------------- Phase 8: optional meta-labelling gate -----------
     # Train a binary GBM predicting P(primary signal is correct) on the
     # first 80% of dev, evaluate on last 20% + use that fit to gate the
@@ -1135,6 +1183,22 @@ def run_pipeline_v5(cfg: PipelineV5Config | None = None) -> dict:
                 from stockpred.pipeline import ensemble_predictions
 
                 hold_ensemble_pre = ensemble_predictions(hold_preds)
+
+            # Phase 19: apply shrinkage factors fit on DEV to the holdout
+            # ensemble. Leakage-safe: factors were computed from the dev
+            # window (first 80% of dev) and never see holdout.
+            if cfg.bayesian_shrinkage_alpha > 0.0 and _shrink_factors_for_holdout is not None:
+                try:
+                    from stockpred.portfolio.bayesian_shrinkage import (
+                        apply_shrinkage_to_panel,
+                    )
+
+                    hold_ensemble_pre = apply_shrinkage_to_panel(
+                        hold_ensemble_pre, _shrink_factors_for_holdout
+                    )
+                    log.info("Phase 19: applied dev-fit shrinkage factors to holdout.")
+                except Exception as e:  # noqa: BLE001
+                    log.warning("Phase 19 holdout shrinkage failed (%s); using raw scores.", e)
 
             from stockpred.models.meta import (
                 build_meta_dataset,

@@ -264,6 +264,8 @@ def _build_pipeline_cfg(
             use_edgar_item_features=body.use_edgar_item_features,
             # Phase 14 GDELT
             use_gdelt_features=body.use_gdelt_features,
+            # Phase 19 Bayesian shrinkage
+            bayesian_shrinkage_alpha=body.bayesian_shrinkage_alpha,
         )
     else:
         horizons = tuple(body.horizons) if body.horizons is not None else (1, 5, 21)
