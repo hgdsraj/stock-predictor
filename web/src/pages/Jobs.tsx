@@ -247,19 +247,25 @@ const OPTIMAL_CURL = `curl -X POST https://stock-predictor-production-d4d4.up.ra
 
 // ─── New Job form ─────────────────────────────────────────────────────────────
 
-const PHASE_TABS = ["Phase 1", "Phase 5", "Phase 8/9 (meta)", "Phase 12/13 (EDGAR)", "Optimal curl"] as const;
-type PhaseTab = typeof PHASE_TABS[number];
+type PhasePreset = "Phase 1" | "Phase 5" | "Phase 8/9 (meta)" | "Phase 12/13 (EDGAR)";
+const PRESET_OPTIONS: { value: PhasePreset; label: string; desc: string }[] = [
+  { value: "Phase 1",            label: "Phase 1 — Basic GBM",             desc: "Equal-weight top-K, no meta or EDGAR" },
+  { value: "Phase 5",            label: "Phase 5 — Full feature stack",     desc: "Tier-2, regime, beta-neutral, vol-scaled" },
+  { value: "Phase 8/9 (meta)",   label: "Phase 8/9 — + Meta-labelling",    desc: "Confidence-weighted gating, ranks only" },
+  { value: "Phase 12/13 (EDGAR)","label": "Phase 12/13 — + EDGAR items",   desc: "Best holdout Sharpe: +0.17 on 150 tickers" },
+];
 
 function NewJobForm({ onClose, onQueued }: { onClose: () => void; onQueued: () => void }) {
-  const [tab, setTab] = useState<PhaseTab>("Phase 5");
+  const [preset, setPreset] = useState<PhasePreset>("Phase 5");
   const [cfg, setCfg] = useState<Record<string, unknown>>(PRESETS["Phase 5"]);
+  const [showCurl, setShowCurl] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [curlCopied, setCurlCopied] = useState(false);
   const qc = useQueryClient();
 
-  function switchTab(t: PhaseTab) {
-    setTab(t);
-    if (t !== "Optimal curl") setCfg(PRESETS[t]);
+  function switchPreset(p: PhasePreset) {
+    setPreset(p);
+    setCfg(PRESETS[p]);
   }
 
   function set(key: string, value: unknown) { setCfg(prev => ({ ...prev, [key]: value })); }
@@ -272,29 +278,45 @@ function NewJobForm({ onClose, onQueued }: { onClose: () => void; onQueued: () =
     onError: (e: Error) => setError(e.message),
   });
 
-  const isPhase1 = tab === "Phase 1";
-  const showCurl = tab === "Optimal curl";
+  const isPhase1 = preset === "Phase 1";
+  const selectedOption = PRESET_OPTIONS.find(o => o.value === preset)!;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
       <div className="flex max-h-[92vh] w-full max-w-2xl flex-col overflow-hidden rounded-xl border border-border bg-card shadow-xl">
         {/* Header */}
         <div className="border-b border-border px-6 py-4">
-          <h2 className="text-lg font-semibold">New Job</h2>
-          <p className="text-sm text-muted-foreground">Choose a preset, tweak parameters, then queue. A password is needed to launch.</p>
-        </div>
-
-        {/* Phase tabs */}
-        <div className="flex gap-1 overflow-x-auto border-b border-border bg-muted/30 px-4 pt-3 pb-0">
-          {PHASE_TABS.map(t => (
-            <button key={t} onClick={() => switchTab(t)}
-              className={cn("whitespace-nowrap rounded-t-md px-3 py-1.5 text-xs font-medium transition-colors",
-                tab === t
-                  ? "border border-b-0 border-border bg-card text-foreground"
-                  : "text-muted-foreground hover:text-foreground")}>
-              {t}
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <h2 className="text-lg font-semibold">New Job</h2>
+              <p className="text-sm text-muted-foreground">Choose a preset, tweak, then queue. Password required to launch.</p>
+            </div>
+            <button
+              onClick={() => setShowCurl(v => !v)}
+              className={cn(
+                "shrink-0 rounded-md border px-3 py-1.5 text-xs font-medium transition-colors",
+                showCurl
+                  ? "border-primary bg-primary/10 text-primary"
+                  : "border-border text-muted-foreground hover:text-foreground"
+              )}>
+              {showCurl ? "← Form" : "Optimal curl"}
             </button>
-          ))}
+          </div>
+
+          {/* Preset selector — always visible, never overflows */}
+          {!showCurl && (
+            <div className="mt-3 flex flex-col gap-1">
+              <select
+                value={preset}
+                onChange={e => switchPreset(e.target.value as PhasePreset)}
+                className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-primary">
+                {PRESET_OPTIONS.map(o => (
+                  <option key={o.value} value={o.value}>{o.label}</option>
+                ))}
+              </select>
+              <p className="text-xs text-muted-foreground">{selectedOption.desc}</p>
+            </div>
+          )}
         </div>
 
         {/* Body */}
