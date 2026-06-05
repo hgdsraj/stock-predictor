@@ -14,11 +14,15 @@ Routes:
   GET  /jobs                        — list recent jobs (in-memory)
   GET  /jobs/{job_id}               — job detail + logs
 
-  POST /jobs/queue                  — queue a job for later approval (no auth, max 5)
+  POST /jobs/queue                  — queue a pipeline OR hypersearch job (no auth, max 5)
+                                      include job_type="hypersearch" in body for hypersearch
   GET  /jobs/queue                  — list queued jobs
   POST /jobs/run/{queue_id}         — launch a queued job (requires X-Password)
   DELETE /jobs/queue/{queue_id}     — delete a queued job (requires X-Password)
   DELETE /jobs/{job_id}/cancel      — cancel a running job (requires X-Password)
+
+  GET  /hypersearch/runs            — list all hypersearch run results
+  GET  /hypersearch/runs/{run_id}   — detail for one hypersearch run (trials, best params)
 
   GET  /watchlist                   — watched tickers
   POST /watchlist                   — add ticker (requires X-API-Key)
@@ -285,6 +289,18 @@ def _launch_pipeline(pipeline_cfg, job_id: str) -> None:
         with _refresh_lock:
             jobs_mod.run_pipeline_job(
                 AppState.SessionLocal, pipeline_cfg=pipeline_cfg, job_id=job_id
+            )
+    t = threading.Thread(target=_run, daemon=True)
+    jobs_mod.register_job_thread(job_id, t)
+    t.start()
+
+
+def _launch_hypersearch(hypersearch_cfg, job_id: str) -> None:
+    """Start a background thread that acquires _refresh_lock and runs a hypersearch."""
+    def _run():
+        with _refresh_lock:
+            jobs_mod.run_hypersearch_job(
+                AppState.SessionLocal, hypersearch_cfg=hypersearch_cfg, job_id=job_id
             )
     t = threading.Thread(target=_run, daemon=True)
     jobs_mod.register_job_thread(job_id, t)
@@ -568,11 +584,15 @@ def register_routes(app: FastAPI) -> None:
         response_model=schemas.QueuedJobOut,
         tags=["jobs"],
     )
-    def queue_job(body: schemas.RefreshRequest, s: Session = Depends(get_db)):
-        """Queue a job for later password-protected launch. No auth required.
-        Up to 5 pending jobs allowed at once."""
+    def queue_job(body: schemas.RefreshRequest | schemas.HypersearchRequest, s: Session = Depends(get_db)):
+        """Queue a pipeline or hypersearch job for later password-protected launch.
+        No auth required. Up to 5 pending jobs at once.
+        Include job_type='hypersearch' for a hypersearch job (use HypersearchRequest body)."""
+        config = body.model_dump()
+        if isinstance(body, schemas.HypersearchRequest):
+            config["job_type"] = "hypersearch"
         try:
-            qj = store.create_queued_job(s, config=body.model_dump())
+            qj = store.create_queued_job(s, config=config)
         except ValueError as e:
             raise HTTPException(429, str(e)) from None
         return schemas.QueuedJobOut(
@@ -610,7 +630,7 @@ def register_routes(app: FastAPI) -> None:
         dependencies=[Depends(_require_password)],
     )
     def run_queued_job(queue_id: str, s: Session = Depends(get_db)):
-        """Launch a pending queued job. Requires X-Password header."""
+        """Launch a pending queued job (pipeline or hypersearch). Requires X-Password header."""
         if AppState.SessionLocal is None:
             raise HTTPException(500, "DB not initialised")
         qj = store.get_queued_job(s, queue_id)
@@ -619,15 +639,25 @@ def register_routes(app: FastAPI) -> None:
         if qj.status != "pending":
             raise HTTPException(409, f"job is already {qj.status}")
         if _is_pipeline_running():
-            raise HTTPException(409, "A pipeline run is already in flight")
+            raise HTTPException(409, "A job is already in flight")
 
-        body = schemas.RefreshRequest(**qj.config_json)
-        pipeline_cfg = _build_pipeline_cfg(body)
         job_id = str(_uuid.uuid4())
-
         store.delete_queued_job(s, queue_id)
         jobs_mod._record_job(job_id, "queued")
-        _launch_pipeline(pipeline_cfg, job_id)
+
+        job_type = qj.config_json.get("job_type", "pipeline")
+        if job_type == "hypersearch":
+            from stockpred.hypersearch import HypersearchConfig
+            cfg_data = {k: v for k, v in qj.config_json.items() if k != "job_type"}
+            hs_cfg = HypersearchConfig(**{
+                f: cfg_data[f] for f in HypersearchConfig.__dataclass_fields__ if f in cfg_data
+            })
+            _launch_hypersearch(hs_cfg, job_id)
+        else:
+            body = schemas.RefreshRequest(**qj.config_json)
+            pipeline_cfg = _build_pipeline_cfg(body)
+            _launch_pipeline(pipeline_cfg, job_id)
+
         return schemas.JobResponse(job_id=job_id, status="queued")
 
     @app.delete(
@@ -660,12 +690,14 @@ def register_routes(app: FastAPI) -> None:
         rec = jobs_mod.get_job_status(job_id, AppState.SessionLocal)
         if rec is None:
             raise HTTPException(404, "unknown job")
+        cfg = rec.get("config", {})
         return schemas.JobDetail(
             job_id=job_id,
             status=rec["status"],
+            job_type=cfg.get("job_type", "pipeline"),
             started_at=rec.get("started_at"),
             updated_at=rec.get("updated_at"),
-            config=rec.get("config", {}),
+            config=cfg,
             logs=rec.get("logs", []),
             run_id=rec.get("run_id"),
             elapsed_s=rec.get("elapsed_s"),
@@ -678,6 +710,7 @@ def register_routes(app: FastAPI) -> None:
             schemas.JobDetail(
                 job_id=item["job_id"],
                 status=item["status"],
+                job_type=(item.get("config") or {}).get("job_type", "pipeline"),
                 started_at=item.get("started_at"),
                 updated_at=item.get("updated_at"),
                 config=item.get("config", {}),
@@ -688,6 +721,78 @@ def register_routes(app: FastAPI) -> None:
             )
             for item in jobs_mod.list_jobs(limit, AppState.SessionLocal)
         ]
+
+    # ------------------------------------------------------------------ #
+    # Hypersearch results
+    # ------------------------------------------------------------------ #
+
+    def _hs_trial_out(row: dict) -> schemas.HypersearchTrialOut:
+        """Convert a flat trial dict to the API schema."""
+        param_keys = {
+            "position_sizing", "k_per_side_pct", "leverage_per_side", "sector_cap_gross",
+            "min_trade_threshold", "horizons", "ensemble_weighting", "use_tier2_features",
+            "use_regime_features", "use_sector_features", "ranks_only", "beta_neutralise",
+            "use_meta_labelling", "meta_threshold", "meta_mode", "meta_conf_floor",
+            "num_leaves", "learning_rate", "n_estimators", "train_years",
+        }
+        params = {k: v for k, v in row.items() if k in param_keys}
+        return schemas.HypersearchTrialOut(
+            trial=row.get("trial", 0),
+            value=row.get("value"),
+            hold_sharpe=row.get("hold_sharpe"),
+            hold_ci_lo=row.get("hold_ci_lo"),
+            hold_ci_hi=row.get("hold_ci_hi"),
+            hold_dd=row.get("hold_dd"),
+            hold_hit=row.get("hold_hit"),
+            hold_ann_return=row.get("hold_ann_return"),
+            dev_sharpe=row.get("dev_sharpe"),
+            elapsed_s=row.get("elapsed_s"),
+            error=row.get("error") or None,
+            params=params,
+        )
+
+    def _hs_run_out(run, *, include_trials: bool = True) -> schemas.HypersearchRunOut:
+        trials = []
+        if include_trials and run.trials_json:
+            trials = [_hs_trial_out(r) for r in run.trials_json]
+        return schemas.HypersearchRunOut(
+            id=run.id,
+            job_id=run.job_id,
+            started_at=run.started_at,
+            completed_at=run.completed_at,
+            status=run.status,
+            config=_sanitize(run.config_json or {}),
+            n_trials_requested=run.n_trials_requested,
+            n_trials_done=run.n_trials_done,
+            best_sharpe=run.best_sharpe,
+            best_params=run.best_params_json,
+            trials=trials,
+        )
+
+    @app.get("/hypersearch/runs", response_model=list[schemas.HypersearchRunOut], tags=["hypersearch"])
+    def list_hypersearch_runs(
+        limit: int = Query(default=25, ge=1, le=100),
+        s: Session = Depends(get_db),
+    ):
+        """List all hypersearch runs (metadata only, no trials)."""
+        runs = store.list_hypersearch_runs(s, limit=limit)
+        return [_hs_run_out(r, include_trials=False) for r in runs]
+
+    @app.get("/hypersearch/runs/{run_id}", response_model=schemas.HypersearchRunOut, tags=["hypersearch"])
+    def get_hypersearch_run(run_id: int, s: Session = Depends(get_db)):
+        """Full detail for one hypersearch run including all trial results."""
+        run = store.get_hypersearch_run(s, run_id)
+        if run is None:
+            raise HTTPException(404, "hypersearch run not found")
+        return _hs_run_out(run, include_trials=True)
+
+    @app.get("/hypersearch/runs/by-job/{job_id}", response_model=schemas.HypersearchRunOut, tags=["hypersearch"])
+    def get_hypersearch_run_by_job(job_id: str, s: Session = Depends(get_db)):
+        """Get the hypersearch run linked to a specific job_id."""
+        run = store.get_hypersearch_run_by_job(s, job_id)
+        if run is None:
+            raise HTTPException(404, "no hypersearch run found for this job")
+        return _hs_run_out(run, include_trials=True)
 
     # ------------------------------------------------------------------ #
     # Watchlist

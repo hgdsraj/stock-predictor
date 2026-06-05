@@ -1,12 +1,17 @@
 """APScheduler-based job runner. In-process, single-node.
 
-Two job kinds:
+Three job kinds:
 
-* `run_pipeline_job` — fetches data, runs the pipeline, snapshots to DB.
+* `run_pipeline_job`    — fetches data, runs the pipeline, snapshots to DB.
   Used by both the daily cron and the on-demand `POST /jobs/refresh` /
   `POST /jobs/run/{queue_id}`.
 
-* `cleanup_old_runs` — periodically prunes runs older than retention.
+* `run_hypersearch_job` — runs an Optuna hyperparameter search, persisting
+  trial results to `HypersearchRun` after each trial. Launched the same way
+  as pipeline jobs via `POST /jobs/run/{queue_id}` when the queued config
+  includes `job_type = "hypersearch"`.
+
+* `cleanup_old_runs`    — periodically prunes runs older than retention.
 
 Log capture: every pipeline thread attaches a thread-local job_id.  A
 module-level logging.Handler reads that value and appends log lines to
@@ -349,6 +354,187 @@ def run_pipeline_job(
                 )
         except Exception:  # noqa: BLE001
             pass
+        return job_id
+
+    finally:
+        _current_job_id.value = None
+        _cancel_flags.pop(job_id, None)
+        with _thread_lock:
+            _job_threads.pop(job_id, None)
+
+
+# ------------------------------------------------------------------ #
+# Hypersearch execution
+# ------------------------------------------------------------------ #
+
+
+def run_hypersearch_job(
+    session_factory,
+    *,
+    hypersearch_cfg,        # stockpred.hypersearch.HypersearchConfig
+    job_id: str | None = None,
+) -> str:
+    """Execute a hyperparameter search, persisting trial results to DB.
+
+    Shares the same log-capture, cancel, and thread-registry infrastructure
+    as `run_pipeline_job`. The `HypersearchRun` row is updated after every
+    completed trial so partial results survive a cancel.
+    """
+    from stockpred.hypersearch import run_hypersearch
+
+    job_id = job_id or str(uuid.uuid4())
+
+    _ensure_log_handler()
+    with _log_lock:
+        _job_logs[job_id] = []
+    _current_job_id.value = job_id
+
+    started_at = _now()
+    cfg_dict = {
+        "job_type": "hypersearch",
+        **dataclasses.asdict(hypersearch_cfg),
+    }
+    _record_job(job_id, "running", config=cfg_dict, started_at=started_at)
+
+    try:
+        with session_scope(session_factory) as s:
+            store.upsert_job_record(
+                s, job_id, "running",
+                started_at=started_at, updated_at=started_at, config=cfg_dict,
+            )
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Create the HypersearchRun row immediately so the UI can see it.
+    hs_run_id: int | None = None
+    try:
+        with session_scope(session_factory) as s:
+            hs_run = store.create_hypersearch_run(
+                s,
+                job_id=job_id,
+                config=cfg_dict,
+                n_trials=hypersearch_cfg.n_trials,
+            )
+            hs_run_id = hs_run.id
+    except Exception:  # noqa: BLE001
+        pass
+
+    def _current_logs() -> list[str]:
+        return get_job_logs(job_id)
+
+    # Accumulate trial rows so we can pass the full list to store on each update.
+    _trial_rows: list[dict] = []
+
+    def _on_trial_done(row: dict) -> None:
+        _trial_rows.append(row)
+        if hs_run_id is None:
+            return
+        # best so far — filter out penalty values
+        valid = [r for r in _trial_rows if (r.get("hold_sharpe") or -99) > -9]
+        best_s: float | None = None
+        best_p: dict | None = None
+        if valid:
+            best_row = max(valid, key=lambda r: r.get("hold_sharpe") or float("-inf"))
+            best_s = best_row.get("hold_sharpe")
+            best_p = {
+                k: best_row[k] for k in best_row
+                if k not in ("trial", "value", "hold_sharpe", "hold_ci_lo",
+                             "hold_ci_hi", "hold_dd", "hold_hit", "hold_ann_return",
+                             "dev_sharpe", "elapsed_s", "error")
+            }
+        try:
+            with session_scope(session_factory) as s:
+                store.update_hypersearch_run(
+                    s, hs_run_id,
+                    n_trials_done=len(_trial_rows),
+                    best_sharpe=best_s,
+                    best_params=best_p,
+                    trials=list(_trial_rows),
+                )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _should_stop() -> bool:
+        return _is_cancelled(job_id)
+
+    def _persist_end(status: str, elapsed: float, error: str | None = None) -> None:
+        _record_job(job_id, status, started_at=started_at, elapsed_s=elapsed, error=error)
+        try:
+            with session_scope(session_factory) as s:
+                store.upsert_job_record(
+                    s, job_id, status,
+                    started_at=started_at, updated_at=_now(),
+                    elapsed_s=elapsed, error=error,
+                    config=cfg_dict, logs=_current_logs(),
+                )
+                if hs_run_id is not None:
+                    store.finalize_hypersearch_run(
+                        s, hs_run_id,
+                        status=status,
+                        trials=list(_trial_rows),
+                    )
+        except Exception:  # noqa: BLE001
+            pass
+
+    try:
+        run_hypersearch(
+            hypersearch_cfg,
+            on_trial_done=_on_trial_done,
+            should_stop=_should_stop,
+        )
+        elapsed = (_now() - started_at).total_seconds()
+
+        if _is_cancelled(job_id):
+            log.info("hypersearch job %s cancelled", job_id)
+            _persist_end("cancelled", elapsed)
+            return job_id
+
+        # Finalise with best params from accumulated rows.
+        valid = [r for r in _trial_rows if (r.get("hold_sharpe") or -99) > -9]
+        best_s = None
+        best_p = None
+        if valid:
+            best_row = max(valid, key=lambda r: r.get("hold_sharpe") or float("-inf"))
+            best_s = best_row.get("hold_sharpe")
+            best_p = {
+                k: best_row[k] for k in best_row
+                if k not in ("trial", "value", "hold_sharpe", "hold_ci_lo",
+                             "hold_ci_hi", "hold_dd", "hold_hit", "hold_ann_return",
+                             "dev_sharpe", "elapsed_s", "error")
+            }
+
+        _record_job(job_id, "ok", started_at=started_at, elapsed_s=elapsed)
+        try:
+            with session_scope(session_factory) as s:
+                store.upsert_job_record(
+                    s, job_id, "ok",
+                    started_at=started_at, updated_at=_now(),
+                    elapsed_s=elapsed, config=cfg_dict, logs=_current_logs(),
+                )
+                if hs_run_id is not None:
+                    store.finalize_hypersearch_run(
+                        s, hs_run_id,
+                        status="ok",
+                        best_sharpe=best_s,
+                        best_params=best_p,
+                        trials=list(_trial_rows),
+                    )
+        except Exception:  # noqa: BLE001
+            pass
+
+        log.info("hypersearch job %s ok (%.0fs, %d trials)", job_id, elapsed, len(_trial_rows))
+        return job_id
+
+    except _CancelInterrupt:
+        elapsed = (_now() - started_at).total_seconds()
+        log.info("hypersearch job %s hard-cancelled (%.0fs)", job_id, elapsed)
+        _persist_end("cancelled", elapsed)
+        return job_id
+
+    except Exception as e:  # noqa: BLE001
+        elapsed = (_now() - started_at).total_seconds()
+        log.exception("hypersearch job %s failed", job_id)
+        _persist_end("failed", elapsed, error=str(e))
         return job_id
 
     finally:

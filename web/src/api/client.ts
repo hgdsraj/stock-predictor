@@ -6,6 +6,8 @@
 import type {
   BacktestSummary,
   HealthResponse,
+  HypersearchRequest,
+  HypersearchRun,
   JobDetail,
   JobResponse,
   NewsHeadline,
@@ -124,4 +126,21 @@ export const api = {
 
   /** Job status (legacy single-field response). */
   jobStatus: (job_id: string) => get<JobDetail>(`/jobs/${encodeURIComponent(job_id)}`),
+
+  // ── Hypersearch ────────────────────────────────────────────────────────
+  /** Queue a hypersearch job. No auth required. */
+  queueHypersearch: (cfg: HypersearchRequest) =>
+    post<QueuedJob>("/jobs/queue", cfg),
+
+  /** List all hypersearch runs (metadata, no trials). */
+  listHypersearchRuns: (limit = 25) =>
+    get<HypersearchRun[]>(`/hypersearch/runs?limit=${limit}`),
+
+  /** Full detail for one hypersearch run including all trial rows. */
+  hypersearchRun: (run_id: number) =>
+    get<HypersearchRun>(`/hypersearch/runs/${run_id}`),
+
+  /** Get hypersearch run linked to a job_id (polls while running). */
+  hypersearchRunByJob: (job_id: string) =>
+    get<HypersearchRun>(`/hypersearch/runs/by-job/${encodeURIComponent(job_id)}`),
 };

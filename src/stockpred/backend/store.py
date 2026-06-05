@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 from stockpred.backend.models import (
     EquitySample,
     Fundamental,
+    HypersearchRun,
     JobRecord,
     NewsItem,
     PriceBar,
@@ -510,3 +511,92 @@ def mark_stale_jobs_crashed(s: Session) -> int:
         .values(status="crashed", updated_at=_now())
     )
     return result.rowcount
+
+
+# --------------------------------------------------------------------- #
+# Hypersearch runs
+# --------------------------------------------------------------------- #
+
+
+def create_hypersearch_run(
+    s: Session,
+    *,
+    job_id: str | None,
+    config: dict,
+    n_trials: int,
+) -> HypersearchRun:
+    run = HypersearchRun(
+        job_id=job_id,
+        started_at=_now(),
+        status="running",
+        config_json=config,
+        n_trials_requested=n_trials,
+        n_trials_done=0,
+        trials_json=[],
+    )
+    s.add(run)
+    s.flush()
+    return run
+
+
+def update_hypersearch_run(
+    s: Session,
+    run_id: int,
+    *,
+    n_trials_done: int,
+    best_sharpe: float | None,
+    best_params: dict | None,
+    trials: list[dict],
+) -> None:
+    run = s.get(HypersearchRun, run_id)
+    if run is None:
+        return
+    run.n_trials_done = n_trials_done
+    run.best_sharpe = best_sharpe
+    run.best_params_json = best_params
+    run.trials_json = trials
+    s.add(run)
+
+
+def finalize_hypersearch_run(
+    s: Session,
+    run_id: int,
+    *,
+    status: str,
+    best_sharpe: float | None = None,
+    best_params: dict | None = None,
+    trials: list[dict] | None = None,
+) -> None:
+    run = s.get(HypersearchRun, run_id)
+    if run is None:
+        return
+    run.status = status
+    run.completed_at = _now()
+    if best_sharpe is not None:
+        run.best_sharpe = best_sharpe
+    if best_params is not None:
+        run.best_params_json = best_params
+    if trials is not None:
+        run.trials_json = trials
+        run.n_trials_done = len(trials)
+    s.add(run)
+
+
+def get_hypersearch_run(s: Session, run_id: int) -> HypersearchRun | None:
+    return s.get(HypersearchRun, run_id)
+
+
+def get_hypersearch_run_by_job(s: Session, job_id: str) -> HypersearchRun | None:
+    return s.execute(
+        select(HypersearchRun).where(HypersearchRun.job_id == job_id)
+    ).scalar_one_or_none()
+
+
+def list_hypersearch_runs(s: Session, *, limit: int = 50) -> list[HypersearchRun]:
+    return list(
+        s.execute(
+            select(HypersearchRun).order_by(desc(HypersearchRun.started_at)).limit(limit)
+        )
+        .scalars()
+        .all()
+    )

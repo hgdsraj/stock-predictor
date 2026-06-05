@@ -1,6 +1,6 @@
 import { ReactNode } from "react";
 import { Link, NavLink } from "react-router-dom";
-import { Moon, Sun, LineChart, Search, BarChart3, Home, Briefcase, BookOpen } from "lucide-react";
+import { Moon, Sun, LineChart, Search, BarChart3, Home, Briefcase, BookOpen, Zap } from "lucide-react";
 import { useTheme } from "./ThemeProvider";
 import { Button } from "./ui/Button";
 import { cn } from "@/lib/cn";
@@ -13,6 +13,7 @@ export function Layout({ children }: { children: ReactNode }) {
     { to: "/screener", label: "Screener", icon: Search },
     { to: "/backtest", label: "Backtest", icon: BarChart3 },
     { to: "/jobs", label: "Jobs", icon: Briefcase },
+    { to: "/hypersearch", label: "Hypersearch", icon: Zap },
     { to: "/about", label: "About", icon: BookOpen },
   ];
 

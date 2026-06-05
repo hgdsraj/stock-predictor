@@ -179,6 +179,29 @@ class JobRecord(Base):
     logs_json: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
 
 
+class HypersearchRun(Base):
+    """Persistent record for one hyperparameter search job.
+
+    Created when a hypersearch job starts; updated after each trial via
+    `store.update_hypersearch_run`; finalised when the job completes.
+    Linked to `JobRecord` by `job_id` (nullable — can exist standalone).
+    """
+
+    __tablename__ = "hypersearch_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    job_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    started_at: Mapped[dt.datetime] = mapped_column(DateTime, nullable=False)
+    completed_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="running")
+    config_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    n_trials_requested: Mapped[int] = mapped_column(Integer, nullable=False, default=50)
+    n_trials_done: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    best_sharpe: Mapped[float | None] = mapped_column(Float, nullable=True)
+    best_params_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    trials_json: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
+
+
 class NewsItem(Base):
     """Headline-level news from yfinance Ticker.news. Free, no API key.
 

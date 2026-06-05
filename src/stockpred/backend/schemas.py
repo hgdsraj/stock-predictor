@@ -287,6 +287,7 @@ class JobDetail(BaseModel):
 
     job_id: str
     status: str
+    job_type: str = "pipeline"  # "pipeline" | "hypersearch"
     started_at: dt.datetime | None = None
     updated_at: dt.datetime | None = None
     config: dict = {}
@@ -294,6 +295,61 @@ class JobDetail(BaseModel):
     run_id: int | None = None
     elapsed_s: float | None = None
     error: str | None = None
+
+
+# ─── Hyperparameter search ────────────────────────────────────────────────────
+
+
+class HypersearchRequest(BaseModel):
+    """Body for POST /jobs/queue when job_type = 'hypersearch'."""
+
+    n_trials: int = Field(default=50, ge=1, le=500, description="Number of Optuna trials")
+    n_tickers: int = Field(default=25, ge=5, le=500, description="Universe size per trial")
+    start_date: str = Field(default="2015-01-01", description="History start date")
+    end_date: str | None = Field(default=None, description="History end date; None = today")
+    holdout_years: int = Field(default=2, ge=1, le=5, description="Years withheld from tuning")
+    bootstrap_n: int = Field(
+        default=50, ge=10, le=500,
+        description="Bootstrap resamples for Sharpe CI (50=fast, 500=honest)",
+    )
+    universe_sampling: Literal["current", "first", "random"] = Field(
+        default="current",
+        description="Ticker selection strategy (current = same set every trial)",
+    )
+    seed: int = Field(default=42, description="Optuna sampler seed for reproducibility")
+
+
+class HypersearchTrialOut(BaseModel):
+    """One trial result row returned by GET /hypersearch/runs/{id}."""
+
+    trial: int
+    value: float | None = None
+    hold_sharpe: float | None = None
+    hold_ci_lo: float | None = None
+    hold_ci_hi: float | None = None
+    hold_dd: float | None = None
+    hold_hit: float | None = None
+    hold_ann_return: float | None = None
+    dev_sharpe: float | None = None
+    elapsed_s: float | None = None
+    error: str | None = None
+    params: dict = {}
+
+
+class HypersearchRunOut(BaseModel):
+    """GET /hypersearch/runs or GET /hypersearch/runs/{id}."""
+
+    id: int
+    job_id: str | None = None
+    started_at: dt.datetime
+    completed_at: dt.datetime | None = None
+    status: str
+    config: dict = {}
+    n_trials_requested: int
+    n_trials_done: int
+    best_sharpe: float | None = None
+    best_params: dict | None = None
+    trials: list[HypersearchTrialOut] = []
 
 
 class QueuedJobOut(BaseModel):

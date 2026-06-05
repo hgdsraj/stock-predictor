@@ -631,12 +631,28 @@ Planned env vars:
 
 ## 6d. Hyperparameter search (find the best config automatically)
 
-`scripts/run_hypersearch.py` runs a **Bayesian hyperparameter search** (Optuna
-TPE) across 20 pipeline parameters to find the combination that maximises
-**holdout Sharpe** — the most honest metric, because the holdout window is
-never touched during tuning.
+The search is available in **two ways**:
 
-### Quick start
+| Mode | Use when |
+| ---- | -------- |
+| **Web UI** (`/hypersearch` page) | Server is running; want to queue, launch, and monitor via the dashboard |
+| **CLI** (`scripts/run_hypersearch.py`) | Headless, local dev, or scheduled batch run |
+
+Both use the same `stockpred.hypersearch` core logic and Optuna TPE sampler.
+Results from the web UI are stored in the database and visible under
+`GET /hypersearch/runs`.
+
+### Web UI
+
+1. Start the server (`uv run python scripts/serve.py`)
+2. Open **http://localhost:8000/hypersearch**
+3. Click **New Search** → configure trials, tickers, date range
+4. The job is queued — click **Launch** and enter `STOCKPRED_PW`
+5. Logs stream live; the trial table updates after every completed trial
+6. When done, expand any row to see the top-10 table, best config JSON, and
+   the exact curl command to promote those parameters to a production pipeline run
+
+### CLI quick start
 
 ```bash
 # Smoke test: 20 trials, ~25 tickers, ~30-80 min total
@@ -859,6 +875,36 @@ curl -X POST \
 
 # Poll job status
 curl http://localhost:8000/jobs/<job-id>
+
+# --- Hypersearch endpoints (no auth to queue; X-Password to launch) ---
+
+# Queue a hypersearch job (no auth required)
+curl -X POST \
+     -H "Content-Type: application/json" \
+     -d '{
+           "n_trials": 50,
+           "n_tickers": 25,
+           "start_date": "2015-01-01",
+           "holdout_years": 2,
+           "bootstrap_n": 50,
+           "universe_sampling": "current",
+           "seed": 42
+         }' \
+     http://localhost:8000/jobs/queue
+
+# Launch the queued job (requires STOCKPRED_PW)
+curl -X POST \
+     -H "X-Password: $STOCKPRED_PW" \
+     http://localhost:8000/jobs/run/<queue_id>
+
+# List all hypersearch runs (metadata, no trial rows)
+curl http://localhost:8000/hypersearch/runs
+
+# Full detail for one run including all trial results
+curl http://localhost:8000/hypersearch/runs/<run_id>
+
+# Get the hypersearch run linked to a specific job
+curl http://localhost:8000/hypersearch/runs/by-job/<job_id>
 ```
 
 Responses are always JSON. NaN and Infinity values are serialised as `null`

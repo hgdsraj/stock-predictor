@@ -1,9 +1,8 @@
 #!/usr/bin/env python
-"""Hyperparameter search for the Phase 5+ pipeline via Optuna (Bayesian TPE).
+"""CLI for the Phase 5+ hyperparameter search (Optuna TPE).
 
-Searches 20 pipeline parameters to maximise holdout Sharpe ratio. Uses
-Tree-structured Parzen Estimator (TPE) so it finds good regions of the
-parameter space ~10x faster than an equivalent grid search.
+Delegates all search logic to `stockpred.hypersearch`; this script handles
+CLI arguments, console progress output, and saving results to reports/.
 
 Fast-mode defaults (tuned for ~2-4 min/trial on a laptop):
   --n-tickers 25   --start 2015-01-01   --bootstrap-n 50
@@ -37,9 +36,15 @@ from pathlib import Path
 import optuna
 import pandas as pd
 
-from stockpred.config import CVConfig
-from stockpred.models.gbm import GBMConfig
-from stockpred.pipeline_v5 import PipelineV5Config, run_pipeline_v5
+from stockpred.hypersearch import (
+    HypersearchConfig,
+    PENALTY,
+    best_trial_params,
+    best_trial_sharpe,
+    run_hypersearch,
+    suggest_pipeline_config,
+    trials_to_records,
+)
 
 REPORTS_DIR = Path(__file__).resolve().parents[1] / "reports"
 log = logging.getLogger("hypersearch")
@@ -98,246 +103,82 @@ def parse_args() -> argparse.Namespace:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Parameter space
+# Progress printer
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _suggest_config(trial: optuna.Trial, args: argparse.Namespace) -> PipelineV5Config:
-    """Map Optuna trial suggestions to a PipelineV5Config.
-
-    20 parameters: portfolio construction, signal, features,
-    meta-labelling (conditional), GBM, and CV walk-forward settings.
-    """
-
-    # ── Portfolio construction ─────────────────────────────────────────────
-    position_sizing = trial.suggest_categorical("position_sizing", ["vol_scaled", "hrp", "top_k"])
-    k_per_side_pct = trial.suggest_float("k_per_side_pct", 0.08, 0.25)
-    leverage_per_side = trial.suggest_float("leverage_per_side", 0.5, 1.5)
-    _sc = trial.suggest_categorical("sector_cap_gross", ["none", "0.20", "0.30", "0.40"])
-    sector_cap_gross: float | None = None if _sc == "none" else float(_sc)
-    min_trade_threshold = trial.suggest_float("min_trade_threshold", 0.001, 0.015, log=True)
-
-    # ── Signal ────────────────────────────────────────────────────────────
-    _hz = trial.suggest_categorical("horizons", ["5", "1,5"])
-    horizons = tuple(int(h) for h in _hz.split(","))
-    ensemble_weighting = trial.suggest_categorical("ensemble_weighting", ["ic_ir", "equal"])
-
-    # ── Features ──────────────────────────────────────────────────────────
-    use_tier2_features = trial.suggest_categorical("use_tier2_features", [True, False])
-    use_regime_features = trial.suggest_categorical("use_regime_features", [True, False])
-    use_sector_features = trial.suggest_categorical("use_sector_features", [True, False])
-    ranks_only = trial.suggest_categorical("ranks_only", [True, False])
-    beta_neutralise = trial.suggest_categorical("beta_neutralise", [True, False])
-
-    # ── Meta-labelling (conditional on use_meta_labelling) ────────────────
-    use_meta_labelling = trial.suggest_categorical("use_meta_labelling", [True, False])
-    if use_meta_labelling:
-        meta_threshold = trial.suggest_float("meta_threshold", 0.50, 0.65)
-        meta_mode = trial.suggest_categorical("meta_mode", ["binary", "confidence"])
-        meta_conf_floor = (
-            trial.suggest_float("meta_conf_floor", 0.48, 0.72)
-            if meta_mode == "confidence"
-            else 0.5
-        )
-    else:
-        meta_threshold = 0.55
-        meta_mode = "binary"
-        meta_conf_floor = 0.5
-
-    # ── GBM ───────────────────────────────────────────────────────────────
-    num_leaves = trial.suggest_categorical("num_leaves", [31, 63, 127])
-    learning_rate = trial.suggest_float("learning_rate", 0.01, 0.08, log=True)
-    n_estimators = trial.suggest_int("n_estimators", 400, 1200, step=200)
-
-    # ── CV ────────────────────────────────────────────────────────────────
-    train_years = trial.suggest_int("train_years", 2, 4)
-
-    return PipelineV5Config(
-        start_date=args.start,
-        end_date=args.end,
-        n_tickers=args.n_tickers,
-        universe_sampling=args.universe_sampling,
-        refresh_data=False,
-        horizons=horizons,
-        model="gbm",
-        gbm=GBMConfig(
-            num_leaves=num_leaves,
-            learning_rate=learning_rate,
-            n_estimators=n_estimators,
-        ),
-        use_sector_features=use_sector_features,
-        use_tier2_features=use_tier2_features,
-        use_regime_features=use_regime_features,
-        beta_neutralise=beta_neutralise,
-        bootstrap_method="block",
-        cv=CVConfig(
-            train_years=train_years,
-            test_months=6,
-            embargo_days=25,
-            min_train_obs=1000,
-        ),
-        holdout_years=args.holdout_years,
-        position_sizing=position_sizing,
-        k_per_side_pct=k_per_side_pct,
-        leverage_per_side=leverage_per_side,
-        sector_cap_gross=sector_cap_gross,
-        min_trade_threshold=min_trade_threshold,
-        ensemble_weighting=ensemble_weighting,
-        use_meta_labelling=use_meta_labelling,
-        meta_threshold=meta_threshold,
-        meta_mode=meta_mode,
-        meta_conf_floor=meta_conf_floor,
-        meta_conf_cap=1.0,
-        meta_walk_forward_folds=1,
-        meta_per_sector=False,
-        use_triple_barrier_labels=False,
-        ranks_only=ranks_only,
-        feature_exclude=(),
-        use_edgar_features=False,
-        use_edgar_item_features=False,
-        bootstrap_n=args.bootstrap_n,
-        tearsheet_path=None,
-    )
+def _make_on_trial_done(n_trials: int):
+    """Return a callback that prints one line per trial."""
+    def on_trial_done(row: dict) -> None:
+        num = row.get("trial", "?")
+        sharpe = row.get("hold_sharpe", float("nan"))
+        ci_lo = row.get("hold_ci_lo", float("nan"))
+        ci_hi = row.get("hold_ci_hi", float("nan"))
+        dd = row.get("hold_dd", float("nan"))
+        elapsed = row.get("elapsed_s", float("nan"))
+        error = row.get("error", "")
+        tag = f"[{int(num) + 1:>3}/{n_trials}]"
+        if error:
+            print(f"{tag} FAILED ({elapsed:.0f}s): {error}", flush=True)
+        else:
+            s = f"{sharpe:+.3f}" if pd.notna(sharpe) else "  nan "
+            lo = f"{ci_lo:+.3f}" if pd.notna(ci_lo) else "   nan"
+            hi = f"{ci_hi:+.3f}" if pd.notna(ci_hi) else "   nan"
+            d = f"{dd:+.2%}" if pd.notna(dd) else "   nan"
+            print(f"{tag} Sharpe={s}  CI=[{lo},{hi}]  DD={d}  ({elapsed:.0f}s)", flush=True)
+    return on_trial_done
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Objective
-# ─────────────────────────────────────────────────────────────────────────────
-
-_PENALTY = -10.0  # returned on error / NaN so Optuna avoids those regions
-
-
-def make_objective(args: argparse.Namespace):
-    n_trials = args.n_trials
-
-    def objective(trial: optuna.Trial) -> float:
-        cfg = _suggest_config(trial, args)
-        t0 = time.time()
-        try:
-            res = run_pipeline_v5(cfg)
-        except Exception as exc:  # noqa: BLE001
-            elapsed = round(time.time() - t0, 1)
-            log.warning("Trial %d failed in %.0fs: %s", trial.number, elapsed, exc)
-            trial.set_user_attr("error", str(exc)[:200])
-            trial.set_user_attr("elapsed_s", elapsed)
-            _print_trial_line(trial.number, n_trials, float("nan"), float("nan"), float("nan"), float("nan"), elapsed, error=str(exc)[:120])
-            return _PENALTY
-
-        elapsed = round(time.time() - t0, 1)
-        hold = res.get("holdout_metrics") or {}
-        dev = res.get("metrics") or {}
-        ci = res.get("bootstrap_sharpe") or {}
-
-        hold_sharpe = hold.get("sharpe", float("nan"))
-        hold_ci_lo = ci.get("sharpe_lo", float("nan"))
-        hold_ci_hi = ci.get("sharpe_hi", float("nan"))
-        hold_dd = hold.get("max_drawdown", float("nan"))
-        hold_hit = hold.get("hit_ratio", float("nan"))
-        hold_ann_return = hold.get("ann_return", float("nan"))
-        dev_sharpe = dev.get("sharpe", float("nan"))
-
-        trial.set_user_attr("hold_sharpe", _f(hold_sharpe))
-        trial.set_user_attr("hold_ci_lo", _f(hold_ci_lo))
-        trial.set_user_attr("hold_ci_hi", _f(hold_ci_hi))
-        trial.set_user_attr("hold_dd", _f(hold_dd))
-        trial.set_user_attr("hold_hit", _f(hold_hit))
-        trial.set_user_attr("hold_ann_return", _f(hold_ann_return))
-        trial.set_user_attr("dev_sharpe", _f(dev_sharpe))
-        trial.set_user_attr("elapsed_s", elapsed)
-        trial.set_user_attr("error", "")
-
-        _print_trial_line(trial.number, n_trials, hold_sharpe, hold_ci_lo, hold_ci_hi, hold_dd, elapsed)
-
-        return _f(hold_sharpe) if pd.notna(hold_sharpe) else _PENALTY
-
-    return objective
-
-
-def _f(x) -> float:
-    """Safe float cast; NaN on failure."""
-    try:
-        v = float(x)
-        return v if pd.notna(v) else float("nan")
-    except (TypeError, ValueError):
-        return float("nan")
-
-
-def _print_trial_line(num, n, sharpe, ci_lo, ci_hi, dd, elapsed, error=""):
-    tag = f"[{num + 1:>3}/{n}]"
-    if error:
-        print(f"{tag} FAILED ({elapsed:.0f}s): {error}", flush=True)
-    else:
-        s = f"{sharpe:+.3f}" if pd.notna(sharpe) else "  nan "
-        lo = f"{ci_lo:+.3f}" if pd.notna(ci_lo) else "   nan"
-        hi = f"{ci_hi:+.3f}" if pd.notna(ci_hi) else "   nan"
-        d = f"{dd:+.2%}" if pd.notna(dd) else "   nan"
-        print(f"{tag} Sharpe={s}  CI=[{lo},{hi}]  DD={d}  ({elapsed:.0f}s)", flush=True)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Results → RefreshRequest body → curl command
+# curl / RefreshRequest body generation
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _to_refresh_request_body(params: dict, args: argparse.Namespace) -> dict:
-    """Convert best Optuna params to a RefreshRequest-compatible JSON body.
-
-    The body targets a production-scale run (n_tickers=None = full universe,
-    bootstrap_n=500 for honest CIs). The caller can override before posting.
-    """
+def _to_refresh_request_body(params: dict, cfg: HypersearchConfig) -> dict:
+    """Convert best Optuna params to a RefreshRequest-compatible JSON body."""
     horizons = [int(h) for h in params.get("horizons", "5").split(",")]
     sc = params.get("sector_cap_gross", "0.30")
     sector_cap_gross = None if sc == "none" else float(sc)
-
-    body: dict = {
+    return {
         "phase": 5,
-        # History — keep the tuning window; bump n_tickers for production
-        "start_date": args.start,
-        "end_date": args.end,
+        "start_date": cfg.start_date,
+        "end_date": cfg.end_date,
         "n_tickers": None,  # full universe for production run
-        "universe_sampling": args.universe_sampling,
+        "universe_sampling": cfg.universe_sampling,
         "horizons": horizons,
         "model": "gbm",
-        # GBM
         "gbm": {
             "num_leaves": params.get("num_leaves", 63),
             "learning_rate": round(params.get("learning_rate", 0.03), 6),
             "n_estimators": params.get("n_estimators", 800),
         },
-        # CV
         "cv": {
             "train_years": params.get("train_years", 3),
             "test_months": 6,
             "embargo_days": 25,
             "min_train_obs": 1000,
         },
-        "holdout_years": args.holdout_years,
-        # Portfolio
+        "holdout_years": cfg.holdout_years,
         "position_sizing": params.get("position_sizing", "vol_scaled"),
         "k_per_side_pct": round(params.get("k_per_side_pct", 0.15), 4),
         "leverage_per_side": round(params.get("leverage_per_side", 1.0), 4),
         "sector_cap_gross": sector_cap_gross,
         "min_trade_threshold": round(params.get("min_trade_threshold", 0.005), 6),
-        # Signal
         "ensemble_weighting": params.get("ensemble_weighting", "ic_ir"),
-        # Features
         "use_sector_features": params.get("use_sector_features", True),
         "use_tier2_features": params.get("use_tier2_features", True),
         "use_regime_features": params.get("use_regime_features", True),
         "beta_neutralise": params.get("beta_neutralise", False),
         "ranks_only": params.get("ranks_only", False),
-        # Meta-labelling
         "use_meta_labelling": params.get("use_meta_labelling", False),
         "meta_threshold": round(params.get("meta_threshold", 0.55), 4),
         "meta_mode": params.get("meta_mode", "binary"),
         "meta_conf_floor": round(params.get("meta_conf_floor", 0.5), 4),
         "meta_conf_cap": 1.0,
         "meta_walk_forward_folds": 1,
-        # Full bootstrap for production
         "bootstrap_n": 500,
         "bootstrap_method": "block",
     }
-    return body
 
 
 def _build_curl(body: dict, server_url: str) -> str:
@@ -347,225 +188,137 @@ def _build_curl(body: dict, server_url: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Results DataFrame
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def _build_results_df(study: optuna.Study) -> pd.DataFrame:
-    rows = []
-    for t in study.trials:
-        if t.state not in (optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.FAIL):
-            continue
-        row: dict = {"trial": t.number}
-        row.update(t.params)
-        row.update(t.user_attrs)
-        rows.append(row)
-    if not rows:
-        return pd.DataFrame()
-    df = pd.DataFrame(rows)
-    if "hold_sharpe" in df.columns:
-        df = df.sort_values("hold_sharpe", ascending=False, na_position="last").reset_index(drop=True)
-    return df
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Markdown report
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 def _write_md_report(
     study: optuna.Study,
-    df: pd.DataFrame,
+    rows: list[dict],
     out_md: Path,
-    args: argparse.Namespace,
+    cfg: HypersearchConfig,
     curl_cmd: str,
-    best_body: dict | None,
 ) -> None:
     import datetime
 
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    valid = df[df["error"].fillna("") == ""] if "error" in df.columns else df
+    valid = [r for r in rows if not r.get("error")]
     n_total = len(valid)
 
-    lines: list[str] = []
-    lines += [
-        f"# Hyperparameter Search Results",
-        f"",
+    lines: list[str] = [
+        "# Hyperparameter Search Results",
+        "",
         f"Generated: {now}  ",
         f"Study: `{study.study_name}`  ",
-        f"Universe: {args.n_tickers} tickers (`{args.universe_sampling}`), {args.start} → {args.end or 'today'}  ",
+        f"Universe: {cfg.n_tickers} tickers (`{cfg.universe_sampling}`), "
+        f"{cfg.start_date} → {cfg.end_date or 'today'}  ",
         f"Trials completed: {len(study.trials)} ({n_total} succeeded)  ",
-        f"Objective: maximise **holdout Sharpe** (last {args.holdout_years} years, never seen during tuning)  ",
-        f"",
+        "Objective: maximise **holdout Sharpe** "
+        f"(last {cfg.holdout_years} years, never seen during tuning)  ",
+        "",
+        "## Top 10 Configs",
+        "",
     ]
 
-    # ── Top 10 ──────────────────────────────────────────────────────────────
-    lines.append("## Top 10 Configs")
-    lines.append("")
-
-    if valid.empty:
+    if not valid:
         lines.append("_No successful trials._")
     else:
-        top10 = valid.head(10)
-        table_cols = [
-            ("Rank", None),
-            ("Sharpe", "hold_sharpe"),
-            ("CI lo", "hold_ci_lo"),
-            ("CI hi", "hold_ci_hi"),
-            ("Max DD", "hold_dd"),
-            ("Ann Ret", "hold_ann_return"),
-            ("Dev Sh", "dev_sharpe"),
-            ("Sizing", "position_sizing"),
-            ("Horizons", "horizons"),
-            ("Meta", "use_meta_labelling"),
-            ("Ranks", "ranks_only"),
-            ("s", "elapsed_s"),
+        top10 = valid[:10]
+        cols = [
+            ("Rank", None), ("Sharpe", "hold_sharpe"), ("CI lo", "hold_ci_lo"),
+            ("CI hi", "hold_ci_hi"), ("Max DD", "hold_dd"), ("Ann Ret", "hold_ann_return"),
+            ("Dev Sh", "dev_sharpe"), ("Sizing", "position_sizing"),
+            ("Horizons", "horizons"), ("Meta", "use_meta_labelling"),
+            ("Ranks", "ranks_only"), ("s", "elapsed_s"),
         ]
-        header = " | ".join(h for h, _ in table_cols)
-        sep = " | ".join("---" for _ in table_cols)
+        header = " | ".join(h for h, _ in cols)
+        sep = " | ".join("---" for _ in cols)
         lines += [f"| {header} |", f"| {sep} |"]
-        for rank, (_, row) in enumerate(top10.iterrows(), 1):
-            def fv(col):
+        for rank, row in enumerate(top10, 1):
+            def fv(col, r=row, rk=rank):
                 if col is None:
-                    return str(rank)
-                v = row.get(col, float("nan"))
+                    return str(rk)
+                v = r.get(col, float("nan"))
                 if col in ("hold_sharpe", "hold_ci_lo", "hold_ci_hi", "dev_sharpe"):
                     return f"{v:+.3f}" if pd.notna(v) else "nan"
                 if col in ("hold_dd", "hold_ann_return"):
                     return f"{v:+.1%}" if pd.notna(v) else "nan"
                 if col == "elapsed_s":
-                    return f"{v:.0f}s" if pd.notna(v) else "nan"
+                    return f"{int(v)}s" if pd.notna(v) else "nan"
                 return str(v) if pd.notna(v) else "nan"
-            cells = " | ".join(fv(col) for _, col in table_cols)
+            cells = " | ".join(fv(col) for _, col in cols)
             lines.append(f"| {cells} |")
         lines.append("")
 
-    # ── Honest interpretation ────────────────────────────────────────────────
-    lines.append("## Honest Interpretation")
-    lines.append("")
-    if not valid.empty:
-        best_row = valid.iloc[0]
-        s = best_row.get("hold_sharpe", float("nan"))
-        lo = best_row.get("hold_ci_lo", float("nan"))
-        hi = best_row.get("hold_ci_hi", float("nan"))
-        t = int(best_row.get("trial", -1))
-
-        n_pos_ci = int((valid["hold_ci_lo"] > 0).sum()) if "hold_ci_lo" in valid.columns else 0
-        n_straddle = int(
-            ((valid["hold_ci_lo"] <= 0) & (valid["hold_ci_hi"] >= 0)).sum()
-        ) if "hold_ci_lo" in valid.columns and "hold_ci_hi" in valid.columns else 0
-
-        sig = valid[valid["hold_ci_lo"] > 0] if "hold_ci_lo" in valid.columns else pd.DataFrame()
+    # Honest interpretation
+    lines += ["## Honest Interpretation", ""]
+    if valid:
+        best = valid[0]
+        s = best.get("hold_sharpe", float("nan"))
+        lo = best.get("hold_ci_lo", float("nan"))
+        hi = best.get("hold_ci_hi", float("nan"))
+        n_pos_ci = sum(1 for r in valid if (r.get("hold_ci_lo") or float("nan")) > 0)
+        n_straddle = sum(
+            1 for r in valid
+            if (r.get("hold_ci_lo") or float("nan")) <= 0
+            and (r.get("hold_ci_hi") or float("nan")) >= 0
+        )
+        sig = [r for r in valid if (r.get("hold_ci_lo") or float("nan")) > 0]
         lines += [
-            f"- **Best point estimate**: Sharpe = `{s:+.3f}` (trial {t})",
+            f"- **Best point estimate**: Sharpe = `{s:+.3f}` (trial {best.get('trial', '?')})",
             f"  95% block-bootstrap CI: [`{lo:+.3f}`, `{hi:+.3f}`]",
-            f"- Configs with CI **strictly > 0** (statistically real edge): **{n_pos_ci} / {n_total}**",
-            f"- Configs with CI straddling zero (could be noise): {n_straddle} / {n_total}",
+            f"- Configs with CI **strictly > 0** (real edge): **{n_pos_ci} / {n_total}**",
+            f"- Configs with CI straddling zero (noise): {n_straddle} / {n_total}",
         ]
-        if not sig.empty:
-            bs = sig.iloc[0]
+        if sig:
+            bs = sig[0]
             lines.append(
-                f"- **Best config with CI > 0**: trial {int(bs.get('trial', -1))}, "
+                f"- **Best config with CI > 0**: trial {bs.get('trial', '?')}, "
                 f"Sharpe = `{bs.get('hold_sharpe', float('nan')):+.3f}` "
-                f"CI = [`{bs.get('hold_ci_lo', float('nan')):+.3f}`, `{bs.get('hold_ci_hi', float('nan')):+.3f}`]"
+                f"CI = [`{bs.get('hold_ci_lo', float('nan')):+.3f}`, "
+                f"`{bs.get('hold_ci_hi', float('nan')):+.3f}`]"
             )
         else:
             lines.append("- **Best config with CI > 0**: _none — no statistically reliable edge found_")
-        lines.append("")
-        lines.append(
-            "> The CI is computed on a small, fast-mode universe. "
-            "Validate the best config on the full S&P 500 universe before drawing conclusions."
-        )
+        lines += [
+            "",
+            "> CI computed on a fast-mode universe. Validate the best config on the full "
+            "S&P 500 before drawing conclusions.",
+        ]
     else:
-        lines += ["_No successful trials to interpret._"]
+        lines.append("_No successful trials to interpret._")
     lines.append("")
 
-    # ── Best config parameters ───────────────────────────────────────────────
-    lines.append("## Best Config Parameters")
-    lines.append("")
-    try:
-        best_params = study.best_trial.params
-        lines.append("```json")
-        lines.append(json.dumps(best_params, indent=2, default=str))
-        lines.append("```")
-    except ValueError:
+    # Best config JSON
+    lines += ["## Best Config Parameters", ""]
+    best_params = best_trial_params(study)
+    if best_params:
+        lines += ["```json", json.dumps(best_params, indent=2, default=str), "```"]
+    else:
         lines.append("_No successful trials._")
     lines.append("")
 
-    # ── Curl command ─────────────────────────────────────────────────────────
-    lines.append("## Queue This Run on the Server")
-    lines.append("")
+    # Curl command
     lines += [
-        "POST to `/jobs/queue` (no auth required — queues for later password-protected launch):",
+        "## Queue This Run on the Server",
+        "",
+        "POST to `/jobs/queue` (no auth required):",
         "",
         "```bash",
         curl_cmd,
         "```",
         "",
-        "Then launch the queued job with the `X-Password` header:",
+        "Then launch the queued job:",
         "```bash",
-        "# 1. Get the queue_id from the response above, then:",
         "curl -X POST \\",
-        f"  '{args.server_url.rstrip('/')}/jobs/run/<queue_id>' \\",
-        "  -H 'X-Password: <your-password>'",
+        f"  '{cfg.start_date}' \\",
+        "  # Replace with: POST /jobs/run/<queue_id>  -H 'X-Password: <your-password>'",
         "```",
         "",
-        "> **Note:** `n_tickers` is set to `null` (full universe) in the command above.",
-        "> The tuning was done on a {}-ticker sample. Full-universe results will differ.".format(args.n_tickers),
+        f"> `n_tickers` is set to `null` (full universe). "
+        f"Tuning was done on {cfg.n_tickers} tickers.",
+        "",
     ]
-    lines.append("")
-
-    # ── Full results table ───────────────────────────────────────────────────
-    if not df.empty:
-        lines.append("## All Trials")
-        lines.append("")
-        lines.append("_Sorted by holdout Sharpe descending._")
-        lines.append("")
-
-        all_cols = [
-            ("Trial", "trial"),
-            ("Sharpe", "hold_sharpe"),
-            ("CI lo", "hold_ci_lo"),
-            ("CI hi", "hold_ci_hi"),
-            ("DD", "hold_dd"),
-            ("Dev Sh", "dev_sharpe"),
-            ("Sizing", "position_sizing"),
-            ("Hz", "horizons"),
-            ("Ens", "ensemble_weighting"),
-            ("T2", "use_tier2_features"),
-            ("Reg", "use_regime_features"),
-            ("Meta", "use_meta_labelling"),
-            ("Rnk", "ranks_only"),
-            ("Meta thr", "meta_threshold"),
-            ("Leaves", "num_leaves"),
-            ("LR", "learning_rate"),
-            ("k%", "k_per_side_pct"),
-            ("Lev", "leverage_per_side"),
-        ]
-        avail = [(h, c) for h, c in all_cols if c in df.columns]
-        header = " | ".join(h for h, _ in avail)
-        sep = " | ".join("---" for _ in avail)
-        lines += [f"| {header} |", f"| {sep} |"]
-
-        for _, row in df.iterrows():
-            def fv2(col):
-                v = row.get(col, float("nan"))
-                if col in ("hold_sharpe", "hold_ci_lo", "hold_ci_hi", "dev_sharpe"):
-                    return f"{v:+.3f}" if pd.notna(v) else "nan"
-                if col == "hold_dd":
-                    return f"{v:+.1%}" if pd.notna(v) else "nan"
-                if col in ("k_per_side_pct", "leverage_per_side"):
-                    return f"{v:.3f}" if pd.notna(v) else "nan"
-                if col == "learning_rate":
-                    return f"{v:.4f}" if pd.notna(v) else "nan"
-                if col in ("meta_threshold",):
-                    return f"{v:.3f}" if pd.notna(v) else "nan"
-                if col in ("use_tier2_features", "use_regime_features", "use_meta_labelling", "ranks_only"):
-                    return "Y" if v else "N"
-                return str(v) if pd.notna(v) else "nan"
-            cells = " | ".join(fv2(col) for _, col in avail)
-            lines.append(f"| {cells} |")
-        lines.append("")
 
     out_md.parent.mkdir(parents=True, exist_ok=True)
     out_md.write_text("\n".join(lines), encoding="utf-8")
@@ -576,72 +329,57 @@ def _write_md_report(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _print_console_summary(study: optuna.Study, df: pd.DataFrame, curl_cmd: str) -> None:
+def _print_summary(study: optuna.Study, rows: list[dict], curl_cmd: str) -> None:
     print()
     print("=" * 100)
     print("Hyperparameter search — results")
     print("=" * 100)
 
-    valid = df[df["error"].fillna("") == ""] if "error" in df.columns else df
-    if valid.empty:
+    valid = [r for r in rows if not r.get("error")]
+    if not valid:
         print("No completed trials.")
         return
 
     n_total = len(valid)
-    display_cols = [c for c in [
-        "trial", "hold_sharpe", "hold_ci_lo", "hold_ci_hi", "hold_dd",
-        "dev_sharpe", "position_sizing", "horizons", "ensemble_weighting",
-        "use_meta_labelling", "ranks_only", "elapsed_s",
-    ] if c in valid.columns]
-
+    cols = ["trial", "hold_sharpe", "hold_ci_lo", "hold_ci_hi", "hold_dd",
+            "dev_sharpe", "position_sizing", "horizons", "use_meta_labelling",
+            "ranks_only", "elapsed_s"]
+    df = pd.DataFrame(valid)
+    disp_cols = [c for c in cols if c in df.columns]
     fmt = {}
     for c in ["hold_sharpe", "hold_ci_lo", "hold_ci_hi", "dev_sharpe"]:
-        if c in valid.columns:
+        if c in df.columns:
             fmt[c] = lambda x: f"{x:+.3f}" if pd.notna(x) else "  nan"
-    if "hold_dd" in valid.columns:
+    if "hold_dd" in df.columns:
         fmt["hold_dd"] = lambda x: f"{x:+.2%}" if pd.notna(x) else "  nan"
 
-    print(f"\nTop {min(10, len(valid))} configs (by holdout Sharpe):\n")
-    print(valid.head(10)[display_cols].to_string(index=False, formatters=fmt))
+    print(f"\nTop {min(10, len(df))} configs (by holdout Sharpe):\n")
+    print(df.head(10)[disp_cols].to_string(index=False, formatters=fmt))
 
-    n_pos_ci = int((valid["hold_ci_lo"] > 0).sum()) if "hold_ci_lo" in valid.columns else 0
-    n_straddle = int(
-        ((valid["hold_ci_lo"] <= 0) & (valid["hold_ci_hi"] >= 0)).sum()
-    ) if "hold_ci_lo" in valid.columns and "hold_ci_hi" in valid.columns else 0
-
-    best = valid.iloc[0]
-    s, lo, hi, t = (
-        best.get("hold_sharpe", float("nan")),
-        best.get("hold_ci_lo", float("nan")),
-        best.get("hold_ci_hi", float("nan")),
-        int(best.get("trial", -1)),
-    )
-    sig = valid[valid["hold_ci_lo"] > 0] if "hold_ci_lo" in valid.columns else pd.DataFrame()
+    best = valid[0]
+    s, lo, hi = (best.get("hold_sharpe", float("nan")),
+                 best.get("hold_ci_lo", float("nan")),
+                 best.get("hold_ci_hi", float("nan")))
+    n_pos_ci = sum(1 for r in valid if (r.get("hold_ci_lo") or float("nan")) > 0)
+    sig = [r for r in valid if (r.get("hold_ci_lo") or float("nan")) > 0]
 
     print()
     print("Honest interpretation:")
-    print(f"  Best point estimate  : Sharpe={s:+.3f}  CI=[{lo:+.3f}, {hi:+.3f}]  (trial {t})")
-    print(f"  CI > 0 (real edge)   : {n_pos_ci} / {n_total}")
-    print(f"  CI straddles zero    : {n_straddle} / {n_total}")
-    if not sig.empty:
-        bs = sig.iloc[0]
-        print(
-            f"  Best w/ CI > 0       : trial {int(bs.get('trial', -1))}, "
-            f"Sharpe={bs.get('hold_sharpe', float('nan')):+.3f}"
-        )
+    print(f"  Best estimate   : Sharpe={s:+.3f}  CI=[{lo:+.3f}, {hi:+.3f}]")
+    print(f"  CI > 0 (real)   : {n_pos_ci} / {n_total}")
+    if sig:
+        print(f"  Best w/ CI > 0  : trial {sig[0].get('trial', '?')}, Sharpe={sig[0].get('hold_sharpe', float('nan')):+.3f}")
     else:
-        print("  Best w/ CI > 0       : NONE")
+        print("  Best w/ CI > 0  : NONE")
     print()
 
-    try:
-        best_params = study.best_trial.params
+    best_params = best_trial_params(study)
+    if best_params:
         print("Best config parameters:")
         print(json.dumps(best_params, indent=2, default=str))
         print()
-    except ValueError:
-        pass
 
-    print("Queue this config on the server:")
+    print("Queue on server:")
     print(curl_cmd)
     print()
 
@@ -671,17 +409,20 @@ def main() -> int:
     out_csv = REPORTS_DIR / f"{study_name}_n{args.n_tickers}_{args.start[:4]}.csv"
     out_md = REPORTS_DIR / f"{study_name}_n{args.n_tickers}_{args.start[:4]}.md"
 
-    print(f"Hyperparameter search — {args.n_trials} trials")
-    print(f"  universe : {args.n_tickers} tickers ({args.universe_sampling}), {args.start} → {args.end or 'today'}")
-    print(f"  holdout  : {args.holdout_years} years   bootstrap_n={args.bootstrap_n}")
-    print(f"  study    : {study_name}")
-    if args.storage:
-        print(f"  storage  : {args.storage}")
-    print(f"  CSV      : {out_csv}")
-    print(f"  Report   : {out_md}")
-    print()
+    cfg = HypersearchConfig(
+        n_trials=args.n_trials,
+        n_tickers=args.n_tickers,
+        start_date=args.start,
+        end_date=args.end,
+        holdout_years=args.holdout_years,
+        bootstrap_n=args.bootstrap_n,
+        universe_sampling=args.universe_sampling,
+        seed=args.seed,
+    )
 
+    # Create or load Optuna study
     sampler = optuna.samplers.TPESampler(seed=args.seed)
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
     study = optuna.create_study(
         direction="maximize",
         sampler=sampler,
@@ -690,30 +431,41 @@ def main() -> int:
         load_if_exists=True,
     )
 
+    print(f"Hyperparameter search — {args.n_trials} trials")
+    print(f"  universe : {args.n_tickers} tickers ({args.universe_sampling}), "
+          f"{args.start} → {args.end or 'today'}")
+    print(f"  holdout  : {args.holdout_years} years   bootstrap_n={args.bootstrap_n}")
+    print(f"  study    : {study_name}")
+    if args.storage:
+        print(f"  storage  : {args.storage}")
+    print(f"  CSV      : {out_csv}")
+    print(f"  Report   : {out_md}")
+    print()
+
+    on_trial_done = _make_on_trial_done(args.n_trials)
+
     try:
-        study.optimize(make_objective(args), n_trials=args.n_trials, show_progress_bar=False)
+        run_hypersearch(cfg, on_trial_done=on_trial_done, study=study)
     except KeyboardInterrupt:
         print("\nInterrupted — saving partial results.")
 
-    df = _build_results_df(study)
+    rows = trials_to_records(study)
 
-    # Generate curl command from best params
-    try:
-        best_params = study.best_trial.params
-        best_body = _to_refresh_request_body(best_params, args)
+    best_params = best_trial_params(study)
+    if best_params:
+        best_body = _to_refresh_request_body(best_params, cfg)
         curl_cmd = _build_curl(best_body, args.server_url)
-    except ValueError:
-        best_params = {}
+    else:
         best_body = None
         curl_cmd = "# no successful trials"
 
-    _print_console_summary(study, df, curl_cmd)
+    _print_summary(study, rows, curl_cmd)
 
-    if not df.empty:
-        df.to_csv(out_csv, index=False)
+    if rows:
+        pd.DataFrame(rows).to_csv(out_csv, index=False)
         print(f"CSV saved : {out_csv}")
 
-    _write_md_report(study, df, out_md, args, curl_cmd, best_body)
+    _write_md_report(study, rows, out_md, cfg, curl_cmd)
     print(f"Report    : {out_md}")
 
     return 0

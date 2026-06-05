@@ -88,6 +88,7 @@ export interface JobResponse {
 export interface JobDetail {
   job_id: string;
   status: string;
+  job_type: "pipeline" | "hypersearch";
   started_at: string | null;
   updated_at: string | null;
   config: Record<string, unknown>;
@@ -95,6 +96,46 @@ export interface JobDetail {
   run_id: number | null;
   elapsed_s: number | null;
   error: string | null;
+}
+
+export interface HypersearchRequest {
+  n_trials?: number;
+  n_tickers?: number;
+  start_date?: string;
+  end_date?: string | null;
+  holdout_years?: number;
+  bootstrap_n?: number;
+  universe_sampling?: "current" | "first" | "random";
+  seed?: number;
+}
+
+export interface HypersearchTrial {
+  trial: number;
+  value: number | null;
+  hold_sharpe: number | null;
+  hold_ci_lo: number | null;
+  hold_ci_hi: number | null;
+  hold_dd: number | null;
+  hold_hit: number | null;
+  hold_ann_return: number | null;
+  dev_sharpe: number | null;
+  elapsed_s: number | null;
+  error: string | null;
+  params: Record<string, unknown>;
+}
+
+export interface HypersearchRun {
+  id: number;
+  job_id: string | null;
+  started_at: string;
+  completed_at: string | null;
+  status: string;
+  config: Record<string, unknown>;
+  n_trials_requested: number;
+  n_trials_done: number;
+  best_sharpe: number | null;
+  best_params: Record<string, unknown> | null;
+  trials: HypersearchTrial[];
 }
 
 export interface QueuedJob {
