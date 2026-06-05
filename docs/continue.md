@@ -32,6 +32,7 @@ Each phase commit is on `main`. `git log --oneline` shows them in reverse order.
 | 9 | DONE | −0.57 (made things worse) | [−1.03, −0.15] | Confidence sizing + walk-forward meta-CV + per-sector meta. Real code-rigor improvements but did not improve backtest. Best remains Phase 8. |
 | 10 | DONE | **+0.08** (confidence floor=0.60); −0.16 (binary) | [−0.38, +0.49] (best); [−0.67, +0.29] (binary) | Confidence-floor sweep on Phase 8 best config. Hypothesis confirmed: high floor (≥ 0.55) DOES recover Phase-8-like behavior; default Phase 9 floor=0.50 was the regression. **Best point estimate** at floor=0.60 (+0.077) but CI still straddles zero. NO config has CI strictly above zero. Reproducibility ✓: binary baseline matched documented Phase 8 (−0.158 vs −0.16); floor=0.50 matched documented Phase 9 (−0.570 vs −0.57). Reviewer caught C1 (baseline drift risk) + H1 (dead CLI flag) + 3 MED; all fixed. |
 | 11 | DONE | **−0.11** (drop bottom 25%); −0.16 (baseline); −0.19 (drop top 25%) | [−0.58, +0.38] / [−0.67, +0.29] / [−0.63, +0.24] | Feature pruning via per_feature_audit on big universe (20 features, all positive `pct_drop` — no leak suspects). Driver: `scripts/phase11_feature_pruning.py`. Pipeline hook: `PipelineV5Config.feature_exclude`. Dropped 5 lowest-impact features (adv_proxy_21, dist_low_252_rank, ret_252d_rank, kurt_63, dist_low_252) → marginally better point estimate (+0.048 vs baseline) AND smaller DD (−13.2% vs −16.0%). Sanity check passes: dropping top 5 (vol_21d, vol_21d_rank, vol_63d_rank, kurt_63_rank, macd_signal) made things worse. Still NO config CI strictly above zero. Honest top-line unchanged. 4 new tests + RSS logging added. |
+| 12 | INFRA DONE; PRODUCTION SMOKE RUNNING | TBD | TBD | SEC EDGAR 8-K event features wired in. New module `src/stockpred/data/edgar.py` (free, no API key, respects SEC's 10 req/sec rate limit + User-Agent rule). New flag `--edgar-events` on `run_phase5.py`. Pipeline hook: `PipelineV5Config.use_edgar_features`. Reviewer caught 2 CRITICAL + 1 HIGH + 1 production-smoke regression (alternate "File Name" vs "Filename" header spelling in 2014 form indexes); all fixed. 22 tests passing (including P&G multi-space-name regression, weekend-filing forward-shift, cache poisoning, alternate header spelling). RAM impact on tiny smoke (40 ticker × 3yr): 0.38 GB peak (well under 6 GB budget). |
 
 **Best honest config (Phase 11; supersedes Phase 8)**:
 ```bash
@@ -196,13 +197,13 @@ Next candidates:
    `ret_252d_rank`, `kurt_63`, `dist_low_252`. Subsequent phases should
    layer on TOP of this pruned baseline via the new `feature_exclude`
    config field.
-2. **Phase 12 — EDGAR 8-K event flags as features** *(user requested
-   2026-06-04, news-as-features path; promoted from Phase 16)*: free
-   historical event flags (8-K filed today: Y/N) from SEC EDGAR's free
-   JSON API. Binary daily per-ticker feature plus rolling event-count
-   features (8-K events in last 5/21/63 days). Most-defensible news
-   source: full historical coverage, no sentiment-model dependency, no
-   selection bias. Honest expectation: small effect if any.
+2. **Phase 12 — EDGAR 8-K event flags as features** *(INFRA DONE;
+   production smoke running as of this commit)*: see ledger row 12.
+   Module: `src/stockpred/data/edgar.py`. CLI: `--edgar-events`.
+   Features (all under `edgar_` prefix, kept by `--ranks-only`):
+   `has_8k` (int8), `count_8k_5d/21d/63d` (int16). Pipeline integration
+   uses `PipelineV5Config.use_edgar_features=True`. Production sweep
+   pending; will land in follow-up commit.
 3. **Phase 13 — GDELT tone + event counts** *(user requested
    2026-06-04)*: free GDELT 2.0 GKG (Global Knowledge Graph) per-ticker
    daily tone score and theme counts, historical to 2015. Adds
@@ -323,6 +324,18 @@ is not done — fix BEFORE updating the ledger.
   floor=0.60 giving the best point estimate (+0.077) but a CI that
   still straddles zero. If you ship a default, ship floor=0.60; do not
   ship floor=0.50.
+- EDGAR form.idx header has two known spellings: "Filename" (post-2015)
+  and "File Name" with a space (2014 and earlier). The parser accepts
+  either; deleting `data/cache/edgar/*.parquet` forces a re-fetch with
+  the latest parser. Set env `EDGAR_USER_AGENT="Name email"` for
+  production deploys so SEC has someone to contact if your traffic
+  becomes problematic.
+- yfinance returns `datetime64[us]` for trading-day indexes; some other
+  free data sources return `datetime64[ms]`. `merge_asof` is strict
+  about matching dtypes and raises "incompatible merge keys" without
+  explicit casts. Any new data-source module should `.astype("datetime64[ns]")`
+  both sides before merging. EDGAR module does this; future sources
+  must too.
 
 ## Sub-agent dispatch pattern (proven to find real bugs)
 

@@ -389,6 +389,19 @@ def test_parse_idx_header_finds_known_field_starts():
     assert header[starts[4] : starts[4] + len("Filename")] == "Filename"
 
 
+def test_parse_idx_header_accepts_alternate_filename_spelling():
+    """REGRESSION (Phase 12 production smoke): SEC's 2014 form.idx files
+    use 'File Name' (with space) instead of 'Filename'. Both must parse."""
+    header_2014 = (
+        "Form Type   Company Name                                                  "
+        "CIK         Date Filed  File Name"
+    )
+    starts = edgar._parse_idx_header(header_2014)
+    assert len(starts) == 5
+    # Last field should land on the "F" of "File Name"
+    assert header_2014[starts[4] : starts[4] + len("File Name")] == "File Name"
+
+
 def test_parse_idx_header_missing_field_raises():
     """A header without one of the expected fields raises ValueError."""
     with pytest.raises(ValueError, match="not found"):

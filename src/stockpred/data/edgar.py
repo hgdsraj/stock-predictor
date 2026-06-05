@@ -307,12 +307,23 @@ def _parse_idx_header(header_line: str) -> list[int]:
     The header line looks like (variable widths across years):
         "Form Type        Company Name      CIK   Date Filed  Filename"
 
+    Some years (e.g. 2014) instead use "File Name" with a space.
+    We accept either spelling for the last field.
+
     We locate the start index of each of the 5 named fields and return
     them as `[0, company_start, cik_start, date_start, filename_start]`.
     The 0 is included so the first slice `[0:company_start]` carves out
     the Form Type column.
     """
-    fields = ("Form Type", "Company Name", "CIK", "Date Filed", "Filename")
+    # The last field has two known spellings (year-dependent). Match
+    # whichever is present in this header line.
+    if "Filename" in header_line:
+        last_field = "Filename"
+    elif "File Name" in header_line:
+        last_field = "File Name"
+    else:
+        raise ValueError(f"Header field 'Filename' or 'File Name' not found in {header_line!r}")
+    fields = ("Form Type", "Company Name", "CIK", "Date Filed", last_field)
     starts: list[int] = []
     cursor = 0
     for field in fields:

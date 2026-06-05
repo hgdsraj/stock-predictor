@@ -385,42 +385,85 @@ features.
 
 ---
 
-## 6c. News features (Phase 12–14 roadmap, planned)
+## 6c. News features (Phase 12–14)
 
-**None of this is implemented yet** — these sections are documented
-in advance per the project's docs-in-sync rule (user direction
-2026-06-04) so that when the code lands, the CLI and `curl` recipes
-are already written.
-
-### Phase 12 — SEC EDGAR 8-K event flags
+### Phase 12 — SEC EDGAR 8-K event flags  *(IMPLEMENTED)*
 
 8-K is the SEC form a public company files when a "material event"
 happens (CEO change, earnings pre-release, M&A, etc.). Free, full
 historical coverage from 2001, no API key.
 
-**Required `curl` headers** (SEC enforces a User-Agent rule):
-
 ```bash
-# Generic ticker -> CIK mapping (one-shot)
-curl -A "stockpred-research raj.axisos@gmail.com" \
-    -o data/cache/edgar/ticker_to_cik.json \
-    https://www.sec.gov/files/company_tickers.json
+# Quick smoke test (40 tickers x 3 years) — completes in ~50 sec
+uv run python scripts/run_phase5.py \
+    --start 2022-01-01 --end 2024-12-31 --n-tickers 40 --horizons 5 \
+    --weighting equal --position-sizing hrp \
+    --k-pct 0.15 --sector-cap 0.30 --min-trade-threshold 0.005 \
+    --holdout-years 1 --no-sector --no-regime --no-tier2 \
+    --universe-sampling current --bootstrap-method block \
+    --meta-labelling --meta-threshold 0.55 --ranks-only \
+    --edgar-events --bootstrap-n 50
 
-# Quarterly form index (one per qtr, ~2 MB each)
-curl -A "stockpred-research raj.axisos@gmail.com" \
-    -o data/cache/edgar/form_2024Q1.idx \
-    https://www.sec.gov/Archives/edgar/full-index/2024/QTR1/form.idx
+# Production (150 tickers x 11 years)
+uv run python scripts/run_phase5.py \
+    --start 2014-01-01 --end 2024-12-31 --n-tickers 150 \
+    [...same flags...] \
+    --edgar-events
 ```
 
-The agent will write `src/stockpred/data/edgar.py` to do this in
-Python (with rate-limiting per SEC's 10 req/s policy) and cache the
-result as gzipped parquet so the pipeline never re-downloads.
+Adds 4 features per (date, ticker):
+- `edgar_has_8k`        (int8)  1 if 8-K filed on this trading day
+- `edgar_count_8k_5d`   (int16) rolling 5-trading-day count
+- `edgar_count_8k_21d`  (int16) rolling 21-trading-day count
+- `edgar_count_8k_63d`  (int16) rolling 63-trading-day count
 
-Planned CLI flags (on `run_phase5.py`):
+The `edgar_` prefix is recognised by `--ranks-only` so these
+discrete event-count features are kept (they have no `_rank`
+counterpart by design — counts don't need cross-sectional ranking).
 
-- `--edgar-events`: enable 8-K daily event flag + rolling counts
-  (5/21/63-day) as per-ticker features.
-- `--edgar-cache-dir data/cache/edgar`: where the parquet caches live.
+**SEC compliance is mandatory.** SEC requires a User-Agent header
+identifying you and rate-limits at 10 req/sec. We default to:
+
+```bash
+export EDGAR_USER_AGENT="Your Name your-email@example.com"
+```
+
+If you don't set it, requests use a generic UA `stock-predictor/0.2
+(raj.axisos@gmail.com)` which SEC may rate-limit harder if many
+unrelated users share it.
+
+**Equivalent `curl` recipes** (if you want to fetch caches manually
+before running the pipeline):
+
+```bash
+UA="Your Name your-email@example.com"
+mkdir -p data/cache/edgar
+
+# Ticker -> CIK mapping (one-shot, ~3 MB)
+curl -A "$UA" -o data/cache/edgar/ticker_to_cik.json \
+    https://www.sec.gov/files/company_tickers.json
+
+# Per-quarter form index (~2 MB each, one per qtr from 2014 onward)
+for YEAR in 2014 2015 2016 2017 2018 2019 2020 2021 2022 2023 2024; do
+  for QTR in 1 2 3 4; do
+    curl -A "$UA" \
+        -o data/cache/edgar/form_${YEAR}Q${QTR}.idx \
+        "https://www.sec.gov/Archives/edgar/full-index/${YEAR}/QTR${QTR}/form.idx"
+    sleep 0.2   # be nice to SEC
+  done
+done
+```
+
+(The pipeline will re-parse these into per-quarter parquet caches at
+`data/cache/edgar/8k_<YYYY>Q<n>.parquet` on the first `--edgar-events`
+run.)
+
+**Storage**: ~30 KB per quarter parquet × 44 quarters ≈ 1.3 MB on
+disk. RAM impact at backtest: <100 MB peak for 150 tickers × 11 yr.
+
+**Honest expectations**: 8-K events are sparse (most companies file
+2-5 per year). Sharpe lift, if any, will be small. Run the full
+production sweep + bootstrap CI before claiming a result.
 
 ### Phase 13 — GDELT 2.0 tone + theme counts
 
