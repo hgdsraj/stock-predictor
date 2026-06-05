@@ -1,19 +1,8 @@
 import { useState, useRef, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
-  Play,
-  Trash2,
-  XCircle,
-  Plus,
-  ChevronDown,
-  ChevronUp,
-  RefreshCw,
-  Clock,
-  CheckCircle,
-  AlertCircle,
-  Loader2,
-  ExternalLink,
-  Copy,
+  Play, Trash2, XCircle, Plus, ChevronDown, ChevronUp, RefreshCw,
+  Clock, CheckCircle, AlertCircle, Loader2, ExternalLink, Copy,
 } from "lucide-react";
 import { api } from "@/api/client";
 import type { JobDetail, QueuedJob } from "@/api/types";
@@ -21,50 +10,43 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { cn } from "@/lib/cn";
 
-// ─── helpers ────────────────────────────────────────────────────────────────
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function JobIdCell({ jobId, onClick }: { jobId: string; onClick?: () => void }) {
   const [copied, setCopied] = useState(false);
   function copy(e: React.MouseEvent) {
     e.stopPropagation();
-    navigator.clipboard.writeText(jobId).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    });
+    navigator.clipboard.writeText(jobId).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500); });
   }
   return (
     <span className="flex items-center gap-1 font-mono text-xs">
-      <button onClick={onClick} className="hover:underline" title={jobId}>
-        {jobId.slice(0, 8)}…
-      </button>
+      <button onClick={onClick} className="hover:underline" title={jobId}>{jobId.slice(0, 8)}…</button>
       <button onClick={copy} title="Copy full ID" className="text-muted-foreground hover:text-foreground">
         {copied ? <CheckCircle className="h-3 w-3 text-green-500" /> : <Copy className="h-3 w-3" />}
       </button>
-      <a
-        href={`/jobs/${jobId}`}
-        target="_blank"
-        rel="noopener noreferrer"
-        title="Open raw JSON"
-        onClick={e => e.stopPropagation()}
-        className="text-muted-foreground hover:text-foreground"
-      >
+      <a href={`/jobs/${jobId}`} target="_blank" rel="noopener noreferrer" title="Open raw JSON"
+        onClick={e => e.stopPropagation()} className="text-muted-foreground hover:text-foreground">
         <ExternalLink className="h-3 w-3" />
       </a>
     </span>
   );
 }
 
+function detectPhase(config: Record<string, unknown>): number {
+  if (config.phase != null) return config.phase as number;
+  return "k_per_side_pct" in config || "position_sizing" in config ? 5 : 1;
+}
+
 function statusBadge(status: string) {
   const map: Record<string, { cls: string; icon: React.ReactNode; label: string }> = {
     queued:     { cls: "bg-yellow-100 text-yellow-800 dark:bg-yellow-900/40 dark:text-yellow-300", icon: <Clock className="h-3 w-3" />, label: "Queued" },
-    running:    { cls: "bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300",    icon: <Loader2 className="h-3 w-3 animate-spin" />, label: "Running" },
-    cancelling: { cls: "bg-orange-100 text-orange-800 dark:bg-orange-900/40 dark:text-orange-300", icon: <Loader2 className="h-3 w-3 animate-spin" />, label: "Cancelling" },
-    ok:         { cls: "bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300", icon: <CheckCircle className="h-3 w-3" />, label: "Completed" },
-    failed:     { cls: "bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300",        icon: <AlertCircle className="h-3 w-3" />, label: "Failed" },
-    crashed:    { cls: "bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300",        icon: <AlertCircle className="h-3 w-3" />, label: "Crashed" },
-    cancelled:  { cls: "bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400",       icon: <XCircle className="h-3 w-3" />, label: "Cancelled" },
+    running:    { cls: "bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300",         icon: <Loader2 className="h-3 w-3 animate-spin" />, label: "Running" },
+    cancelling: { cls: "bg-orange-100 text-orange-800 dark:bg-orange-900/40 dark:text-orange-300", icon: <Loader2 className="h-3 w-3 animate-spin" />, label: "Cancelling…" },
+    ok:         { cls: "bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300",     icon: <CheckCircle className="h-3 w-3" />, label: "Completed" },
+    failed:     { cls: "bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300",             icon: <AlertCircle className="h-3 w-3" />, label: "Failed" },
+    crashed:    { cls: "bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300",             icon: <AlertCircle className="h-3 w-3" />, label: "Crashed" },
+    cancelled:  { cls: "bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400",            icon: <XCircle className="h-3 w-3" />, label: "Cancelled" },
     pending:    { cls: "bg-yellow-100 text-yellow-800 dark:bg-yellow-900/40 dark:text-yellow-300", icon: <Clock className="h-3 w-3" />, label: "Pending" },
-    launched:   { cls: "bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300",    icon: <Play className="h-3 w-3" />, label: "Launched" },
   };
   const s = map[status] ?? { cls: "bg-gray-100 text-gray-600", icon: null, label: status };
   return (
@@ -74,92 +56,47 @@ function statusBadge(status: string) {
   );
 }
 
-function fmtDuration(seconds: number | null | undefined): string {
-  if (seconds == null) return "—";
-  const m = Math.floor(seconds / 60);
-  const s = Math.floor(seconds % 60);
-  return m > 0 ? `${m}m ${s}s` : `${s}s`;
+function fmtDuration(s: number | null | undefined) {
+  if (s == null) return "—";
+  const m = Math.floor(s / 60); const sec = Math.floor(s % 60);
+  return m > 0 ? `${m}m ${sec}s` : `${sec}s`;
 }
-
-function fmtElapsed(startedAt: string | null | undefined): string {
+function fmtElapsed(startedAt: string | null | undefined) {
   if (!startedAt) return "—";
-  const diff = (Date.now() - new Date(startedAt).getTime()) / 1000;
-  return fmtDuration(diff);
+  return fmtDuration((Date.now() - new Date(startedAt).getTime()) / 1000);
 }
-
-function fmtTs(ts: string | null | undefined): string {
-  if (!ts) return "—";
-  return new Date(ts).toLocaleString();
-}
+function fmtTs(ts: string | null | undefined) { return ts ? new Date(ts).toLocaleString() : "—"; }
 
 function estimateTotalSeconds(config: Record<string, unknown>): number {
-  const phase = (config.phase as number) ?? 1;
-  // null n_tickers means full S&P 500 universe (~500 tickers)
+  const phase = detectPhase(config);
   const nTickers = config.n_tickers as number | null;
   const effective = nTickers ?? 500;
   const base = phase === 5 ? 7200 : 3600;
   return base * (effective / 500);
 }
 
-function detectPhase(config: Record<string, unknown>): number {
-  // "phase" is stored explicitly for new jobs; fall back to config shape for old ones.
-  if (config.phase != null) return config.phase as number;
-  return "k_per_side_pct" in config || "position_sizing" in config ? 5 : 1;
-}
+// ─── Password modal ───────────────────────────────────────────────────────────
 
-function configSummary(config: Record<string, unknown>): string {
-  const phase = detectPhase(config);
-  const n = config.n_tickers ?? "all";
-  const start = (config.start_date as string ?? "").slice(0, 7);
-  return `Phase ${phase} · ${n} tickers · from ${start}`;
-}
-
-// ─── Password modal ──────────────────────────────────────────────────────────
-
-interface PwModalProps {
-  title: string;
-  description: string;
-  confirmLabel: string;
-  confirmVariant?: "default" | "destructive";
-  onConfirm: (pw: string) => void;
-  onClose: () => void;
-  isLoading: boolean;
-  error: string | null;
-}
-
-function PasswordModal({
-  title, description, confirmLabel, confirmVariant = "default",
-  onConfirm, onClose, isLoading, error,
-}: PwModalProps) {
+function PasswordModal({ title, description, confirmLabel, confirmVariant = "default", onConfirm, onClose, isLoading, error }: {
+  title: string; description: string; confirmLabel: string; confirmVariant?: "default" | "destructive";
+  onConfirm: (pw: string) => void; onClose: () => void; isLoading: boolean; error: string | null;
+}) {
   const [pw, setPw] = useState("");
-  const inputRef = useRef<HTMLInputElement>(null);
-
-  useEffect(() => { inputRef.current?.focus(); }, []);
-
-  function submit(e: React.FormEvent) {
-    e.preventDefault();
-    if (pw.trim()) onConfirm(pw.trim());
-  }
-
+  const ref = useRef<HTMLInputElement>(null);
+  useEffect(() => { ref.current?.focus(); }, []);
+  function submit(e: React.FormEvent) { e.preventDefault(); if (pw.trim()) onConfirm(pw.trim()); }
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
       <div className="w-full max-w-sm rounded-xl border border-border bg-card p-6 shadow-xl">
         <h2 className="mb-1 text-lg font-semibold">{title}</h2>
         <p className="mb-4 text-sm text-muted-foreground">{description}</p>
         <form onSubmit={submit} className="space-y-3">
-          <input
-            ref={inputRef}
-            type="password"
-            value={pw}
-            onChange={e => setPw(e.target.value)}
+          <input ref={ref} type="password" value={pw} onChange={e => setPw(e.target.value)}
             placeholder="Enter password (STOCKPRED_PW)"
-            className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary"
-          />
+            className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary" />
           {error && <p className="text-xs text-red-500">{error}</p>}
           <div className="flex justify-end gap-2">
-            <Button variant="ghost" size="sm" type="button" onClick={onClose} disabled={isLoading}>
-              Cancel
-            </Button>
+            <Button variant="ghost" size="sm" type="button" onClick={onClose} disabled={isLoading}>Cancel</Button>
             <Button variant={confirmVariant} size="sm" type="submit" disabled={isLoading || !pw.trim()}>
               {isLoading ? <Loader2 className="h-4 w-4 animate-spin" /> : confirmLabel}
             </Button>
@@ -170,264 +107,443 @@ function PasswordModal({
   );
 }
 
-// ─── New Job form ────────────────────────────────────────────────────────────
+// ─── Form sub-components ──────────────────────────────────────────────────────
 
-const DEFAULT_PHASE1 = {
-  phase: 1, n_tickers: 100, start_date: "2013-01-01", end_date: null,
+function Field({ label, children, className }: { label: string; children: React.ReactNode; className?: string }) {
+  return (
+    <div className={className}>
+      <label className="mb-1 block text-xs font-medium text-muted-foreground">{label}</label>
+      {children}
+    </div>
+  );
+}
+
+const inp = "w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-primary";
+const sel = inp;
+
+function Checkbox({ label, checked, onChange, note }: { label: string; checked: boolean; onChange: (v: boolean) => void; note?: string }) {
+  return (
+    <label className="flex cursor-pointer items-start gap-2 text-sm">
+      <input type="checkbox" checked={checked} onChange={e => onChange(e.target.checked)} className="mt-0.5 h-4 w-4 rounded border-border accent-primary" />
+      <span className="flex flex-col">
+        <span>{label}</span>
+        {note && <span className="text-xs text-muted-foreground">{note}</span>}
+      </span>
+    </label>
+  );
+}
+
+function Section({ title, children, defaultOpen = false }: { title: string; children: React.ReactNode; defaultOpen?: boolean }) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <div className="rounded-lg border border-border">
+      <button type="button" onClick={() => setOpen(v => !v)}
+        className="flex w-full items-center justify-between px-4 py-2.5 text-sm font-medium hover:bg-accent/50 transition-colors">
+        {title}
+        {open ? <ChevronUp className="h-4 w-4 text-muted-foreground" /> : <ChevronDown className="h-4 w-4 text-muted-foreground" />}
+      </button>
+      {open && <div className="border-t border-border px-4 py-3 space-y-3">{children}</div>}
+    </div>
+  );
+}
+
+// ─── Phase presets ────────────────────────────────────────────────────────────
+
+const BASE_UNIVERSE = {
+  start_date: "2014-01-01", end_date: null, n_tickers: 150,
   universe_sampling: "current", refresh_data: false,
-  horizons: [1, 5, 21], model: "gbm", use_sector_features: true,
-  k_per_side: 20,
-  cv: { train_years: 3, test_months: 6, embargo_days: 25, min_train_obs: 1000 },
-  gbm: { num_leaves: 63, learning_rate: 0.03, n_estimators: 800, min_data_in_leaf: 200,
-         feature_fraction: 0.8, bagging_fraction: 0.8, bagging_freq: 5,
-         reg_lambda: 1.0, early_stopping_rounds: 50 },
+};
+const BASE_CV = { train_years: 5, test_months: 6, embargo_days: 25, min_train_obs: 1000 };
+const BASE_GBM = {
+  num_leaves: 63, learning_rate: 0.03, n_estimators: 800, min_data_in_leaf: 200,
+  feature_fraction: 0.7, bagging_fraction: 0.8, bagging_freq: 5, reg_lambda: 2.0, early_stopping_rounds: 50,
 };
 
-const DEFAULT_PHASE5 = {
-  phase: 5, n_tickers: null, start_date: "2013-01-01", end_date: null,
-  universe_sampling: "current", refresh_data: false,
-  horizons: [1, 5], model: "gbm", use_sector_features: true,
-  use_tier2_features: true, use_regime_features: true,
-  beta_neutralise: true, bootstrap_method: "block", holdout_years: 2,
-  position_sizing: "vol_scaled", k_per_side_pct: 0.10, leverage_per_side: 1.0,
-  sector_cap_gross: 0.25, min_trade_threshold: 0.005,
-  ensemble_weighting: "ic_ir", bootstrap_n: 500,
-  cv: { train_years: 5, test_months: 6, embargo_days: 25, min_train_obs: 1000 },
-  gbm: { num_leaves: 63, learning_rate: 0.03, n_estimators: 800, min_data_in_leaf: 200,
-         feature_fraction: 0.7, bagging_fraction: 0.8, bagging_freq: 5,
-         reg_lambda: 2.0, early_stopping_rounds: 50 },
+const PRESETS: Record<string, Record<string, unknown>> = {
+  "Phase 1": {
+    phase: 1, ...BASE_UNIVERSE, horizons: [1, 5, 21], model: "gbm",
+    use_sector_features: true, k_per_side: 20, feature_cols: null,
+    cv: BASE_CV, gbm: BASE_GBM,
+  },
+  "Phase 5": {
+    phase: 5, ...BASE_UNIVERSE, horizons: [5], model: "gbm",
+    use_sector_features: true, use_tier2_features: true, use_regime_features: true,
+    beta_neutralise: true, bootstrap_method: "block", holdout_years: 2,
+    position_sizing: "vol_scaled", k_per_side_pct: 0.15, leverage_per_side: 1.0,
+    sector_cap_gross: 0.25, min_trade_threshold: 0.02, ensemble_weighting: "ic_ir",
+    bootstrap_n: 500,
+    use_meta_labelling: false, meta_threshold: 0.55, meta_mode: "binary",
+    meta_conf_floor: 0.5, meta_conf_cap: 1.0, meta_walk_forward_folds: 1, meta_per_sector: false,
+    use_triple_barrier_labels: false, tb_k_sigma: 2.0,
+    ranks_only: false, feature_exclude: [],
+    use_edgar_features: false, use_edgar_item_features: false,
+    cv: BASE_CV, gbm: BASE_GBM,
+  },
+  "Phase 8/9 (meta)": {
+    phase: 5, ...BASE_UNIVERSE, horizons: [5], model: "gbm",
+    use_sector_features: true, use_tier2_features: true, use_regime_features: true,
+    beta_neutralise: true, bootstrap_method: "block", holdout_years: 2,
+    position_sizing: "vol_scaled", k_per_side_pct: 0.15, leverage_per_side: 1.0,
+    sector_cap_gross: 0.25, min_trade_threshold: 0.02, ensemble_weighting: "ic_ir",
+    bootstrap_n: 500,
+    use_meta_labelling: true, meta_threshold: 0.55, meta_mode: "confidence",
+    meta_conf_floor: 0.50, meta_conf_cap: 0.80, meta_walk_forward_folds: 3, meta_per_sector: false,
+    use_triple_barrier_labels: false, tb_k_sigma: 2.0,
+    ranks_only: true, feature_exclude: [],
+    use_edgar_features: false, use_edgar_item_features: false,
+    cv: BASE_CV, gbm: BASE_GBM,
+  },
+  "Phase 12/13 (EDGAR)": {
+    phase: 5, ...BASE_UNIVERSE, horizons: [5], model: "gbm",
+    use_sector_features: true, use_tier2_features: true, use_regime_features: true,
+    beta_neutralise: true, bootstrap_method: "block", holdout_years: 2,
+    position_sizing: "vol_scaled", k_per_side_pct: 0.15, leverage_per_side: 1.0,
+    sector_cap_gross: 0.25, min_trade_threshold: 0.02, ensemble_weighting: "ic_ir",
+    bootstrap_n: 200,
+    use_meta_labelling: true, meta_threshold: 0.55, meta_mode: "confidence",
+    meta_conf_floor: 0.50, meta_conf_cap: 0.80, meta_walk_forward_folds: 3, meta_per_sector: false,
+    use_triple_barrier_labels: false, tb_k_sigma: 2.0,
+    ranks_only: true, feature_exclude: [],
+    use_edgar_features: true, use_edgar_item_features: true,
+    cv: BASE_CV, gbm: BASE_GBM,
+  },
 };
 
-interface NewJobFormProps { onClose: () => void; onQueued: () => void; }
+const OPTIMAL_CURL = `curl -X POST https://stock-predictor-production-d4d4.up.railway.app/jobs/queue \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "phase": 5,
+    "start_date": "2014-01-01",
+    "n_tickers": 200,
+    "universe_sampling": "current",
+    "horizons": [5],
+    "use_sector_features": true,
+    "use_tier2_features": true,
+    "use_regime_features": true,
+    "beta_neutralise": true,
+    "ensemble_weighting": "ic_ir",
+    "position_sizing": "vol_scaled",
+    "k_per_side_pct": 0.15,
+    "leverage_per_side": 1.0,
+    "sector_cap_gross": 0.25,
+    "min_trade_threshold": 0.02,
+    "holdout_years": 2,
+    "ranks_only": true,
+    "use_meta_labelling": true,
+    "meta_threshold": 0.55,
+    "meta_mode": "confidence",
+    "meta_conf_floor": 0.50,
+    "meta_conf_cap": 0.80,
+    "meta_walk_forward_folds": 3,
+    "bootstrap_n": 200,
+    "cv": { "train_years": 5, "test_months": 6, "embargo_days": 25, "min_train_obs": 1000 },
+    "gbm": {
+      "num_leaves": 63, "learning_rate": 0.03, "n_estimators": 800,
+      "min_data_in_leaf": 200, "feature_fraction": 0.7,
+      "bagging_fraction": 0.8, "bagging_freq": 5, "reg_lambda": 2.0,
+      "early_stopping_rounds": 50
+    }
+  }'`;
 
-function NewJobForm({ onClose, onQueued }: NewJobFormProps) {
-  const [phase, setPhase] = useState<1 | 5>(1);
-  const [showAdvanced, setShowAdvanced] = useState(false);
-  const [cfg, setCfg] = useState<Record<string, unknown>>(DEFAULT_PHASE1 as any);
+// ─── New Job form ─────────────────────────────────────────────────────────────
+
+const PHASE_TABS = ["Phase 1", "Phase 5", "Phase 8/9 (meta)", "Phase 12/13 (EDGAR)", "Optimal curl"] as const;
+type PhaseTab = typeof PHASE_TABS[number];
+
+function NewJobForm({ onClose, onQueued }: { onClose: () => void; onQueued: () => void }) {
+  const [tab, setTab] = useState<PhaseTab>("Phase 5");
+  const [cfg, setCfg] = useState<Record<string, unknown>>(PRESETS["Phase 5"]);
   const [error, setError] = useState<string | null>(null);
+  const [curlCopied, setCurlCopied] = useState(false);
   const qc = useQueryClient();
 
-  const defaults = phase === 5 ? DEFAULT_PHASE5 : DEFAULT_PHASE1;
-
-  function switchPhase(p: 1 | 5) {
-    setPhase(p);
-    setCfg(p === 5 ? DEFAULT_PHASE5 as any : DEFAULT_PHASE1 as any);
+  function switchTab(t: PhaseTab) {
+    setTab(t);
+    if (t !== "Optimal curl") setCfg(PRESETS[t]);
   }
 
-  function setField(key: string, value: unknown) {
-    setCfg(prev => ({ ...prev, [key]: value }));
-  }
-
-  function setGbm(key: string, value: unknown) {
-    setCfg(prev => ({ ...prev, gbm: { ...(prev.gbm as object), [key]: value } }));
-  }
-
-  function setCv(key: string, value: unknown) {
-    setCfg(prev => ({ ...prev, cv: { ...(prev.cv as object), [key]: value } }));
-  }
+  function set(key: string, value: unknown) { setCfg(prev => ({ ...prev, [key]: value })); }
+  function setGbm(key: string, v: unknown) { setCfg(prev => ({ ...prev, gbm: { ...(prev.gbm as object), [key]: v } })); }
+  function setCv(key: string, v: unknown)  { setCfg(prev => ({ ...prev, cv:  { ...(prev.cv  as object), [key]: v } })); }
 
   const mutate = useMutation({
     mutationFn: () => api.queueJob(cfg),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["queued"] });
-      onQueued();
-    },
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ["queued"] }); onQueued(); },
     onError: (e: Error) => setError(e.message),
   });
 
+  const isPhase1 = tab === "Phase 1";
+  const showCurl = tab === "Optimal curl";
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
-      <div className="flex max-h-[90vh] w-full max-w-2xl flex-col overflow-hidden rounded-xl border border-border bg-card shadow-xl">
+      <div className="flex max-h-[92vh] w-full max-w-2xl flex-col overflow-hidden rounded-xl border border-border bg-card shadow-xl">
+        {/* Header */}
         <div className="border-b border-border px-6 py-4">
           <h2 className="text-lg font-semibold">New Job</h2>
-          <p className="text-sm text-muted-foreground">Configure and queue a pipeline run. A password is needed to launch it.</p>
+          <p className="text-sm text-muted-foreground">Choose a preset, tweak parameters, then queue. A password is needed to launch.</p>
         </div>
 
-        <div className="flex-1 overflow-y-auto px-6 py-4 space-y-4">
-          {/* Phase selector */}
-          <div>
-            <label className="mb-1 block text-sm font-medium">Phase</label>
-            <div className="flex gap-2">
-              {([1, 5] as const).map(p => (
-                <button key={p} onClick={() => switchPhase(p)}
-                  className={cn("rounded-lg border px-4 py-2 text-sm font-medium transition-colors",
-                    phase === p ? "border-primary bg-primary text-primary-foreground" : "border-border hover:bg-accent")}>
-                  Phase {p}{p === 1 ? " — Basic GBM" : " — Full (vol-scaled, regime-aware)"}
+        {/* Phase tabs */}
+        <div className="flex gap-1 overflow-x-auto border-b border-border bg-muted/30 px-4 pt-3 pb-0">
+          {PHASE_TABS.map(t => (
+            <button key={t} onClick={() => switchTab(t)}
+              className={cn("whitespace-nowrap rounded-t-md px-3 py-1.5 text-xs font-medium transition-colors",
+                tab === t
+                  ? "border border-b-0 border-border bg-card text-foreground"
+                  : "text-muted-foreground hover:text-foreground")}>
+              {t}
+            </button>
+          ))}
+        </div>
+
+        {/* Body */}
+        <div className="flex-1 overflow-y-auto px-6 py-4 space-y-3">
+
+          {showCurl ? (
+            <div className="space-y-3">
+              <p className="text-sm text-muted-foreground">
+                Best-guess optimal configuration based on diagnostics: h=5 only (IC IR 1.18), beta-neutral,
+                confidence-weighted meta-labelling, ranks_only, higher min_trade_threshold (0.02) to cut the
+                240×/yr turnover. Queue this, then launch with your password.
+              </p>
+              <div className="relative">
+                <pre className="overflow-x-auto rounded-lg border border-border bg-muted p-4 text-xs font-mono leading-relaxed whitespace-pre">
+                  {OPTIMAL_CURL}
+                </pre>
+                <button
+                  onClick={() => { navigator.clipboard.writeText(OPTIMAL_CURL); setCurlCopied(true); setTimeout(() => setCurlCopied(false), 2000); }}
+                  className="absolute right-2 top-2 rounded-md border border-border bg-card px-2 py-1 text-xs text-muted-foreground hover:text-foreground">
+                  {curlCopied ? "Copied!" : "Copy"}
                 </button>
-              ))}
+              </div>
             </div>
-          </div>
+          ) : (
+            <>
+              {/* ── Universe (all phases) ── */}
+              <Section title="Universe & dates" defaultOpen>
+                <div className="grid grid-cols-2 gap-3">
+                  <Field label="Start date">
+                    <input type="date" value={cfg.start_date as string} onChange={e => set("start_date", e.target.value)} className={inp} />
+                  </Field>
+                  <Field label="Tickers (null = all ~500)">
+                    <input type="number" min={1} value={(cfg.n_tickers as number | null) ?? ""}
+                      placeholder="null = all S&P 500"
+                      onChange={e => set("n_tickers", e.target.value === "" ? null : Number(e.target.value))}
+                      className={inp} />
+                  </Field>
+                  <Field label="Universe sampling">
+                    <select value={cfg.universe_sampling as string} onChange={e => set("universe_sampling", e.target.value)} className={sel}>
+                      <option value="current">current (today's members — survivorship bias)</option>
+                      <option value="random">random (unbiased)</option>
+                      <option value="first">first (alphabetical)</option>
+                    </select>
+                  </Field>
+                  <Field label="Horizons (days, comma-sep)">
+                    <input type="text"
+                      value={((cfg.horizons as number[]) ?? [5]).join(", ")}
+                      onChange={e => {
+                        const vals = e.target.value.split(",").map(s => parseInt(s.trim())).filter(n => !isNaN(n));
+                        set("horizons", vals);
+                      }} className={inp} />
+                  </Field>
+                </div>
+              </Section>
 
-          {/* Universe */}
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">Tickers (null = all S&P 500)</label>
-              <input type="number" min={1} placeholder="null = all"
-                value={(cfg.n_tickers as number | null) ?? ""}
-                onChange={e => setField("n_tickers", e.target.value === "" ? null : Number(e.target.value))}
-                className="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm" />
-            </div>
-            <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">Start date</label>
-              <input type="date"
-                value={(cfg.start_date as string) ?? "2013-01-01"}
-                onChange={e => setField("start_date", e.target.value)}
-                className="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm" />
-            </div>
-            <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">Universe sampling</label>
-              <select value={(cfg.universe_sampling as string) ?? "current"}
-                onChange={e => setField("universe_sampling", e.target.value)}
-                className="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm">
-                <option value="current">current (today's members)</option>
-                <option value="random">random (unbiased)</option>
-                <option value="first">first (alphabetical)</option>
-              </select>
-            </div>
-            <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">Horizons (days)</label>
-              <input type="text"
-                value={((cfg.horizons as number[]) ?? [1, 5]).join(", ")}
-                onChange={e => {
-                  const vals = e.target.value.split(",").map(s => parseInt(s.trim())).filter(n => !isNaN(n));
-                  setField("horizons", vals);
-                }}
-                className="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm" />
-            </div>
-          </div>
+              {isPhase1 ? (
+                // ── Phase 1 specific ──
+                <Section title="Portfolio (Phase 1)" defaultOpen>
+                  <div className="grid grid-cols-2 gap-3">
+                    <Field label="K per side (# positions)">
+                      <input type="number" min={1} value={(cfg.k_per_side as number) ?? 20}
+                        onChange={e => set("k_per_side", +e.target.value)} className={inp} />
+                    </Field>
+                    <Field label="Model">
+                      <select value={cfg.model as string} onChange={e => set("model", e.target.value)} className={sel}>
+                        <option value="gbm">GBM</option>
+                        <option value="logistic">Logistic</option>
+                      </select>
+                    </Field>
+                  </div>
+                  <Checkbox label="Use sector features" checked={!!(cfg.use_sector_features)} onChange={v => set("use_sector_features", v)} />
+                </Section>
+              ) : (
+                <>
+                  {/* ── Phase 5 features ── */}
+                  <Section title="Features" defaultOpen>
+                    <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                      <Checkbox label="Sector features" checked={!!(cfg.use_sector_features)} onChange={v => set("use_sector_features", v)} note="GICS dummies + sector-neutralised returns" />
+                      <Checkbox label="Tier-2 features" checked={!!(cfg.use_tier2_features)} onChange={v => set("use_tier2_features", v)} note="12-1 momentum, IVOL, beta, max-ret, Amihud" />
+                      <Checkbox label="Regime features" checked={!!(cfg.use_regime_features)} onChange={v => set("use_regime_features", v)} note="VIX, term spread, USD, xs-dispersion" />
+                      <Checkbox label="Ranks only" checked={!!(cfg.ranks_only)} onChange={v => set("ranks_only", v)} note="Drop raw values; keep cross-sectional ranks (Phase 8)" />
+                    </div>
+                  </Section>
 
-          {/* Phase 5 extra */}
-          {phase === 5 && (
-            <div className="grid grid-cols-2 gap-3">
-              <label className="col-span-2 -mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Phase 5 options</label>
-              {[
-                ["beta_neutralise", "Beta-neutralise vs SPY"],
-                ["use_tier2_features", "Tier-2 features (momentum, IVOL, beta)"],
-                ["use_regime_features", "Regime features (VIX, term spread)"],
-              ].map(([k, label]) => (
-                <label key={k} className="flex cursor-pointer items-center gap-2 text-sm">
-                  <input type="checkbox" checked={!!(cfg[k])}
-                    onChange={e => setField(k, e.target.checked)}
-                    className="h-4 w-4 rounded border-border" />
-                  {label}
-                </label>
-              ))}
-              <div>
-                <label className="mb-1 block text-xs font-medium text-muted-foreground">Position sizing</label>
-                <select value={(cfg.position_sizing as string) ?? "vol_scaled"}
-                  onChange={e => setField("position_sizing", e.target.value)}
-                  className="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm">
-                  <option value="vol_scaled">vol_scaled</option>
-                  <option value="top_k">top_k</option>
-                </select>
-              </div>
-              <div>
-                <label className="mb-1 block text-xs font-medium text-muted-foreground">k per side %</label>
-                <input type="number" step={0.01} min={0.01} max={1}
-                  value={(cfg.k_per_side_pct as number) ?? 0.10}
-                  onChange={e => setField("k_per_side_pct", parseFloat(e.target.value))}
-                  className="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm" />
-              </div>
-              <div>
-                <label className="mb-1 block text-xs font-medium text-muted-foreground">Sector cap gross</label>
-                <input type="number" step={0.05} min={0} max={1}
-                  value={(cfg.sector_cap_gross as number) ?? 0.25}
-                  onChange={e => setField("sector_cap_gross", parseFloat(e.target.value))}
-                  className="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm" />
-              </div>
-              <div>
-                <label className="mb-1 block text-xs font-medium text-muted-foreground">Holdout years</label>
-                <input type="number" min={0} max={5}
-                  value={(cfg.holdout_years as number) ?? 2}
-                  onChange={e => setField("holdout_years", parseInt(e.target.value))}
-                  className="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm" />
-              </div>
-            </div>
+                  {/* ── Portfolio ── */}
+                  <Section title="Portfolio construction" defaultOpen>
+                    <div className="grid grid-cols-2 gap-3">
+                      <Field label="Position sizing">
+                        <select value={cfg.position_sizing as string} onChange={e => set("position_sizing", e.target.value)} className={sel}>
+                          <option value="vol_scaled">vol_scaled (signal × 1/vol)</option>
+                          <option value="top_k">top_k (equal weight)</option>
+                          <option value="hrp">hrp (hierarchical risk parity)</option>
+                        </select>
+                      </Field>
+                      <Field label="Ensemble weighting">
+                        <select value={cfg.ensemble_weighting as string} onChange={e => set("ensemble_weighting", e.target.value)} className={sel}>
+                          <option value="ic_ir">ic_ir (weight by OOS IC IR)</option>
+                          <option value="equal">equal</option>
+                        </select>
+                      </Field>
+                      <Field label="K per side %">
+                        <input type="number" step={0.01} min={0.01} max={1} value={cfg.k_per_side_pct as number}
+                          onChange={e => set("k_per_side_pct", parseFloat(e.target.value))} className={inp} />
+                      </Field>
+                      <Field label="Min trade threshold">
+                        <input type="number" step={0.005} min={0} value={cfg.min_trade_threshold as number}
+                          onChange={e => set("min_trade_threshold", parseFloat(e.target.value))} className={inp} />
+                        <p className="mt-0.5 text-xs text-amber-600 dark:text-amber-400">↑ Raise to 0.02+ to cut turnover (currently 240×/yr)</p>
+                      </Field>
+                      <Field label="Sector cap (gross)">
+                        <input type="number" step={0.05} min={0} max={1} value={(cfg.sector_cap_gross as number) ?? 0.25}
+                          onChange={e => set("sector_cap_gross", parseFloat(e.target.value))} className={inp} />
+                      </Field>
+                      <Field label="Leverage per side">
+                        <input type="number" step={0.1} min={0.1} value={cfg.leverage_per_side as number}
+                          onChange={e => set("leverage_per_side", parseFloat(e.target.value))} className={inp} />
+                      </Field>
+                      <Field label="Holdout years">
+                        <input type="number" min={0} max={5} value={cfg.holdout_years as number}
+                          onChange={e => set("holdout_years", parseInt(e.target.value))} className={inp} />
+                      </Field>
+                    </div>
+                    <Checkbox label="Beta-neutralise vs SPY" checked={!!(cfg.beta_neutralise)} onChange={v => set("beta_neutralise", v)}
+                      note="Recommended: eliminates market-beta drag on short book in bull markets" />
+                  </Section>
+
+                  {/* ── Meta-labelling (Phase 8/9) ── */}
+                  <Section title="Meta-labelling — Phase 8/9">
+                    <Checkbox label="Enable meta-labelling" checked={!!(cfg.use_meta_labelling)} onChange={v => set("use_meta_labelling", v)}
+                      note="Secondary classifier gates signals by P(primary score is correct)" />
+                    {!!(cfg.use_meta_labelling) && (
+                      <div className="mt-3 grid grid-cols-2 gap-3">
+                        <Field label="Mode">
+                          <select value={cfg.meta_mode as string} onChange={e => set("meta_mode", e.target.value)} className={sel}>
+                            <option value="binary">binary (hard gate)</option>
+                            <option value="confidence">confidence (scale by P)</option>
+                          </select>
+                        </Field>
+                        <Field label="Threshold">
+                          <input type="number" step={0.01} min={0} max={1} value={cfg.meta_threshold as number}
+                            onChange={e => set("meta_threshold", parseFloat(e.target.value))} className={inp} />
+                        </Field>
+                        {cfg.meta_mode === "confidence" && (
+                          <>
+                            <Field label="Confidence floor">
+                              <input type="number" step={0.05} min={0} max={1} value={cfg.meta_conf_floor as number}
+                                onChange={e => set("meta_conf_floor", parseFloat(e.target.value))} className={inp} />
+                            </Field>
+                            <Field label="Confidence cap">
+                              <input type="number" step={0.05} min={0} max={1} value={cfg.meta_conf_cap as number}
+                                onChange={e => set("meta_conf_cap", parseFloat(e.target.value))} className={inp} />
+                            </Field>
+                          </>
+                        )}
+                        <Field label="Walk-forward folds">
+                          <input type="number" min={1} max={10} value={cfg.meta_walk_forward_folds as number}
+                            onChange={e => set("meta_walk_forward_folds", parseInt(e.target.value))} className={inp} />
+                        </Field>
+                        <div className="flex items-end">
+                          <Checkbox label="Per-sector classifiers" checked={!!(cfg.meta_per_sector)} onChange={v => set("meta_per_sector", v)}
+                            note="One meta GBM per GICS sector" />
+                        </div>
+                      </div>
+                    )}
+                  </Section>
+
+                  {/* ── Labels (Phase 8) ── */}
+                  <Section title="Label construction — Phase 8">
+                    <Checkbox label="Triple-barrier labels" checked={!!(cfg.use_triple_barrier_labels)} onChange={v => set("use_triple_barrier_labels", v)}
+                      note="Replace forward returns with triple-barrier signed returns (López de Prado Ch. 3)" />
+                    {!!(cfg.use_triple_barrier_labels) && (
+                      <Field label="Barrier width (σ)" className="mt-3">
+                        <input type="number" step={0.5} min={0.5} value={cfg.tb_k_sigma as number}
+                          onChange={e => set("tb_k_sigma", parseFloat(e.target.value))} className={inp} />
+                      </Field>
+                    )}
+                  </Section>
+
+                  {/* ── EDGAR (Phase 12/13) ── */}
+                  <Section title="SEC EDGAR features — Phase 12/13">
+                    <div className="space-y-2">
+                      <Checkbox label="8-K event counts (Phase 12)" checked={!!(cfg.use_edgar_features)} onChange={v => set("use_edgar_features", v)}
+                        note="has_8k flag + 5/21/63d rolling counts — free, ~10 req/s SEC rate limit" />
+                      <Checkbox label="8-K per-item features (Phase 13)" checked={!!(cfg.use_edgar_item_features)} onChange={v => set("use_edgar_item_features", v)}
+                        note="CEO change, earnings release, M&A, etc. — requires Phase 12 to be useful" />
+                    </div>
+                  </Section>
+                </>
+              )}
+
+              {/* ── GBM / CV (all phases) ── */}
+              <Section title="GBM & cross-validation">
+                <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">GBM</p>
+                <div className="grid grid-cols-3 gap-3">
+                  {(["num_leaves","n_estimators","min_data_in_leaf"] as const).map(k => (
+                    <Field key={k} label={k}>
+                      <input type="number" value={(cfg.gbm as any)?.[k]} onChange={e => setGbm(k, parseInt(e.target.value))} className={inp} />
+                    </Field>
+                  ))}
+                  {(["learning_rate","feature_fraction","reg_lambda"] as const).map(k => (
+                    <Field key={k} label={k}>
+                      <input type="number" step={0.01} value={(cfg.gbm as any)?.[k]} onChange={e => setGbm(k, parseFloat(e.target.value))} className={inp} />
+                    </Field>
+                  ))}
+                </div>
+                <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Cross-validation</p>
+                <div className="grid grid-cols-2 gap-3">
+                  {(["train_years","test_months","embargo_days","min_train_obs"] as const).map(k => (
+                    <Field key={k} label={k}>
+                      <input type="number" value={(cfg.cv as any)?.[k]} onChange={e => setCv(k, parseInt(e.target.value))} className={inp} />
+                    </Field>
+                  ))}
+                </div>
+              </Section>
+
+              {error && <p className="text-sm text-red-500">{error}</p>}
+            </>
           )}
-
-          {/* Advanced toggle */}
-          <button onClick={() => setShowAdvanced(v => !v)}
-            className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground">
-            {showAdvanced ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
-            Advanced (GBM / CV params)
-          </button>
-
-          {showAdvanced && (
-            <div className="space-y-3 rounded-lg border border-border p-3">
-              <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">GBM</p>
-              <div className="grid grid-cols-3 gap-3">
-                {(["num_leaves","n_estimators","min_data_in_leaf"] as const).map(k => (
-                  <div key={k}>
-                    <label className="mb-1 block text-xs font-medium text-muted-foreground">{k}</label>
-                    <input type="number"
-                      value={((cfg.gbm as any)?.[k]) ?? (defaults as any).gbm[k]}
-                      onChange={e => setGbm(k, parseInt(e.target.value))}
-                      className="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm" />
-                  </div>
-                ))}
-                {(["learning_rate","feature_fraction","reg_lambda"] as const).map(k => (
-                  <div key={k}>
-                    <label className="mb-1 block text-xs font-medium text-muted-foreground">{k}</label>
-                    <input type="number" step={0.01}
-                      value={((cfg.gbm as any)?.[k]) ?? (defaults as any).gbm[k]}
-                      onChange={e => setGbm(k, parseFloat(e.target.value))}
-                      className="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm" />
-                  </div>
-                ))}
-              </div>
-              <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">Cross-validation</p>
-              <div className="grid grid-cols-2 gap-3">
-                {(["train_years","test_months","embargo_days","min_train_obs"] as const).map(k => (
-                  <div key={k}>
-                    <label className="mb-1 block text-xs font-medium text-muted-foreground">{k}</label>
-                    <input type="number"
-                      value={((cfg.cv as any)?.[k]) ?? (defaults as any).cv[k]}
-                      onChange={e => setCv(k, parseInt(e.target.value))}
-                      className="w-full rounded-md border border-border bg-background px-3 py-1.5 text-sm" />
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {error && <p className="text-sm text-red-500">{error}</p>}
         </div>
 
+        {/* Footer */}
         <div className="flex justify-end gap-2 border-t border-border px-6 py-4">
           <Button variant="ghost" size="sm" onClick={onClose}>Cancel</Button>
-          <Button size="sm" onClick={() => { setError(null); mutate.mutate(); }}
-            disabled={mutate.isPending}>
-            {mutate.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
-            Queue Job
-          </Button>
+          {!showCurl && (
+            <Button size="sm" onClick={() => { setError(null); mutate.mutate(); }} disabled={mutate.isPending}>
+              {mutate.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
+              Queue Job
+            </Button>
+          )}
         </div>
       </div>
     </div>
   );
 }
 
-// ─── Job detail panel ────────────────────────────────────────────────────────
+// ─── Job detail panel ─────────────────────────────────────────────────────────
 
-interface JobDetailPanelProps {
-  jobId: string;
-  onClose: () => void;
-  onCancel: (jobId: string) => void;
-}
-
-function JobDetailPanel({ jobId, onClose, onCancel }: JobDetailPanelProps) {
+function JobDetailPanel({ jobId, onClose, onCancel }: { jobId: string; onClose: () => void; onCancel: (id: string) => void }) {
   const logsEndRef = useRef<HTMLDivElement>(null);
   const { data: job } = useQuery({
     queryKey: ["job", jobId],
     queryFn: () => api.jobDetail(jobId),
-    refetchInterval: (query) => {
-      const s = query.state.data?.status;
+    refetchInterval: q => {
+      const s = q.state.data?.status;
       return s === "running" || s === "queued" || s === "cancelling" ? 2500 : false;
     },
   });
 
-  useEffect(() => {
-    logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [job?.logs?.length]);
+  useEffect(() => { logsEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [job?.logs?.length]);
 
   if (!job) return null;
 
@@ -442,9 +558,7 @@ function JobDetailPanel({ jobId, onClose, onCancel }: JobDetailPanelProps) {
         <div className="flex items-center gap-2">
           <JobIdCell jobId={jobId} />
           {statusBadge(job.status)}
-          {job.elapsed_s != null && (
-            <span className="text-xs text-muted-foreground">Runtime: {fmtDuration(job.elapsed_s)}</span>
-          )}
+          {job.elapsed_s != null && <span className="text-xs text-muted-foreground">Runtime: {fmtDuration(job.elapsed_s)}</span>}
         </div>
         <div className="flex items-center gap-2">
           {isActive && (
@@ -456,7 +570,6 @@ function JobDetailPanel({ jobId, onClose, onCancel }: JobDetailPanelProps) {
         </div>
       </div>
 
-      {/* Progress bar */}
       {isActive && pct != null && (
         <div className="mb-3">
           <div className="mb-1 flex justify-between text-xs text-muted-foreground">
@@ -470,12 +583,11 @@ function JobDetailPanel({ jobId, onClose, onCancel }: JobDetailPanelProps) {
       )}
 
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-3">
-        {/* Parameters */}
         <div className="col-span-2 lg:col-span-1">
           <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Parameters</p>
           <dl className="space-y-1 text-xs">
             {Object.entries(job.config)
-              .filter(([k]) => !["cv", "gbm"].includes(k))
+              .filter(([k]) => !["cv","gbm","feature_exclude"].includes(k))
               .map(([k, v]) => (
                 <div key={k} className="flex justify-between gap-2">
                   <dt className="text-muted-foreground">{k}</dt>
@@ -489,16 +601,12 @@ function JobDetailPanel({ jobId, onClose, onCancel }: JobDetailPanelProps) {
             </div>
           )}
         </div>
-
-        {/* Logs */}
         <div className="col-span-2">
           <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
             Logs {job.logs.length > 0 && <span className="text-muted-foreground/60">({job.logs.length} lines)</span>}
           </p>
           <pre className="h-64 overflow-y-auto rounded-md bg-muted p-2 font-mono text-xs leading-relaxed text-foreground/80 scrollbar-thin">
-            {job.logs.length === 0
-              ? (isActive ? "Waiting for output…" : "No logs captured.")
-              : job.logs.join("\n")}
+            {job.logs.length === 0 ? (isActive ? "Waiting for output…" : "No logs captured.") : job.logs.join("\n")}
             <div ref={logsEndRef} />
           </pre>
         </div>
@@ -507,7 +615,7 @@ function JobDetailPanel({ jobId, onClose, onCancel }: JobDetailPanelProps) {
   );
 }
 
-// ─── Main page ───────────────────────────────────────────────────────────────
+// ─── Main page ────────────────────────────────────────────────────────────────
 
 export function Jobs() {
   const qc = useQueryClient();
@@ -522,13 +630,12 @@ export function Jobs() {
   const [pwError, setPwError] = useState<string | null>(null);
   const [pwLoading, setPwLoading] = useState(false);
 
-  const hasActive = (jobs: JobDetail[]) =>
-    jobs.some(j => ["running", "queued", "cancelling"].includes(j.status));
+  const hasActive = (jobs: JobDetail[]) => jobs.some(j => ["running","queued","cancelling"].includes(j.status));
 
   const { data: jobs = [] } = useQuery({
     queryKey: ["jobs"],
     queryFn: () => api.listJobs(),
-    refetchInterval: (q) => (hasActive(q.state.data ?? []) ? 3000 : 15000),
+    refetchInterval: q => hasActive(q.state.data ?? []) ? 3000 : 15000,
   });
 
   const { data: queued = [] } = useQuery({
@@ -539,8 +646,7 @@ export function Jobs() {
 
   async function handlePwConfirm(pw: string) {
     if (!pwAction) return;
-    setPwLoading(true);
-    setPwError(null);
+    setPwLoading(true); setPwError(null);
     try {
       if (pwAction.type === "cancel") {
         await api.cancelJob(pwAction.jobId, pw);
@@ -563,22 +669,14 @@ export function Jobs() {
     }
   }
 
-  const pending = queued.filter(j => j.status === "pending");
-  const launched = queued.filter(j => j.status !== "pending");
-
   return (
     <div className="space-y-6">
-      {/* Header */}
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-bold">Jobs</h1>
-          <p className="text-sm text-muted-foreground">
-            Queue and manage pipeline runs. A password (STOCKPRED_PW) is required to launch or cancel.
-          </p>
+          <p className="text-sm text-muted-foreground">Queue pipeline runs. Password (STOCKPRED_PW) required to launch or cancel.</p>
         </div>
-        <Button onClick={() => setShowNewJobForm(true)}>
-          <Plus className="h-4 w-4" /> New Job
-        </Button>
+        <Button onClick={() => setShowNewJobForm(true)}><Plus className="h-4 w-4" /> New Job</Button>
       </div>
 
       {/* Active & History */}
@@ -586,8 +684,7 @@ export function Jobs() {
         <CardHeader>
           <CardTitle className="flex items-center justify-between text-base">
             Active &amp; History
-            <button onClick={() => qc.invalidateQueries({ queryKey: ["jobs"] })}
-              className="text-muted-foreground hover:text-foreground">
+            <button onClick={() => qc.invalidateQueries({ queryKey: ["jobs"] })} className="text-muted-foreground hover:text-foreground">
               <RefreshCw className="h-4 w-4" />
             </button>
           </CardTitle>
@@ -612,23 +709,18 @@ export function Jobs() {
                 <tbody>
                   {jobs.map(j => {
                     const isSelected = selectedJobId === j.job_id;
-                    const isActive = ["running", "queued", "cancelling"].includes(j.status);
+                    const isActive = ["running","queued","cancelling"].includes(j.status);
                     return (
                       <tr key={j.job_id}
                         onClick={() => setSelectedJobId(isSelected ? null : j.job_id)}
-                        className={cn(
-                          "cursor-pointer border-b border-border/50 transition-colors hover:bg-accent/50",
-                          isSelected && "bg-accent",
-                        )}>
+                        className={cn("cursor-pointer border-b border-border/50 transition-colors hover:bg-accent/50", isSelected && "bg-accent")}>
                         <td className="px-4 py-2">
                           <JobIdCell jobId={j.job_id} onClick={() => setSelectedJobId(isSelected ? null : j.job_id)} />
                         </td>
                         <td className="px-4 py-2">{statusBadge(j.status)}</td>
                         <td className="px-4 py-2">{detectPhase(j.config)}</td>
                         <td className="px-4 py-2">{String(j.config.n_tickers ?? "all")}</td>
-                        <td className="px-4 py-2 text-xs">
-                          {isActive ? fmtElapsed(j.started_at) + " ago" : fmtTs(j.started_at)}
-                        </td>
+                        <td className="px-4 py-2 text-xs">{isActive ? fmtElapsed(j.started_at) + " ago" : fmtTs(j.started_at)}</td>
                         <td className="px-4 py-2 text-xs">{fmtDuration(j.elapsed_s)}</td>
                         <td className="px-4 py-2 text-xs text-muted-foreground">{j.run_id ?? "—"}</td>
                       </tr>
@@ -638,15 +730,10 @@ export function Jobs() {
               </table>
             </div>
           )}
-
-          {/* Detail panel */}
           {selectedJobId && (
             <div className="px-4 pb-4">
-              <JobDetailPanel
-                jobId={selectedJobId}
-                onClose={() => setSelectedJobId(null)}
-                onCancel={id => { setPwError(null); setPwAction({ type: "cancel", jobId: id }); }}
-              />
+              <JobDetailPanel jobId={selectedJobId} onClose={() => setSelectedJobId(null)}
+                onCancel={id => { setPwError(null); setPwAction({ type: "cancel", jobId: id }); }} />
             </div>
           )}
         </CardContent>
@@ -657,24 +744,21 @@ export function Jobs() {
         <CardHeader>
           <CardTitle className="flex items-center justify-between text-base">
             <span>
-              Queued (pending launch)
-              {pending.length > 0 && (
+              Pending (awaiting launch)
+              {queued.filter(j => j.status === "pending").length > 0 && (
                 <span className="ml-2 rounded-full bg-yellow-100 px-2 py-0.5 text-xs text-yellow-800 dark:bg-yellow-900/40 dark:text-yellow-300">
-                  {pending.length} / 5
+                  {queued.filter(j => j.status === "pending").length} / 5
                 </span>
               )}
             </span>
-            <button onClick={() => qc.invalidateQueries({ queryKey: ["queued"] })}
-              className="text-muted-foreground hover:text-foreground">
+            <button onClick={() => qc.invalidateQueries({ queryKey: ["queued"] })} className="text-muted-foreground hover:text-foreground">
               <RefreshCw className="h-4 w-4" />
             </button>
           </CardTitle>
         </CardHeader>
         <CardContent className="p-0">
           {queued.length === 0 ? (
-            <p className="px-4 py-6 text-center text-sm text-muted-foreground">
-              No queued jobs. Click <strong>New Job</strong> to create one.
-            </p>
+            <p className="px-4 py-6 text-center text-sm text-muted-foreground">No queued jobs. Click <strong>New Job</strong> to create one.</p>
           ) : (
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
@@ -692,23 +776,22 @@ export function Jobs() {
                     <tr key={q.id} className="border-b border-border/50">
                       <td className="px-4 py-2 font-mono text-xs">{q.id.slice(0, 8)}…</td>
                       <td className="px-4 py-2">{statusBadge(q.status)}</td>
-                      <td className="px-4 py-2 text-xs text-muted-foreground">{configSummary(q.config)}</td>
+                      <td className="px-4 py-2 text-xs text-muted-foreground">
+                        Phase {detectPhase(q.config)} · {String(q.config.n_tickers ?? "all")} tickers
+                        {(q.config.horizons as number[] | null)?.length ? ` · h=${(q.config.horizons as number[]).join(",")}` : ""}
+                      </td>
                       <td className="px-4 py-2 text-xs">{fmtTs(q.created_at)}</td>
                       <td className="px-4 py-2">
-                        <div className="flex gap-1">
-                          {q.status === "pending" && (
-                            <>
-                              <Button variant="default" size="sm"
-                                onClick={() => { setPwError(null); setPwAction({ type: "launch", queueId: q.id }); }}>
-                                <Play className="h-3 w-3" /> Launch
-                              </Button>
-                              <Button variant="ghost" size="sm"
-                                onClick={() => { setPwError(null); setPwAction({ type: "delete", queueId: q.id }); }}>
-                                <Trash2 className="h-3 w-3" />
-                              </Button>
-                            </>
-                          )}
-                        </div>
+                        {q.status === "pending" && (
+                          <div className="flex gap-1">
+                            <Button variant="default" size="sm" onClick={() => { setPwError(null); setPwAction({ type: "launch", queueId: q.id }); }}>
+                              <Play className="h-3 w-3" /> Launch
+                            </Button>
+                            <Button variant="ghost" size="sm" onClick={() => { setPwError(null); setPwAction({ type: "delete", queueId: q.id }); }}>
+                              <Trash2 className="h-3 w-3" />
+                            </Button>
+                          </div>
+                        )}
                       </td>
                     </tr>
                   ))}
@@ -719,32 +802,19 @@ export function Jobs() {
         </CardContent>
       </Card>
 
-      {/* Modals */}
-      {showNewJobForm && (
-        <NewJobForm
-          onClose={() => setShowNewJobForm(false)}
-          onQueued={() => { setShowNewJobForm(false); }}
-        />
-      )}
+      {showNewJobForm && <NewJobForm onClose={() => setShowNewJobForm(false)} onQueued={() => setShowNewJobForm(false)} />}
 
       {pwAction && (
         <PasswordModal
-          title={
-            pwAction.type === "cancel" ? "Cancel Job" :
-            pwAction.type === "launch" ? "Launch Job" : "Delete Queued Job"
-          }
+          title={pwAction.type === "cancel" ? "Cancel Job" : pwAction.type === "launch" ? "Launch Job" : "Delete Queued Job"}
           description={
             pwAction.type === "cancel"
-              ? "The running job will be soft-cancelled — it will finish its current step but results won't be saved."
-              : pwAction.type === "launch"
-              ? "Enter STOCKPRED_PW to launch this queued job."
+              ? "The job will be interrupted — it may take a few seconds to stop if LightGBM is mid-training."
+              : pwAction.type === "launch" ? "Enter STOCKPRED_PW to launch this queued job."
               : "Enter STOCKPRED_PW to permanently delete this queued job."
           }
-          confirmLabel={
-            pwAction.type === "cancel" ? "Cancel Job" :
-            pwAction.type === "launch" ? "Launch" : "Delete"
-          }
-          confirmVariant={pwAction.type === "delete" || pwAction.type === "cancel" ? "destructive" : "default"}
+          confirmLabel={pwAction.type === "cancel" ? "Cancel Job" : pwAction.type === "launch" ? "Launch" : "Delete"}
+          confirmVariant={pwAction.type !== "launch" ? "destructive" : "default"}
           onConfirm={handlePwConfirm}
           onClose={() => { setPwAction(null); setPwError(null); }}
           isLoading={pwLoading}

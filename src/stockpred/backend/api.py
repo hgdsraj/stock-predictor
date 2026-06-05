@@ -244,6 +244,22 @@ def _build_pipeline_cfg(
             min_trade_threshold=body.min_trade_threshold,
             ensemble_weighting=body.ensemble_weighting,
             bootstrap_n=body.bootstrap_n,
+            # Phase 8-9
+            use_meta_labelling=body.use_meta_labelling,
+            meta_threshold=body.meta_threshold,
+            meta_mode=body.meta_mode,
+            meta_conf_floor=body.meta_conf_floor,
+            meta_conf_cap=body.meta_conf_cap,
+            meta_walk_forward_folds=body.meta_walk_forward_folds,
+            meta_per_sector=body.meta_per_sector,
+            use_triple_barrier_labels=body.use_triple_barrier_labels,
+            tb_k_sigma=body.tb_k_sigma,
+            # Phase 8/11
+            ranks_only=body.ranks_only,
+            feature_exclude=tuple(body.feature_exclude),
+            # Phase 12-13
+            use_edgar_features=body.use_edgar_features,
+            use_edgar_item_features=body.use_edgar_item_features,
         )
     else:
         horizons = tuple(body.horizons) if body.horizons is not None else (1, 5, 21)
@@ -270,7 +286,9 @@ def _launch_pipeline(pipeline_cfg, job_id: str) -> None:
             jobs_mod.run_pipeline_job(
                 AppState.SessionLocal, pipeline_cfg=pipeline_cfg, job_id=job_id
             )
-    threading.Thread(target=_run, daemon=True).start()
+    t = threading.Thread(target=_run, daemon=True)
+    jobs_mod.register_job_thread(job_id, t)
+    t.start()
 
 
 # ----- Routes ------------------------------------------------------------

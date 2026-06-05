@@ -211,6 +211,70 @@ class RefreshRequest(BaseModel):
         default=500, ge=1, description="[Phase 5] Number of bootstrap samples for stress test."
     )
 
+    # --- Phase 8: meta-labelling (López de Prado Ch. 3.6) ---
+    use_meta_labelling: bool = Field(
+        default=False,
+        description="[Phase 8] Train a secondary classifier to gate signals by P(primary score is correct).",
+    )
+    meta_threshold: float = Field(
+        default=0.55, ge=0, le=1,
+        description="[Phase 8] Min P(correct) required to pass the meta-gate.",
+    )
+    meta_mode: Literal["binary", "confidence"] = Field(
+        default="binary",
+        description="[Phase 9] 'binary' = hard gate; 'confidence' = scale signal by P.",
+    )
+    meta_conf_floor: float = Field(
+        default=0.5, ge=0, le=1,
+        description="[Phase 9] Lower bound for confidence scaling (P below this → weight 0).",
+    )
+    meta_conf_cap: float = Field(
+        default=1.0, ge=0, le=1,
+        description="[Phase 9] Upper bound for confidence scaling (P above this → full weight).",
+    )
+    meta_walk_forward_folds: int = Field(
+        default=1, ge=1,
+        description="[Phase 9] CV folds for meta classifier. 1 = single-pass (faster); >1 = proper walk-forward.",
+    )
+    meta_per_sector: bool = Field(
+        default=False,
+        description="[Phase 9] Train one meta classifier per GICS sector instead of globally.",
+    )
+
+    # --- Phase 8: triple-barrier labels ---
+    use_triple_barrier_labels: bool = Field(
+        default=False,
+        description="[Phase 8] Use triple-barrier labels instead of forward returns as the regression target.",
+    )
+    tb_k_sigma: float = Field(
+        default=2.0, gt=0,
+        description="[Phase 8] Barrier width in trailing-volatility units.",
+    )
+
+    # --- Phase 8: feature transformations ---
+    ranks_only: bool = Field(
+        default=False,
+        description="[Phase 8] Drop raw feature values; keep only cross-sectional rank columns + EDGAR/regime.",
+    )
+
+    # --- Phase 11: feature pruning ---
+    feature_exclude: list[str] = Field(
+        default=[],
+        description="[Phase 11] Feature names to exclude from training (e.g. low-IC features from audit).",
+    )
+
+    # --- Phase 12: SEC EDGAR 8-K event features ---
+    use_edgar_features: bool = Field(
+        default=False,
+        description="[Phase 12] Add SEC 8-K filing event counts (has_8k, count_5d/21d/63d) as features.",
+    )
+
+    # --- Phase 13: SEC EDGAR 8-K per-item features ---
+    use_edgar_item_features: bool = Field(
+        default=False,
+        description="[Phase 13] Add per-item-code 8-K features (CEO changes, earnings releases, etc.).",
+    )
+
 
 class JobResponse(BaseModel):
     job_id: str
