@@ -14,10 +14,21 @@ We use LightGBM because:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
-import lightgbm as lgb
 import numpy as np
 import pandas as pd
+
+if TYPE_CHECKING:
+    import lightgbm as lgb
+
+# NOTE: ``lightgbm`` is imported lazily inside the functions that actually
+# train a model (see train_gbm). LightGBM dlopen's a native OpenMP runtime
+# (libomp) at import time; importing it at module top would make the whole
+# backend fail to boot on machines without libomp installed — even for paths
+# that never train a model (e.g. serving the dashboard, or seeding synthetic
+# data). Keeping the import lazy lets everything except actual training run
+# without the native dependency.
 
 
 @dataclass
@@ -46,6 +57,8 @@ def train_gbm(
     y_valid: pd.Series | None = None,
     cfg: GBMConfig | None = None,
 ) -> lgb.Booster:
+    import lightgbm as lgb
+
     cfg = cfg or GBMConfig()
     mask = y_train.notna()
     Xt = X_train.loc[mask]

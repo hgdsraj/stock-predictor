@@ -106,6 +106,37 @@ open http://localhost:8000
 See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for Fly.io, Render, and VM
 deployment walkthroughs.
 
+### Local testing with synthetic data (no yfinance, no model training)
+
+To click through the whole dashboard without fetching real data or running
+the pipeline, seed a throwaway SQLite DB with randomly-generated data and
+serve it:
+
+```bash
+# Seed data/local_test.db with fake prices/predictions/backtest and serve it
+uv run python scripts/seed_synthetic.py --serve
+# → backend on http://127.0.0.1:8000 (open it for the built dashboard)
+```
+
+This writes to `data/local_test.db`, so your real `data/app.db` is never
+touched. Useful flags: `--n-tickers`, `--days`, `--seed`, `--reset`,
+`--port`. The generated tickers (e.g. `ZQ07`) are obviously fake and every
+number on the page is random — it exists only to exercise the UI.
+
+To work on the **React frontend** against that synthetic data with hot
+reload, start the backend (above) and in another shell:
+
+```bash
+cd web
+npm install          # first time only
+npm run dev          # Vite dev server on http://127.0.0.1:5173
+```
+
+Open <http://127.0.0.1:5173>. Vite proxies API calls to the backend on
+`:8000`, so edits to the React code hot-reload instantly while still showing
+the seeded data. See [`docs/USAGE.md`](docs/USAGE.md#local-testing-with-synthetic-data)
+for the full walkthrough.
+
 ## Frontend pages
 
 - **Home** — today's top long and short cohorts, KPI tiles, equity curve.

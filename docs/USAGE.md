@@ -78,8 +78,59 @@ cd web && npm run dev
 # open http://localhost:5173
 ```
 
-Vite proxies `/api/*` paths to `http://127.0.0.1:8000`. Hot module reload
-gives you instant UI feedback.
+Vite proxies API calls (`/healthz`, `/tickers`, `/predictions`, `/runs`,
+`/backtest`, `/jobs`) to `http://127.0.0.1:8000` (see
+[`web/vite.config.ts`](../web/vite.config.ts)). Hot module reload gives you
+instant UI feedback. The backend it proxies to can hold real data *or*
+synthetic data — see the next section.
+
+### Local testing with synthetic data
+
+You usually don't want to wait for a real pipeline run (and hammer yfinance)
+just to see the dashboard or work on the frontend. `scripts/seed_synthetic.py`
+fills a **separate** SQLite DB (`data/local_test.db`, so your real
+`data/app.db` is untouched) with randomly-generated prices, fundamentals,
+predictions, an equity curve, and a finished run — shaped exactly like a real
+pipeline result, so every page and every endpoint has data to show.
+
+```bash
+# Seed the synthetic DB and start the backend on http://127.0.0.1:8000
+uv run python scripts/seed_synthetic.py --serve
+```
+
+Open <http://127.0.0.1:8000> for the built dashboard (if you've run
+`npm run build`), or for live frontend work start Vite against it:
+
+```bash
+# Terminal 1 — backend serving the synthetic DB
+uv run python scripts/seed_synthetic.py --serve
+
+# Terminal 2 — Vite dev server with hot reload, proxying to :8000
+cd web && npm install && npm run dev
+# open http://127.0.0.1:5173
+```
+
+Useful flags:
+
+| Flag           | Default               | Meaning                                            |
+| -------------- | --------------------- | -------------------------------------------------- |
+| `--db`         | `data/local_test.db`  | Where to write the synthetic SQLite DB.            |
+| `--n-tickers`  | `80`                  | Number of synthetic tickers to generate.           |
+| `--days`       | `500`                 | Trading days of price history.                     |
+| `--seed`       | `42`                  | RNG seed (same seed → identical data).             |
+| `--reset`      | off                   | Delete the synthetic DB (and `-wal`/`-shm`) first. |
+| `--serve`      | off                   | Launch the backend after seeding.                  |
+| `--host`/`--port` | `127.0.0.1`/`8000` | Server bind address (with `--serve`).              |
+
+The generated tickers (e.g. `ZQ07`) are obviously fake and every number is
+random — nothing here implies any real-world prediction. To re-seed cleanly,
+add `--reset`. To seed without serving (e.g. to point your own server at it):
+
+```bash
+uv run python scripts/seed_synthetic.py --reset --n-tickers 120 --days 750
+STOCKPRED_DB=data/local_test.db STOCKPRED_DISABLE_SCHEDULER=1 \
+    uv run python scripts/serve.py
+```
 
 ---
 
