@@ -801,6 +801,15 @@ def register_routes(app: FastAPI) -> None:
         ticker: str,
         limit: int = Query(default=20, ge=1, le=100),
         refresh: bool = Query(default=False),
+        with_sentiment: bool = Query(
+            default=True,
+            description=(
+                "Phase 15: when True (default), each headline is scored "
+                "with FinBERT (cached). If FinBERT isn't installed the "
+                "score fields are None and the rest of the payload is "
+                "unchanged. Set False to skip sentiment lookup entirely."
+            ),
+        ),
         s: Session = Depends(get_db),
     ):
         try:
@@ -813,6 +822,21 @@ def register_routes(app: FastAPI) -> None:
             items = news_mod.fetch_one(ticker, max_items=limit, refresh=True)
             store.upsert_news(s, ticker, items)
         rows = store.news_for_ticker(s, ticker, limit=limit)
+
+        # Phase 15: score headlines via FinBERT (lazy-loaded; cached
+        # per headline). If not installed, all sentiment_* fields stay
+        # None and the legacy payload is preserved exactly.
+        scores: list[dict | None] = [None] * len(rows)
+        if with_sentiment and rows:
+            try:
+                from stockpred.data import sentiment as sent_mod
+
+                titles = [r.title or "" for r in rows]
+                scored = sent_mod.score_headlines(titles)
+                scores = [s if s.get("label") != "unavailable" else None for s in scored]
+            except Exception as e:  # noqa: BLE001
+                log.warning("Sentiment scoring failed (%s); skipping.", e)
+
         return [
             schemas.NewsHeadline(
                 uuid=r.uuid,
@@ -821,8 +845,13 @@ def register_routes(app: FastAPI) -> None:
                 link=r.link,
                 type=r.type,
                 published_at=r.published_at,
+                sentiment_label=(scores[i] or {}).get("label") if scores[i] else None,
+                sentiment_net=(scores[i] or {}).get("net") if scores[i] else None,
+                sentiment_positive=(scores[i] or {}).get("positive") if scores[i] else None,
+                sentiment_neutral=(scores[i] or {}).get("neutral") if scores[i] else None,
+                sentiment_negative=(scores[i] or {}).get("negative") if scores[i] else None,
             )
-            for r in rows
+            for i, r in enumerate(rows)
         ]
 
 

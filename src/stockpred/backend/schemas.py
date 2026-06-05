@@ -426,3 +426,12 @@ class NewsHeadline(BaseModel):
     link: str | None
     type: str | None
     published_at: dt.datetime | None
+    # Phase 15 FinBERT sentiment (live-mode, DASHBOARD ONLY).
+    # `sentiment_label`: 'positive'|'neutral'|'negative'|'unavailable'.
+    # `sentiment_net` in [-1, +1] = positive_prob - negative_prob.
+    # All fields None when FinBERT isn't installed.
+    sentiment_label: str | None = None
+    sentiment_net: float | None = None
+    sentiment_positive: float | None = None
+    sentiment_neutral: float | None = None
+    sentiment_negative: float | None = None
