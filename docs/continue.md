@@ -32,7 +32,7 @@ Each phase commit is on `main`. `git log --oneline` shows them in reverse order.
 | 9 | DONE | −0.57 (made things worse) | [−1.03, −0.15] | Confidence sizing + walk-forward meta-CV + per-sector meta. Real code-rigor improvements but did not improve backtest. Best remains Phase 8. |
 | 10 | DONE | **+0.08** (confidence floor=0.60); −0.16 (binary) | [−0.38, +0.49] (best); [−0.67, +0.29] (binary) | Confidence-floor sweep on Phase 8 best config. Hypothesis confirmed: high floor (≥ 0.55) DOES recover Phase-8-like behavior; default Phase 9 floor=0.50 was the regression. **Best point estimate** at floor=0.60 (+0.077) but CI still straddles zero. NO config has CI strictly above zero. Reproducibility ✓: binary baseline matched documented Phase 8 (−0.158 vs −0.16); floor=0.50 matched documented Phase 9 (−0.570 vs −0.57). Reviewer caught C1 (baseline drift risk) + H1 (dead CLI flag) + 3 MED; all fixed. |
 | 11 | DONE | **−0.11** (drop bottom 25%); −0.16 (baseline); −0.19 (drop top 25%) | [−0.58, +0.38] / [−0.67, +0.29] / [−0.63, +0.24] | Feature pruning via per_feature_audit on big universe (20 features, all positive `pct_drop` — no leak suspects). Driver: `scripts/phase11_feature_pruning.py`. Pipeline hook: `PipelineV5Config.feature_exclude`. Dropped 5 lowest-impact features (adv_proxy_21, dist_low_252_rank, ret_252d_rank, kurt_63, dist_low_252) → marginally better point estimate (+0.048 vs baseline) AND smaller DD (−13.2% vs −16.0%). Sanity check passes: dropping top 5 (vol_21d, vol_21d_rank, vol_63d_rank, kurt_63_rank, macd_signal) made things worse. Still NO config CI strictly above zero. Honest top-line unchanged. 4 new tests + RSS logging added. |
-| 12 | INFRA DONE; PRODUCTION SMOKE RUNNING | TBD | TBD | SEC EDGAR 8-K event features wired in. New module `src/stockpred/data/edgar.py` (free, no API key, respects SEC's 10 req/sec rate limit + User-Agent rule). New flag `--edgar-events` on `run_phase5.py`. Pipeline hook: `PipelineV5Config.use_edgar_features`. Reviewer caught 2 CRITICAL + 1 HIGH + 1 production-smoke regression (alternate "File Name" vs "Filename" header spelling in 2014 form indexes); all fixed. 22 tests passing (including P&G multi-space-name regression, weekend-filing forward-shift, cache poisoning, alternate header spelling). RAM impact on tiny smoke (40 ticker × 3yr): 0.38 GB peak (well under 6 GB budget). |
+| 12 | DONE | **−0.38** (EDGAR enabled, WORSE than baseline) | [−0.84, +0.08] | SEC EDGAR 8-K event features. New module `src/stockpred/data/edgar.py` (free, full historical, no API key, SEC-compliant). New CLI flag `--edgar-events`. Adds 4 features: `edgar_has_8k`, `edgar_count_8k_{5,21,63}d`. **Honest finding**: HURT the strategy. Sharpe dropped −0.16 → −0.38, DD widened −16% → −20%. CI still straddles zero (not statistically worse) but point estimate clearly degraded vs Phase 11 baseline. Likely cause: count features are firm-size-noise; `has_8k` lacks sentiment direction. RAM: 0.97 GB peak (well under 6 GB budget); cold EDGAR fetch ~4 min (44 quarters, rate-limited). Sub-agent reviewer caught 2 CRITICAL + 1 HIGH (Procter&Gamble parser bug) + 1 production-smoke regression (alternate 'File Name' header spelling in 2014); all fixed before commit. 22 tests passing. Total suite: 127. |
 
 **Best honest config (Phase 11; supersedes Phase 8)**:
 ```bash
@@ -197,13 +197,16 @@ Next candidates:
    `ret_252d_rank`, `kurt_63`, `dist_low_252`. Subsequent phases should
    layer on TOP of this pruned baseline via the new `feature_exclude`
    config field.
-2. **Phase 12 — EDGAR 8-K event flags as features** *(INFRA DONE;
-   production smoke running as of this commit)*: see ledger row 12.
-   Module: `src/stockpred/data/edgar.py`. CLI: `--edgar-events`.
-   Features (all under `edgar_` prefix, kept by `--ranks-only`):
-   `has_8k` (int8), `count_8k_5d/21d/63d` (int16). Pipeline integration
-   uses `PipelineV5Config.use_edgar_features=True`. Production sweep
-   pending; will land in follow-up commit.
+2. **Phase 12 — EDGAR 8-K event flags as features** *(DONE; result
+   was honest-negative)*: see ledger row 12. Sharpe degraded from
+   −0.16 → −0.38 vs Phase 11 baseline. Likely cause: count features
+   are firm-size noise; `has_8k` lacks sentiment direction. **Default
+   `--edgar-events` to OFF; do not enable it unless paired with a
+   sentiment-direction signal (Phase 13 GDELT, or filtered to
+   specific 8-K item codes).** Future enhancement: extract 8-K item
+   codes (`item_5.02 = CEO change`, `item_2.02 = earnings release`,
+   etc.) as separate per-(date, ticker) flags. Item-coded events
+   carry directional information; raw counts don't.
 3. **Phase 13 — GDELT tone + event counts** *(user requested
    2026-06-04)*: free GDELT 2.0 GKG (Global Knowledge Graph) per-ticker
    daily tone score and theme counts, historical to 2015. Adds
