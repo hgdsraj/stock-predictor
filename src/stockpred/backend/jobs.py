@@ -231,11 +231,15 @@ def list_jobs(limit: int = 25, session_factory=None) -> list[dict]:
         except Exception:  # noqa: BLE001
             pass
 
-    combined = sorted(
-        memory_items + db_items,
-        key=lambda x: x.get("updated_at") or datetime.min,
-        reverse=True,
-    )
+    def _sort_key(x):
+        v = x.get("updated_at") or datetime.min
+        # Normalise to naive UTC so timezone-aware (in-memory) and
+        # timezone-naive (DB) datetimes can be compared together.
+        if getattr(v, "tzinfo", None) is not None:
+            v = v.replace(tzinfo=None)
+        return v
+
+    combined = sorted(memory_items + db_items, key=_sort_key, reverse=True)
     return combined[:limit]
 
 
