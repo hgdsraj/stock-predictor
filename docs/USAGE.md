@@ -479,6 +479,10 @@ features.
 
 ## 6c. News features (Phase 12–15)
 
+**Want the BEST config in one curl command?** See
+[`docs/OPTIMAL.md`](OPTIMAL.md) — single source of truth for the
+best-known config, full parameter explanation, honest expectations.
+
 **See the dedicated [`docs/NEWS.md`](NEWS.md)** for the complete
 end-to-end guide to the four news data sources (EDGAR 8-K events,
 EDGAR 8-K item codes, GDELT daily tone, FinBERT live-mode sentiment),

@@ -385,8 +385,12 @@ change to the constraints:
 
 ## Project documents
 
+- [`docs/OPTIMAL.md`](docs/OPTIMAL.md) — **THE BEST CONFIG.** Single
+   curl command, full parameter explanation, honest expectations on
+   Sharpe / CI / drawdown. Read this if you just want to run the best-
+   known model.
 - [`docs/CONCEPTS.md`](docs/CONCEPTS.md) — **terminology & ideas for
-   beginners.** Read first.
+   beginners.** Read first if you've never touched factor investing.
 - [`docs/USAGE.md`](docs/USAGE.md) — install, run, interpret, operate,
    extend.
 - [`docs/NEWS.md`](docs/NEWS.md) — **news features deep dive** (SEC
