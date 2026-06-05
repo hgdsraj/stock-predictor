@@ -477,7 +477,16 @@ features.
 
 ---
 
-## 6c. News features (Phase 12–14)
+## 6c. News features (Phase 12–15)
+
+**See the dedicated [`docs/NEWS.md`](NEWS.md)** for the complete
+end-to-end guide to the four news data sources (EDGAR 8-K events,
+EDGAR 8-K item codes, GDELT daily tone, FinBERT live-mode sentiment),
+including one-time setup curl commands, daily-run examples, full
+results table, and leakage-safety arguments.
+
+This section is the abbreviated quick-reference; **NEWS.md is the
+canonical doc**.
 
 ### Phase 12 — SEC EDGAR 8-K event flags  *(IMPLEMENTED)*
 

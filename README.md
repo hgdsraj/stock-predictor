@@ -386,11 +386,16 @@ change to the constraints:
 ## Project documents
 
 - [`docs/CONCEPTS.md`](docs/CONCEPTS.md) — **terminology & ideas for
-  beginners.** Read first.
+   beginners.** Read first.
 - [`docs/USAGE.md`](docs/USAGE.md) — install, run, interpret, operate,
-  extend.
+   extend.
+- [`docs/NEWS.md`](docs/NEWS.md) — **news features deep dive** (SEC
+   EDGAR events + items, GDELT tone, FinBERT live sentiment). Setup
+   curl commands, results table, leakage-safety arguments, memory
+   budget. Read this before enabling `--edgar-items`, `--gdelt`, or
+   FinBERT.
 - [`docs/PROJECT_LOG.md`](docs/PROJECT_LOG.md) — full chronological log
-  including the strategy-research sub-agent's report and Phase 5 results.
+   including the strategy-research sub-agent's report and Phase 5 results.
 - [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) — Docker, Fly, Render, VM.
 - [`docs/HANDOFF.md`](docs/HANDOFF.md) — resume protocol for new sessions.
 
