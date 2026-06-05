@@ -187,6 +187,14 @@ class PipelineV5Config:
     # holdout. Empty tuple = no pruning (default).
     feature_exclude: tuple[str, ...] = ()
 
+    # Phase 12: SEC EDGAR 8-K event features. When True, fetches all
+    # 8-K filings in the backtest range, maps to per-ticker daily
+    # has_8k flag + rolling counts (5/21/63d windows). Columns are
+    # prefixed `edgar_` so they survive `ranks_only` filtering. Free,
+    # no API key required; respects SEC's 10 req/sec rate limit and
+    # User-Agent rule (set EDGAR_USER_AGENT env var to override).
+    use_edgar_features: bool = False
+
     # Stress
     bootstrap_n: int = 500
 
@@ -684,15 +692,70 @@ def run_pipeline_v5(cfg: PipelineV5Config | None = None) -> dict:
         except Exception as e:  # noqa: BLE001
             log.warning("Regime features failed (%s); continuing.", e)
 
+    # Phase 12: SEC EDGAR 8-K event features. Joined into the master
+    # panel as `edgar_has_8k`, `edgar_count_8k_5d`, etc. The prefix
+    # `edgar_` is recognised by the ranks_only filter below so these
+    # discrete event flags survive (they have no _rank counterpart by
+    # design — event indicators don't need cross-sectional ranking).
+    if cfg.use_edgar_features:
+        log.info("Building EDGAR 8-K event features...")
+        # Reviewer CRITICAL #2: narrow the except so MemoryError and
+        # other "you really should hear about this" errors propagate.
+        # MemoryError, KeyboardInterrupt are intentionally not caught.
+        import requests as _requests
+
+        try:
+            from stockpred.data import edgar as edgar_mod
+
+            edgar_panel = edgar_mod.build_8k_features(
+                tickers=list(close.columns),
+                trading_days=close.index,
+                start=cfg.start_date,
+                end=cfg.end_date,
+                refresh=cfg.refresh_data,
+            )
+            if not edgar_panel.empty:
+                # Prefix columns with `edgar_` so they survive ranks_only.
+                edgar_panel = edgar_panel.add_prefix("edgar_")
+                feats = feats.join(edgar_panel, how="left")
+                # Fill missing (ticker not in SEC map) with 0 — i.e.
+                # treat absent data as "no filings reported".
+                edgar_cols = [c for c in feats.columns if c.startswith("edgar_")]
+                for c in edgar_cols:
+                    feats[c] = feats[c].fillna(0).astype("int16")
+                log.info("After EDGAR: %s rows x %s cols", *feats.shape)
+                # Memory hygiene: explicit del + gc per RAM constraint #8.
+                del edgar_panel
+                import gc as _gc
+
+                _gc.collect()
+            else:
+                # When EDGAR is explicitly requested but yields empty,
+                # this is suspicious enough to WARN (not just skip).
+                log.warning(
+                    "EDGAR features: empty panel returned. Check that "
+                    "tickers have SEC CIK matches and the date range has filings."
+                )
+        except (
+            _requests.RequestException,  # network / 403 / timeout
+            OSError,  # disk / cache I/O
+            ValueError,  # parser / dtype
+            RuntimeError,  # explicit raise from edgar module (validation fail)
+        ) as e:
+            log.warning("EDGAR features failed (%s); continuing without.", e)
+
     # Phase 8: optionally drop the raw (non-rank) numeric columns. Per-feature
     # audit on the medium universe showed raw versions degrade ~100% under
     # the hard-cutoff audit while their _rank versions degrade only ~15-50%;
     # keeping only ranks is a defensible noise-reduction move.
     if cfg.ranks_only:
-        # Keep: anything ending in _rank, anything prefixed sec_ (sector dummies),
-        # anything prefixed reg_ (regime broadcasts). Drop the rest.
+        # Keep: anything ending in _rank, anything prefixed sec_ (sector
+        # dummies), anything prefixed reg_ (regime broadcasts), anything
+        # prefixed edgar_ (Phase 12 event features). Drop the rest.
         keep_cols = [
-            c for c in feats.columns if c.endswith("_rank") or c.startswith(("sec_", "reg_"))
+            c
+            for c in feats.columns
+            if c.endswith("_rank") or c.startswith(("sec_", "reg_", "edgar_"))
         ]
         if keep_cols:
             log.info(
@@ -702,7 +765,7 @@ def run_pipeline_v5(cfg: PipelineV5Config | None = None) -> dict:
             )
             feats = feats[keep_cols]
         else:
-            log.warning("ranks_only: no rank/sec/reg columns found; keeping all")
+            log.warning("ranks_only: no rank/sec/reg/edgar columns found; keeping all")
 
     # Phase 11: explicit feature blocklist. Applied AFTER ranks_only so the
     # blocklist can target either raw or rank columns regardless of whether

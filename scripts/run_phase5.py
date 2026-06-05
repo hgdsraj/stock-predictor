@@ -131,6 +131,16 @@ def parse_args() -> argparse.Namespace:
         default="block",
         help="block (default; honest for overlapping horizons) or iid",
     )
+    p.add_argument(
+        "--edgar-events",
+        action="store_true",
+        help=(
+            "Phase 12: enable SEC EDGAR 8-K event features (per-ticker "
+            "daily has_8k flag + rolling counts 5d/21d/63d). Free, no "
+            "API key; respects SEC's 10 req/sec rate limit. Set env "
+            "EDGAR_USER_AGENT='Your Name email@x.com' to identify."
+        ),
+    )
     p.add_argument("--refresh", action="store_true")
     p.add_argument("--verbose", "-v", action="store_true")
     return p.parse_args()
@@ -186,6 +196,7 @@ def main() -> int:
         use_triple_barrier_labels=args.triple_barrier,
         tb_k_sigma=args.tb_k_sigma,
         ranks_only=args.ranks_only,
+        use_edgar_features=args.edgar_events,
         refresh_data=args.refresh,
     )
     r = run_pipeline_v5(cfg)
