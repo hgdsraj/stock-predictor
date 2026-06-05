@@ -260,6 +260,266 @@ The script also runs:
 
 ---
 
+## 6b. Phase 6–11 improvements (advanced flags)
+
+Phases 6–11 layer in research-grade portfolio tooling. None of them is
+guaranteed to flip HOLDOUT Sharpe above zero (see `docs/continue.md`
+phase ledger for the honest numbers), but each adds a tool you can
+combine with the Phase 5 baseline.
+
+### Phase 6 — Tier-2 features, regime features, beta neutralisation, block bootstrap
+
+```bash
+uv run python scripts/run_phase5.py \
+    --start 2014-01-01 --end 2024-12-31 --n-tickers 150 \
+    --beta-neutralise \
+    --bootstrap-method block
+```
+
+- `--beta-neutralise`: subtract SPY exposure from the daily long-short
+  PnL so the strategy is a pure-alpha bet.
+- `--bootstrap-method block` (default): the bootstrap re-samples in
+  blocks of size = horizon to preserve autocorrelation from overlapping
+  positions. The IID alternative (`--bootstrap-method iid`) over-states
+  significance for overlapping-horizon strategies.
+- `--no-tier2 / --no-regime / --no-sector`: turn OFF the Tier-2 features
+  (12-1 momentum, IVOL, β, Amihud illiquidity), regime broadcasts (VIX
+  quintile, term-spread quintile), and sector dummies respectively. The
+  Phase 8 best config has all three OFF.
+
+### Phase 7 — HRP portfolio + triple-barrier label scaffold
+
+```bash
+uv run python scripts/run_phase5.py \
+    --start 2014-01-01 --end 2024-12-31 --n-tickers 150 \
+    --position-sizing hrp
+```
+
+- `--position-sizing hrp`: Hierarchical Risk Parity weights (López de
+  Prado Ch. 16). Splits the long sleeve and short sleeve into clusters
+  by correlation and allocates inverse-variance within each cluster.
+- The backtest engine clips per-name `pct_change` at ±50% to defend
+  against delisted-ticker price corruptions from yfinance (cosmetic
+  warning spam in the log when this fires).
+
+### Phase 8 — meta-labelling + ranks_only + triple-barrier labels
+
+```bash
+uv run python scripts/run_phase5.py \
+    --start 2014-01-01 --end 2024-12-31 --n-tickers 150 \
+    --meta-labelling --meta-threshold 0.55 \
+    --ranks-only \
+    [--triple-barrier --tb-k-sigma 2.0]
+```
+
+- `--meta-labelling`: train a secondary binary classifier per fold
+  predicting `P(primary score has correct sign)`. Gate the primary
+  score: zero-out rows where `P < --meta-threshold`. Reduces turnover
+  and improves precision at the cost of recall.
+- `--meta-threshold 0.55`: gate threshold (default 0.55).
+- `--ranks-only`: drop the raw feature columns and keep only the
+  cross-sectional `_rank` columns (plus sector dummies / regime
+  broadcasts if enabled). Per-feature audit on the 150-name × 11-yr
+  universe shows raw columns degrade ~100% under hard-cutoff while
+  the ranked versions degrade only 15–50%.
+- `--triple-barrier`: switch from the simple forward-return label to
+  the López de Prado triple-barrier signed return per horizon. Bounded
+  by construction (clipped at ±`tb-k-sigma` units of trailing vol).
+
+### Phase 9 — confidence-weighted sizing + walk-forward meta-CV
+
+```bash
+uv run python scripts/run_phase5.py [...same as Phase 8...] \
+    --meta-mode confidence --meta-conf-floor 0.60 --meta-conf-cap 1.0 \
+    --meta-walk-forward-folds 3 \
+    [--meta-per-sector]
+```
+
+- `--meta-mode confidence`: scale signal by
+  `clip((P-floor)/(cap-floor), 0, 1)` instead of a hard binary gate.
+- `--meta-conf-floor 0.60`: the Phase 10 sweet spot. **Do NOT use the
+  default `0.5`** — Phase 10 swept floors {0.50…0.75} and 0.50
+  reproducibly underperforms binary by ~0.4 Sharpe; 0.60 has the best
+  point estimate.
+- `--meta-walk-forward-folds 3`: K folds of expanding-window
+  meta-classifier CV. K=1 reproduces the Phase 8 single-pass behaviour.
+- `--meta-per-sector`: one meta classifier per sector (requires
+  fundamentals successfully loaded; falls back to global meta if not).
+
+### Phase 10 — confidence-floor sweep
+
+```bash
+uv run python scripts/phase10_conf_floor_sweep.py \
+    --start 2014-01-01 --end 2024-12-31 --n-tickers 150 \
+    --floors 0.50 0.55 0.60 0.65 0.70 0.75
+```
+
+Runs the Phase 8 best config 7 times: once with `--meta-mode binary`
+(baseline) and once per floor with `--meta-mode confidence`. Reports
+holdout Sharpe + 95% block-bootstrap CI per run. Output:
+`reports/phase10_conf_floor_sweep_<start>_<end>_n<N>.csv`.
+
+### Phase 11 — feature pruning by per-feature audit
+
+```bash
+# Step 1: re-build the per-feature audit on your universe (~30 min)
+uv run python scripts/per_feature_audit.py \
+    --start 2014-01-01 --end 2024-12-31 \
+    --n-tickers 150 --horizon 5 --top-n 20
+
+# Step 2: run the 3-config sweep (~10 min)
+uv run python scripts/phase11_feature_pruning.py \
+    --start 2014-01-01 --end 2024-12-31 --n-tickers 150
+```
+
+The driver reads `reports/per_feature_audit.csv` and runs three configs
+on top of the Phase 8 best config:
+- baseline (no pruning)
+- drop bottom 25% by `pct_drop` (least same-day work — noise candidates)
+- drop top 25% by `pct_drop` (most same-day work — sanity check; should
+  be worse than baseline)
+
+The pipeline now exposes a `PipelineV5Config.feature_exclude:
+tuple[str, ...]` field so future phases can chain pruning with new
+features.
+
+---
+
+## 6c. News features (Phase 12–14 roadmap, planned)
+
+**None of this is implemented yet** — these sections are documented
+in advance per the project's docs-in-sync rule (user direction
+2026-06-04) so that when the code lands, the CLI and `curl` recipes
+are already written.
+
+### Phase 12 — SEC EDGAR 8-K event flags
+
+8-K is the SEC form a public company files when a "material event"
+happens (CEO change, earnings pre-release, M&A, etc.). Free, full
+historical coverage from 2001, no API key.
+
+**Required `curl` headers** (SEC enforces a User-Agent rule):
+
+```bash
+# Generic ticker -> CIK mapping (one-shot)
+curl -A "stockpred-research raj.axisos@gmail.com" \
+    -o data/cache/edgar/ticker_to_cik.json \
+    https://www.sec.gov/files/company_tickers.json
+
+# Quarterly form index (one per qtr, ~2 MB each)
+curl -A "stockpred-research raj.axisos@gmail.com" \
+    -o data/cache/edgar/form_2024Q1.idx \
+    https://www.sec.gov/Archives/edgar/full-index/2024/QTR1/form.idx
+```
+
+The agent will write `src/stockpred/data/edgar.py` to do this in
+Python (with rate-limiting per SEC's 10 req/s policy) and cache the
+result as gzipped parquet so the pipeline never re-downloads.
+
+Planned CLI flags (on `run_phase5.py`):
+
+- `--edgar-events`: enable 8-K daily event flag + rolling counts
+  (5/21/63-day) as per-ticker features.
+- `--edgar-cache-dir data/cache/edgar`: where the parquet caches live.
+
+### Phase 13 — GDELT 2.0 tone + theme counts
+
+GDELT 2.0 publishes a global event/sentiment dataset every 15 minutes,
+free, no API key. Coverage from 2015-02-18. We aggregate per-ticker
+daily features: average tone, mention count, and theme counts for a
+small set of finance themes (EARNINGS, REGULATION, ACQUISITION).
+
+**Required `curl` for the master file list**:
+
+```bash
+# Master list of every 15-min slice (~5 MB text file, updated daily)
+curl -o data/cache/gdelt/masterfilelist.txt \
+    http://data.gdeltproject.org/gdeltv2/masterfilelist.txt
+```
+
+Memory caution: each daily aggregate is ~50 MB compressed; the full
+2015–2024 raw dump is ~18 GB. The agent will stream + filter via
+`pd.read_csv(url, chunksize=200_000)` and keep ONLY rows mentioning
+S&P 500 tickers, persisting the result as gzipped parquet (~1 GB
+final size).
+
+Planned CLI flags:
+
+- `--gdelt-tone`: enable GDELT daily tone + count features.
+- `--gdelt-cache-dir data/cache/gdelt`: where the parquet caches live.
+
+### Phase 14 — FinBERT live-mode sentiment (dashboard ONLY)
+
+ProsusAI/FinBERT is a 110-M-parameter financial-domain BERT classifier
+(positive / neutral / negative) fine-tuned on Financial PhraseBank.
+We use it ONLY for the dashboard's per-ticker news panel — never as a
+backtest feature, because the underlying yfinance news source only
+has ~30 days of history (using it as a feature would create
+catastrophic walk-forward bias).
+
+**Required model download (one-shot, ~440 MB)**:
+
+```bash
+# Hugging Face CLI (preferred)
+pip install huggingface_hub
+huggingface-cli download ProsusAI/finbert --local-dir models/finbert
+
+# OR direct curl (skip CLI)
+mkdir -p models/finbert
+for f in config.json vocab.txt pytorch_model.bin tokenizer.json; do
+    curl -L -o models/finbert/$f \
+        https://huggingface.co/ProsusAI/finbert/resolve/main/$f
+done
+```
+
+Then `pip install transformers torch` (~1.5 GB). The agent will gate
+the import inside `news.py` so the rest of the pipeline doesn't fail
+if these heavy deps aren't installed.
+
+Planned env vars:
+
+- `FINBERT_MODEL_DIR=models/finbert` (path to the local model)
+- `FINBERT_BATCH_SIZE=32` (CPU inference; lower if OOMing)
+- `FINBERT_ENABLED=true` (off by default to keep the dashboard
+  lightweight when the model isn't downloaded)
+
+---
+
+## 6d. Memory budget (8 GB / 8 vCPU target)
+
+User direction 2026-06-04: production deploy target is an 8 GB / 8
+vCPU box. Each pipeline run now logs peak RSS at the end:
+
+```
+Phase 5 complete in 184.3s (peak RSS: 2.71 GB)
+```
+
+If a run exceeds 6 GB (1 GB headroom for OS + 1 GB for other
+processes), a warning fires:
+
+```
+WARNING: Peak RSS 6.47 GB exceeds 6 GB budget (8 GB box, 2 GB headroom).
+```
+
+For pre-flight checks before pushing data-heavy phases (12, 13):
+
+```bash
+# Tiny smoke (5-10 min) — confirms wiring + RSS sanity
+uv run python scripts/run_phase5.py \
+    --start 2022-01-01 --end 2024-12-31 --n-tickers 40 \
+    --bootstrap-n 50 [your new flag]
+
+# Production smoke (30-60 min) — confirms scale + RAM stays under 6 GB
+nohup uv run python scripts/run_phase5.py \
+    --start 2014-01-01 --end 2024-12-31 --n-tickers 150 \
+    [your new flag] > logs/smoke.log 2>&1 &
+
+# Then verify
+grep -E "Peak RSS|HOLDOUT" logs/smoke.log | tail
+```
+
+---
+
 ## 7. Running on production data
 
 A few things to be aware of for a real run:

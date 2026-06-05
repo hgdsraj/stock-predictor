@@ -31,8 +31,23 @@ Each phase commit is on `main`. `git log --oneline` shows them in reverse order.
 | 8 | DONE | **−0.16** ← **BEST RESULT** | **[−0.67, +0.29]** ← straddles zero | Wired meta-labelling + triple-barrier + ranks_only. Reviewer caught 3 CRIT (double z-score, holdout meta on gated dev, ranks_only dropped tier-2). All fixed. |
 | 9 | DONE | −0.57 (made things worse) | [−1.03, −0.15] | Confidence sizing + walk-forward meta-CV + per-sector meta. Real code-rigor improvements but did not improve backtest. Best remains Phase 8. |
 | 10 | DONE | **+0.08** (confidence floor=0.60); −0.16 (binary) | [−0.38, +0.49] (best); [−0.67, +0.29] (binary) | Confidence-floor sweep on Phase 8 best config. Hypothesis confirmed: high floor (≥ 0.55) DOES recover Phase-8-like behavior; default Phase 9 floor=0.50 was the regression. **Best point estimate** at floor=0.60 (+0.077) but CI still straddles zero. NO config has CI strictly above zero. Reproducibility ✓: binary baseline matched documented Phase 8 (−0.158 vs −0.16); floor=0.50 matched documented Phase 9 (−0.570 vs −0.57). Reviewer caught C1 (baseline drift risk) + H1 (dead CLI flag) + 3 MED; all fixed. |
+| 11 | DONE | **−0.11** (drop bottom 25%); −0.16 (baseline); −0.19 (drop top 25%) | [−0.58, +0.38] / [−0.67, +0.29] / [−0.63, +0.24] | Feature pruning via per_feature_audit on big universe (20 features, all positive `pct_drop` — no leak suspects). Driver: `scripts/phase11_feature_pruning.py`. Pipeline hook: `PipelineV5Config.feature_exclude`. Dropped 5 lowest-impact features (adv_proxy_21, dist_low_252_rank, ret_252d_rank, kurt_63, dist_low_252) → marginally better point estimate (+0.048 vs baseline) AND smaller DD (−13.2% vs −16.0%). Sanity check passes: dropping top 5 (vol_21d, vol_21d_rank, vol_63d_rank, kurt_63_rank, macd_signal) made things worse. Still NO config CI strictly above zero. Honest top-line unchanged. 4 new tests + RSS logging added. |
 
-**Best honest config (Phase 8)**:
+**Best honest config (Phase 11; supersedes Phase 8)**:
+```bash
+uv run python scripts/phase11_feature_pruning.py \
+    --start 2014-01-01 --end 2024-12-31 \
+    --n-tickers 150
+# -> baseline (Phase 8)   : hold Sharpe -0.158, CI [-0.67, +0.29]
+# -> drop bottom 25% (5)  : hold Sharpe -0.110, CI [-0.58, +0.38]  ← BEST
+# -> drop top 25%  (5)    : hold Sharpe -0.187, CI [-0.63, +0.24]  (sanity check)
+```
+The Phase 11 best config does NOT yet have a single-CLI form on
+`run_phase5.py` (would need a `--feature-exclude` arg). For now, use
+the driver. Phase 12+ should build on top of the same pruning by
+passing `feature_exclude=(...)` to `PipelineV5Config`.
+
+**Best honest config from Phase 8 (still reproducible)**:
 ```bash
 uv run python scripts/run_phase5.py \
     --start 2014-01-01 --end 2024-12-31 \
@@ -174,12 +189,13 @@ floor_sweep.py`. Output: `reports/phase10_conf_floor_sweep.csv`.
 
 Next candidates:
 
-1. **Phase 11 — feature pruning from per-feature audit** *(IN PROGRESS as
-   of this commit)*: re-run `per_feature_audit.py` on the big universe
-   (150-name × 11yr), then test baseline vs drop-bottom-quartile-by-
-   `pct_drop` vs drop-top-quartile-by-`pct_drop` on the Phase 8 best
-   config. Driver: `scripts/phase11_feature_pruning.py`. Pipeline hook:
-   `PipelineV5Config.feature_exclude: tuple[str, ...] = ()`.
+1. **Phase 11 — feature pruning from per-feature audit** *(DONE)*: see
+   ledger row 11. Best result: drop bottom 5 by pct_drop → hold Sharpe
+   −0.11, CI [−0.58, +0.38], DD −13.2%. The 5 features to drop on the
+   150-name × 11yr universe are: `adv_proxy_21`, `dist_low_252_rank`,
+   `ret_252d_rank`, `kurt_63`, `dist_low_252`. Subsequent phases should
+   layer on TOP of this pruned baseline via the new `feature_exclude`
+   config field.
 2. **Phase 12 — EDGAR 8-K event flags as features** *(user requested
    2026-06-04, news-as-features path; promoted from Phase 16)*: free
    historical event flags (8-K filed today: Y/N) from SEC EDGAR's free
