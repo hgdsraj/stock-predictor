@@ -218,10 +218,54 @@ class JobResponse(BaseModel):
     detail: str | None = None
 
 
+class JobDetail(BaseModel):
+    """Full detail for a single in-flight or completed job (GET /jobs/{job_id})."""
+
+    job_id: str
+    status: str
+    started_at: dt.datetime | None = None
+    updated_at: dt.datetime | None = None
+    config: dict = {}
+    logs: list[str] = []
+    run_id: int | None = None
+    elapsed_s: float | None = None
+    error: str | None = None
+
+
+class QueuedJobOut(BaseModel):
+    """A pending job queued via POST /jobs/queue, awaiting password-protected launch."""
+
+    id: str
+    created_at: dt.datetime
+    config: dict
+    label: str | None = None
+    status: str  # pending | launched | cancelled
+    launched_at: dt.datetime | None = None
+    job_id: str | None = None  # populated once launched
+
+
 class HealthResponse(BaseModel):
     status: str = "ok"
     db: str
     scheduler: str
+
+
+class QuoteOut(BaseModel):
+    """Latest (delayed) quote from yfinance fast_info. ~15 min delayed; only
+    moves during market hours. Fields are None when unavailable."""
+
+    ticker: str
+    price: float | None = None
+    previous_close: float | None = None
+    open: float | None = None
+    day_high: float | None = None
+    day_low: float | None = None
+    volume: float | None = None
+    market_cap: float | None = None
+    change: float | None = None  # price - previous_close
+    change_pct: float | None = None  # change / previous_close
+    as_of: dt.datetime  # server time the quote was fetched
+    delayed: bool = True
 
 
 class WatchedItem(BaseModel):

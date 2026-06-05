@@ -18,14 +18,23 @@ from sqlalchemy.orm import Session
 from stockpred.backend.models import (
     EquitySample,
     Fundamental,
+    JobRecord,
     NewsItem,
     PriceBar,
     Prediction,
+    QueuedJob,
     Run,
     WatchedTicker,
 )
 
 log = logging.getLogger(__name__)
+
+# SQLite hard-limits bound variables to 999 per statement.
+# Use this helper to split any bulk payload into safe chunks.
+def _chunks(payload: list, n_cols: int):
+    size = 999 // n_cols
+    for i in range(0, len(payload), size):
+        yield payload[i : i + size]
 
 
 # --------------------------------------------------------------------- #
@@ -85,10 +94,10 @@ def upsert_predictions(s: Session, run: Run, rows: Iterable[dict]) -> int:
     payload = [{**r, "run_id": run.id} for r in rows]
     if not payload:
         return 0
-    stmt = sqlite_insert(Prediction).values(payload)
-    # If the same run re-inserts (unlikely), ignore conflicts.
-    stmt = stmt.on_conflict_do_nothing(index_elements=["run_id", "date", "ticker"])
-    s.execute(stmt)
+    for chunk in _chunks(payload, 8):
+        stmt = sqlite_insert(Prediction).values(chunk)
+        stmt = stmt.on_conflict_do_nothing(index_elements=["run_id", "date", "ticker"])
+        s.execute(stmt)
     return len(payload)
 
 
@@ -142,19 +151,20 @@ def upsert_prices(s: Session, rows: Iterable[dict]) -> int:
     payload = list(rows)
     if not payload:
         return 0
-    stmt = sqlite_insert(PriceBar).values(payload)
-    stmt = stmt.on_conflict_do_update(
-        index_elements=["ticker", "date"],
-        set_={
-            "open": stmt.excluded.open,
-            "high": stmt.excluded.high,
-            "low": stmt.excluded.low,
-            "close": stmt.excluded.close,
-            "adj_close": stmt.excluded.adj_close,
-            "volume": stmt.excluded.volume,
-        },
-    )
-    s.execute(stmt)
+    for chunk in _chunks(payload, 8):
+        stmt = sqlite_insert(PriceBar).values(chunk)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["ticker", "date"],
+            set_={
+                "open": stmt.excluded.open,
+                "high": stmt.excluded.high,
+                "low": stmt.excluded.low,
+                "close": stmt.excluded.close,
+                "adj_close": stmt.excluded.adj_close,
+                "volume": stmt.excluded.volume,
+            },
+        )
+        s.execute(stmt)
     return len(payload)
 
 
@@ -187,12 +197,16 @@ def upsert_fundamentals(s: Session, rows: Iterable[dict]) -> int:
     payload = list(rows)
     if not payload:
         return 0
-    stmt = sqlite_insert(Fundamental).values(payload)
-    excluded_cols = {
-        c.name: stmt.excluded[c.name] for c in Fundamental.__table__.columns if c.name != "ticker"
-    }
-    stmt = stmt.on_conflict_do_update(index_elements=["ticker"], set_=excluded_cols)
-    s.execute(stmt)
+    # Fundamental has 14 columns → chunk_size = 71
+    for chunk in _chunks(payload, 14):
+        stmt = sqlite_insert(Fundamental).values(chunk)
+        excluded_cols = {
+            c.name: stmt.excluded[c.name]
+            for c in Fundamental.__table__.columns
+            if c.name != "ticker"
+        }
+        stmt = stmt.on_conflict_do_update(index_elements=["ticker"], set_=excluded_cols)
+        s.execute(stmt)
     return len(payload)
 
 
@@ -209,9 +223,11 @@ def upsert_equity(s: Session, run: Run, rows: Iterable[dict]) -> int:
     payload = [{**r, "run_id": run.id} for r in rows]
     if not payload:
         return 0
-    stmt = sqlite_insert(EquitySample).values(payload)
-    stmt = stmt.on_conflict_do_nothing(index_elements=["run_id", "date"])
-    s.execute(stmt)
+    # EquitySample has 7 non-autoincrement columns → chunk_size = 142
+    for chunk in _chunks(payload, 7):
+        stmt = sqlite_insert(EquitySample).values(chunk)
+        stmt = stmt.on_conflict_do_nothing(index_elements=["run_id", "date"])
+        s.execute(stmt)
     return len(payload)
 
 
@@ -331,19 +347,20 @@ def upsert_news(s: Session, ticker: str, items: Iterable[dict]) -> int:
         )
     if not payload:
         return 0
-    stmt = sqlite_insert(NewsItem).values(payload)
-    stmt = stmt.on_conflict_do_update(
-        index_elements=["ticker", "uuid"],
-        set_={
-            "title": stmt.excluded.title,
-            "publisher": stmt.excluded.publisher,
-            "link": stmt.excluded.link,
-            "type": stmt.excluded.type,
-            "published_at": stmt.excluded.published_at,
-            "fetched_at": stmt.excluded.fetched_at,
-        },
-    )
-    s.execute(stmt)
+    for chunk in _chunks(payload, 8):
+        stmt = sqlite_insert(NewsItem).values(chunk)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["ticker", "uuid"],
+            set_={
+                "title": stmt.excluded.title,
+                "publisher": stmt.excluded.publisher,
+                "link": stmt.excluded.link,
+                "type": stmt.excluded.type,
+                "published_at": stmt.excluded.published_at,
+                "fetched_at": stmt.excluded.fetched_at,
+            },
+        )
+        s.execute(stmt)
     return len(payload)
 
 
@@ -358,3 +375,135 @@ def news_for_ticker(s: Session, ticker: str, *, limit: int = 20) -> list[NewsIte
         .scalars()
         .all()
     )
+
+
+# --------------------------------------------------------------------- #
+# Queued jobs
+# --------------------------------------------------------------------- #
+
+_MAX_PENDING_JOBS = 5
+
+
+def count_pending_queued_jobs(s: Session) -> int:
+    from sqlalchemy import func
+    return s.execute(
+        select(func.count()).select_from(QueuedJob).where(QueuedJob.status == "pending")
+    ).scalar_one()
+
+
+def create_queued_job(
+    s: Session, config: dict, *, label: str | None = None
+) -> QueuedJob:
+    """Create a pending queued job. Raises ValueError if the pending cap is hit."""
+    import uuid as _uuid
+
+    if count_pending_queued_jobs(s) >= _MAX_PENDING_JOBS:
+        raise ValueError(f"Maximum of {_MAX_PENDING_JOBS} pending queued jobs reached")
+    job = QueuedJob(
+        id=str(_uuid.uuid4()),
+        created_at=_now(),
+        config_json=config,
+        label=label,
+        status="pending",
+    )
+    s.add(job)
+    s.flush()
+    return job
+
+
+def list_queued_jobs(s: Session) -> list[QueuedJob]:
+    return list(
+        s.execute(select(QueuedJob).order_by(desc(QueuedJob.created_at))).scalars().all()
+    )
+
+
+def get_queued_job(s: Session, queue_id: str) -> QueuedJob | None:
+    return s.get(QueuedJob, queue_id)
+
+
+def mark_queued_launched(s: Session, queue_id: str, job_id: str) -> QueuedJob | None:
+    job = s.get(QueuedJob, queue_id)
+    if job is None:
+        return None
+    job.status = "launched"
+    job.launched_at = _now()
+    job.job_id = job_id
+    s.add(job)
+    return job
+
+
+def delete_queued_job(s: Session, queue_id: str) -> bool:
+    job = s.get(QueuedJob, queue_id)
+    if job is None:
+        return False
+    s.delete(job)
+    return True
+
+
+# --------------------------------------------------------------------- #
+# Job records (persistent across restarts)
+# --------------------------------------------------------------------- #
+
+
+def upsert_job_record(
+    s: Session,
+    job_id: str,
+    status: str,
+    *,
+    started_at=None,
+    updated_at=None,
+    elapsed_s=None,
+    run_id=None,
+    error=None,
+    config=None,
+) -> None:
+    stmt = sqlite_insert(JobRecord).values(
+        job_id=job_id,
+        status=status,
+        started_at=started_at,
+        updated_at=updated_at,
+        elapsed_s=elapsed_s,
+        run_id=run_id,
+        error=error,
+        config_json=config,
+    )
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["job_id"],
+        set_={
+            "status": stmt.excluded.status,
+            "started_at": stmt.excluded.started_at,
+            "updated_at": stmt.excluded.updated_at,
+            "elapsed_s": stmt.excluded.elapsed_s,
+            "run_id": stmt.excluded.run_id,
+            "error": stmt.excluded.error,
+            "config_json": stmt.excluded.config_json,
+        },
+    )
+    s.execute(stmt)
+
+
+def get_job_record(s: Session, job_id: str) -> JobRecord | None:
+    return s.get(JobRecord, job_id)
+
+
+def list_job_records(s: Session, *, limit: int = 50) -> list[JobRecord]:
+    return list(
+        s.execute(
+            select(JobRecord).order_by(desc(JobRecord.updated_at)).limit(limit)
+        )
+        .scalars()
+        .all()
+    )
+
+
+def mark_stale_jobs_crashed(s: Session) -> int:
+    """On startup, any job_records still in 'running'/'queued' state were
+    interrupted by a server crash/restart. Mark them crashed."""
+    from sqlalchemy import update
+
+    result = s.execute(
+        update(JobRecord)
+        .where(JobRecord.status.in_(["running", "queued", "cancelling"]))
+        .values(status="crashed", updated_at=_now())
+    )
+    return result.rowcount

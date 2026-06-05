@@ -1,20 +1,28 @@
 """FastAPI application.
 
-The app is built around a single SQLite database (`data/app.db` by default)
-and an in-process APScheduler for daily refreshes.
-
 Routes:
-  GET  /healthz                — DB + scheduler health
-  GET  /tickers                — list all tickers with summary
-  GET  /tickers/{ticker}       — last year prices + predictions
-  GET  /tickers/{ticker}/details — fundamentals + extended history
-  GET  /predictions/latest     — top-k long / bottom-k short for the latest run
-  GET  /runs                   — recent runs (metadata)
-  GET  /runs/{run_id}/equity   — backtest equity curve for that run
-  GET  /backtest/summary       — latest backtest tearsheet payload
-  POST /jobs/refresh           — trigger an on-demand pipeline run
-  GET  /jobs/{job_id}          — get status of a job
-  GET  /jobs                   — list recent jobs
+  GET  /healthz                     — DB + scheduler health
+  GET  /tickers                     — list all tickers with summary
+  GET  /tickers/{ticker}/details    — fundamentals + extended history
+  GET  /tickers/{ticker}/news       — headlines
+  GET  /predictions/latest          — top-k long / bottom-k short
+  GET  /runs                        — recent runs (metadata)
+  GET  /runs/{run_id}/equity        — backtest equity curve
+  GET  /backtest/summary            — latest backtest tearsheet payload
+
+  POST /jobs/refresh                — trigger run (requires X-API-Key)
+  GET  /jobs                        — list recent jobs (in-memory)
+  GET  /jobs/{job_id}               — job detail + logs
+
+  POST /jobs/queue                  — queue a job for later approval (no auth, max 5)
+  GET  /jobs/queue                  — list queued jobs
+  POST /jobs/run/{queue_id}         — launch a queued job (requires X-Password)
+  DELETE /jobs/queue/{queue_id}     — delete a queued job (requires X-Password)
+  DELETE /jobs/{job_id}/cancel      — cancel a running job (requires X-Password)
+
+  GET  /watchlist                   — watched tickers
+  POST /watchlist                   — add ticker (requires X-API-Key)
+  DELETE /watchlist/{ticker}        — remove ticker (requires X-API-Key)
 """
 
 from __future__ import annotations
@@ -24,11 +32,13 @@ import logging
 import math
 import os
 import threading
+import uuid as _uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pandas as pd
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from sqlalchemy import func, select
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -52,20 +62,19 @@ WEB_DIST = os.environ.get(
     str((Path(__file__).resolve().parent.parent.parent.parent / "web" / "dist").resolve()),
 )
 
-# API key for write endpoints (POST /jobs/refresh). If unset, write endpoints
-# are disabled in deployments; localhost dev defaults to the convenience
-# value "dev" which is documented in README/DEPLOYMENT.
 WRITE_API_KEY = os.environ.get("STOCKPRED_API_KEY")
+WRITE_PW = os.environ.get("STOCKPRED_PW")
 
-# Concurrency lock so /jobs/refresh cannot kick off multiple in-flight
-# pipeline runs on the same process. APScheduler's daily job uses its own
-# coalesce=True+max_instances=1, but the on-demand endpoint needs its own
-# guard.
 _refresh_lock = threading.Lock()
+
+# Server-side quote cache: {ticker: (fetched_at, payload)}. TTL throttles
+# outbound yfinance calls so frontend polling can't rate-limit our IP.
+_QUOTE_TTL_S = 8.0
+_quote_cache: dict[str, tuple[float, dict]] = {}
+_quote_lock = threading.Lock()
 
 
 def _is_pipeline_running() -> bool:
-    """True if a refresh job is currently executing on this process."""
     return _refresh_lock.locked()
 
 
@@ -75,7 +84,7 @@ class AppState:
     scheduler = None
 
 
-# ----- JSON response: NaN/Inf -> null (RFC-7159 compliant) ----------------
+# ----- JSON response: NaN/Inf -> null ------------------------------------
 
 
 def _sanitize(value):
@@ -89,12 +98,8 @@ def _sanitize(value):
 
 
 class SafeJSONResponse(JSONResponse):
-    """JSON response class that coerces NaN/Inf to null and forbids
-    non-conforming JSON output, so browsers can always parse the body."""
-
     def render(self, content) -> bytes:
         import json
-
         return json.dumps(
             _sanitize(content),
             allow_nan=False,
@@ -108,12 +113,18 @@ async def lifespan(app: FastAPI):
     AppState.engine = make_engine(DB_PATH)
     create_all(AppState.engine)
     AppState.SessionLocal = make_session_factory(AppState.engine)
-    # Seed default watchlist (HND.TO, HNU.TO, UNG, SPY, ^VIX) on first boot.
     try:
         with session_scope(AppState.SessionLocal) as s:
             store.seed_default_watchlist(s)
     except Exception as e:  # noqa: BLE001
         log.warning("watchlist seed failed: %s", e)
+    try:
+        with session_scope(AppState.SessionLocal) as s:
+            crashed = store.mark_stale_jobs_crashed(s)
+            if crashed:
+                log.info("startup: marked %d stale job(s) as crashed", crashed)
+    except Exception as e:  # noqa: BLE001
+        log.warning("stale job cleanup failed: %s", e)
     AppState.scheduler = jobs_mod.make_scheduler(AppState.SessionLocal)
     if os.environ.get("STOCKPRED_DISABLE_SCHEDULER") != "1":
         AppState.scheduler.start()
@@ -132,13 +143,9 @@ def create_app() -> FastAPI:
         ),
         version="0.2.0",
         lifespan=lifespan,
-        default_response_class=SafeJSONResponse,  # NaN -> null, RFC 7159 valid
+        default_response_class=SafeJSONResponse,
     )
 
-    # CORS: restrict to explicit origins by default. Set STOCKPRED_CORS to a
-    # comma-separated list to widen. We intentionally do NOT pair "*" with
-    # allow_credentials=True (browsers reject the combo, and that combo is a
-    # CSRF vector once auth is added).
     raw = os.environ.get("STOCKPRED_CORS", "http://localhost:5173,http://127.0.0.1:8000")
     origins = [o.strip() for o in raw.split(",") if o.strip()]
     wildcard = origins == ["*"]
@@ -147,9 +154,9 @@ def create_app() -> FastAPI:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=origins,
-        allow_credentials=not wildcard,  # incompatible with "*" per spec
-        allow_methods=["GET", "POST", "DELETE"],  # /watchlist/{ticker} needs DELETE
-        allow_headers=["Authorization", "Content-Type", "X-API-Key"],
+        allow_credentials=not wildcard,
+        allow_methods=["GET", "POST", "DELETE"],
+        allow_headers=["Authorization", "Content-Type", "X-API-Key", "X-Password"],
     )
 
     register_routes(app)
@@ -157,12 +164,11 @@ def create_app() -> FastAPI:
     return app
 
 
+# ----- Auth dependencies -------------------------------------------------
+
+
 def _require_api_key(x_api_key: str | None = Header(default=None)) -> None:
-    """Guard write endpoints. Behavior:
-       - If STOCKPRED_API_KEY is unset, write endpoints are DISABLED (returns 403).
-       - If set, the header X-API-Key must equal it.
-    This protects against drive-by CSRF from any web page in any tab.
-    """
+    """Guard original write endpoints (POST /jobs/refresh, watchlist)."""
     if WRITE_API_KEY is None:
         raise HTTPException(
             403,
@@ -172,6 +178,17 @@ def _require_api_key(x_api_key: str | None = Header(default=None)) -> None:
         raise HTTPException(401, "X-API-Key header required")
 
 
+def _require_password(x_password: str | None = Header(default=None)) -> None:
+    """Guard launch / cancel / delete-queued endpoints (STOCKPRED_PW)."""
+    if WRITE_PW is None:
+        raise HTTPException(
+            403,
+            "Password not configured. Set STOCKPRED_PW env var to enable.",
+        )
+    if not x_password or x_password != WRITE_PW:
+        raise HTTPException(401, "X-Password header required")
+
+
 def get_db():
     if AppState.SessionLocal is None:
         raise HTTPException(status_code=500, detail="DB not initialised")
@@ -179,22 +196,105 @@ def get_db():
         yield s
 
 
+# ----- Pipeline config builder (shared by /refresh and /jobs/run) --------
+
+
+def _build_pipeline_cfg(
+    body: schemas.RefreshRequest,
+) -> PipelineConfig | PipelineV5Config:
+    cv_cfg = CVConfig(
+        train_years=body.cv.train_years,
+        test_months=body.cv.test_months,
+        embargo_days=body.cv.embargo_days,
+        min_train_obs=body.cv.min_train_obs,
+    )
+    gbm_cfg = GBMConfig(
+        num_leaves=body.gbm.num_leaves,
+        learning_rate=body.gbm.learning_rate,
+        n_estimators=body.gbm.n_estimators,
+        min_data_in_leaf=body.gbm.min_data_in_leaf,
+        feature_fraction=body.gbm.feature_fraction,
+        bagging_fraction=body.gbm.bagging_fraction,
+        bagging_freq=body.gbm.bagging_freq,
+        reg_lambda=body.gbm.reg_lambda,
+        early_stopping_rounds=body.gbm.early_stopping_rounds,
+    )
+    if body.phase == 5:
+        horizons = tuple(body.horizons) if body.horizons is not None else (1, 5)
+        return PipelineV5Config(
+            start_date=body.start_date,
+            end_date=body.end_date,
+            n_tickers=body.n_tickers,
+            universe_sampling=body.universe_sampling,
+            refresh_data=body.refresh_data,
+            horizons=horizons,
+            model=body.model,
+            gbm=gbm_cfg,
+            use_sector_features=body.use_sector_features,
+            use_tier2_features=body.use_tier2_features,
+            use_regime_features=body.use_regime_features,
+            beta_neutralise=body.beta_neutralise,
+            bootstrap_method=body.bootstrap_method,
+            cv=cv_cfg,
+            holdout_years=body.holdout_years,
+            position_sizing=body.position_sizing,
+            k_per_side_pct=body.k_per_side_pct,
+            leverage_per_side=body.leverage_per_side,
+            sector_cap_gross=body.sector_cap_gross,
+            min_trade_threshold=body.min_trade_threshold,
+            ensemble_weighting=body.ensemble_weighting,
+            bootstrap_n=body.bootstrap_n,
+        )
+    else:
+        horizons = tuple(body.horizons) if body.horizons is not None else (1, 5, 21)
+        return PipelineConfig(
+            start_date=body.start_date,
+            end_date=body.end_date,
+            n_tickers=body.n_tickers,
+            universe_sampling=body.universe_sampling,
+            refresh_data=body.refresh_data,
+            horizons=horizons,
+            k_per_side=body.k_per_side,
+            cv=cv_cfg,
+            model=body.model,
+            gbm=gbm_cfg,
+            use_sector_features=body.use_sector_features,
+            feature_cols=body.feature_cols,
+        )
+
+
+def _launch_pipeline(pipeline_cfg, job_id: str) -> None:
+    """Start a background thread that acquires _refresh_lock and runs the pipeline."""
+    def _run():
+        with _refresh_lock:
+            jobs_mod.run_pipeline_job(
+                AppState.SessionLocal, pipeline_cfg=pipeline_cfg, job_id=job_id
+            )
+    threading.Thread(target=_run, daemon=True).start()
+
+
 # ----- Routes ------------------------------------------------------------
 
 
 def register_routes(app: FastAPI) -> None:
+
+    # ------------------------------------------------------------------ #
+    # Health
+    # ------------------------------------------------------------------ #
+
     @app.get("/healthz", response_model=schemas.HealthResponse, tags=["meta"])
     def healthz():
         db_status = "ok" if AppState.engine is not None else "uninitialised"
         sched_status = "running" if (AppState.scheduler and AppState.scheduler.running) else "off"
         return schemas.HealthResponse(db=db_status, scheduler=sched_status)
 
+    # ------------------------------------------------------------------ #
+    # Tickers
+    # ------------------------------------------------------------------ #
+
     @app.get("/tickers", response_model=list[schemas.TickerSummary], tags=["tickers"])
     def list_tickers(s: Session = Depends(get_db)):
         from stockpred.backend.models import Fundamental, PriceBar
-
-        # Latest price per ticker for the summary.
-        from sqlalchemy import func, select
 
         latest_dates = (
             select(PriceBar.ticker, func.max(PriceBar.date).label("max_date"))
@@ -239,10 +339,8 @@ def register_routes(app: FastAPI) -> None:
         fund = store.fundamental_for(s, ticker)
         if fund is None:
             raise HTTPException(404, f"unknown ticker {ticker}")
-
         start = dt.date.today() - dt.timedelta(days=days)
         prices = store.prices_for_ticker(s, ticker, start=start)
-
         run = store.latest_run(s)
         preds_out: list[schemas.PredictionOut] = []
         if run:
@@ -259,7 +357,6 @@ def register_routes(app: FastAPI) -> None:
                             per_horizon=p.per_horizon_json or {},
                         )
                     )
-
         return schemas.TickerDetail(
             ticker=fund.ticker,
             sector=fund.sector,
@@ -289,6 +386,51 @@ def register_routes(app: FastAPI) -> None:
             predictions=preds_out,
         )
 
+    @app.get("/quote/{ticker}", response_model=schemas.QuoteOut, tags=["tickers"])
+    def quote(ticker: str):
+        """Latest delayed quote (~15 min, market hours only). Server-cached
+        for a few seconds so frontend polling can't rate-limit our IP."""
+        import time as _time
+
+        from stockpred.data import prices as prices_mod
+
+        try:
+            ticker = schemas._validate_ticker(ticker)
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from None
+
+        now = _time.monotonic()
+        with _quote_lock:
+            cached = _quote_cache.get(ticker)
+            if cached is not None and (now - cached[0]) < _QUOTE_TTL_S:
+                return cached[1]
+
+        q = prices_mod.latest_quote(ticker)
+        price = q.get("price")
+        prev = q.get("previous_close")
+        change = (price - prev) if (price is not None and prev is not None) else None
+        change_pct = (change / prev) if (change is not None and prev) else None
+        payload = schemas.QuoteOut(
+            ticker=ticker,
+            price=price,
+            previous_close=prev,
+            open=q.get("open"),
+            day_high=q.get("day_high"),
+            day_low=q.get("day_low"),
+            volume=q.get("volume"),
+            market_cap=q.get("market_cap"),
+            change=change,
+            change_pct=change_pct,
+            as_of=dt.datetime.now(dt.timezone.utc),
+        ).model_dump()
+        with _quote_lock:
+            _quote_cache[ticker] = (now, payload)
+        return payload
+
+    # ------------------------------------------------------------------ #
+    # Predictions
+    # ------------------------------------------------------------------ #
+
     @app.get("/predictions/latest", response_model=schemas.TopMovers, tags=["predictions"])
     def latest_movers(top_k: int = Query(default=10, ge=1, le=100), s: Session = Depends(get_db)):
         run = store.latest_run(s)
@@ -296,31 +438,27 @@ def register_routes(app: FastAPI) -> None:
             return schemas.TopMovers(date=None, long=[], short=[])
         data = store.latest_predictions(s, run.id, top_k=top_k)
         date_val = data.get("date")
-        long_out = [
-            schemas.PredictionOut(
-                date=p.date,
-                ticker=p.ticker,
-                score=p.score,
-                rank=p.rank,
-                side=p.side,
-                weight=p.weight,
-                per_horizon=p.per_horizon_json or {},
-            )
-            for p in data["long"]
-        ]
-        short_out = [
-            schemas.PredictionOut(
-                date=p.date,
-                ticker=p.ticker,
-                score=p.score,
-                rank=p.rank,
-                side=p.side,
-                weight=p.weight,
-                per_horizon=p.per_horizon_json or {},
-            )
-            for p in data["short"]
-        ]
-        return schemas.TopMovers(date=date_val, long=long_out, short=short_out)
+        return schemas.TopMovers(
+            date=date_val,
+            long=[
+                schemas.PredictionOut(
+                    date=p.date, ticker=p.ticker, score=p.score, rank=p.rank,
+                    side=p.side, weight=p.weight, per_horizon=p.per_horizon_json or {},
+                )
+                for p in data["long"]
+            ],
+            short=[
+                schemas.PredictionOut(
+                    date=p.date, ticker=p.ticker, score=p.score, rank=p.rank,
+                    side=p.side, weight=p.weight, per_horizon=p.per_horizon_json or {},
+                )
+                for p in data["short"]
+            ],
+        )
+
+    # ------------------------------------------------------------------ #
+    # Runs / backtest
+    # ------------------------------------------------------------------ #
 
     @app.get("/runs", response_model=list[schemas.RunSummary], tags=["runs"])
     def runs(limit: int = Query(default=20, ge=1, le=100), s: Session = Depends(get_db)):
@@ -339,11 +477,7 @@ def register_routes(app: FastAPI) -> None:
             for r in rows
         ]
 
-    @app.get(
-        "/runs/{run_id}/equity",
-        response_model=list[schemas.EquityPoint],
-        tags=["runs"],
-    )
+    @app.get("/runs/{run_id}/equity", response_model=list[schemas.EquityPoint], tags=["runs"])
     def equity_curve(run_id: int, s: Session = Depends(get_db)):
         rows = store.equity_for_run(s, run_id)
         return [
@@ -388,6 +522,10 @@ def register_routes(app: FastAPI) -> None:
             ],
         )
 
+    # ------------------------------------------------------------------ #
+    # Jobs — existing refresh + new queue/run/cancel endpoints
+    # ------------------------------------------------------------------ #
+
     @app.post(
         "/jobs/refresh",
         response_model=schemas.JobResponse,
@@ -395,115 +533,153 @@ def register_routes(app: FastAPI) -> None:
         dependencies=[Depends(_require_api_key)],
     )
     def refresh(body: schemas.RefreshRequest | None = None):
-        """Trigger a pipeline run. Requires X-API-Key header.
-
-        Accepts an optional JSON body to configure the run (phase, universe,
-        horizons, model hyper-params, etc.). Defaults to Phase 1 with stock
-        settings when the body is omitted.
-
-        Returns 409 if another refresh is already in flight.
-        """
+        """Trigger a pipeline run immediately. Requires X-API-Key."""
         if AppState.SessionLocal is None:
             raise HTTPException(500, "DB not initialised")
         if _is_pipeline_running():
             raise HTTPException(409, "A pipeline run is already in flight")
-
         body = body or schemas.RefreshRequest()
-        cv_cfg = CVConfig(
-            train_years=body.cv.train_years,
-            test_months=body.cv.test_months,
-            embargo_days=body.cv.embargo_days,
-            min_train_obs=body.cv.min_train_obs,
-        )
-        gbm_cfg = GBMConfig(
-            num_leaves=body.gbm.num_leaves,
-            learning_rate=body.gbm.learning_rate,
-            n_estimators=body.gbm.n_estimators,
-            min_data_in_leaf=body.gbm.min_data_in_leaf,
-            feature_fraction=body.gbm.feature_fraction,
-            bagging_fraction=body.gbm.bagging_fraction,
-            bagging_freq=body.gbm.bagging_freq,
-            reg_lambda=body.gbm.reg_lambda,
-            early_stopping_rounds=body.gbm.early_stopping_rounds,
-        )
-
-        if body.phase == 5:
-            horizons = tuple(body.horizons) if body.horizons is not None else (1, 5)
-            pipeline_cfg = PipelineV5Config(
-                start_date=body.start_date,
-                end_date=body.end_date,
-                n_tickers=body.n_tickers,
-                universe_sampling=body.universe_sampling,
-                refresh_data=body.refresh_data,
-                horizons=horizons,
-                model=body.model,
-                gbm=gbm_cfg,
-                use_sector_features=body.use_sector_features,
-                use_tier2_features=body.use_tier2_features,
-                use_regime_features=body.use_regime_features,
-                beta_neutralise=body.beta_neutralise,
-                bootstrap_method=body.bootstrap_method,
-                cv=cv_cfg,
-                holdout_years=body.holdout_years,
-                position_sizing=body.position_sizing,
-                k_per_side_pct=body.k_per_side_pct,
-                leverage_per_side=body.leverage_per_side,
-                sector_cap_gross=body.sector_cap_gross,
-                min_trade_threshold=body.min_trade_threshold,
-                ensemble_weighting=body.ensemble_weighting,
-                bootstrap_n=body.bootstrap_n,
-            )
-        else:
-            horizons = tuple(body.horizons) if body.horizons is not None else (1, 5, 21)
-            pipeline_cfg = PipelineConfig(
-                start_date=body.start_date,
-                end_date=body.end_date,
-                n_tickers=body.n_tickers,
-                universe_sampling=body.universe_sampling,
-                refresh_data=body.refresh_data,
-                horizons=horizons,
-                k_per_side=body.k_per_side,
-                cv=cv_cfg,
-                model=body.model,
-                gbm=gbm_cfg,
-                use_sector_features=body.use_sector_features,
-                feature_cols=body.feature_cols,
-            )
-
-        import uuid as _uuid
-
+        pipeline_cfg = _build_pipeline_cfg(body)
         job_id = str(_uuid.uuid4())
         jobs_mod._record_job(job_id, "queued")
-
-        def _run():
-            with _refresh_lock:
-                jobs_mod.run_pipeline_job(
-                    AppState.SessionLocal, pipeline_cfg=pipeline_cfg, job_id=job_id
-                )
-
-        threading.Thread(target=_run, daemon=True).start()
+        _launch_pipeline(pipeline_cfg, job_id)
         return schemas.JobResponse(job_id=job_id, status="queued")
 
-    @app.get("/jobs/{job_id}", response_model=schemas.JobResponse, tags=["jobs"])
+    @app.post(
+        "/jobs/queue",
+        response_model=schemas.QueuedJobOut,
+        tags=["jobs"],
+    )
+    def queue_job(body: schemas.RefreshRequest, s: Session = Depends(get_db)):
+        """Queue a job for later password-protected launch. No auth required.
+        Up to 5 pending jobs allowed at once."""
+        try:
+            qj = store.create_queued_job(s, config=body.model_dump())
+        except ValueError as e:
+            raise HTTPException(429, str(e)) from None
+        return schemas.QueuedJobOut(
+            id=qj.id,
+            created_at=qj.created_at,
+            config=qj.config_json,
+            label=qj.label,
+            status=qj.status,
+        )
+
+    @app.get(
+        "/jobs/queue",
+        response_model=list[schemas.QueuedJobOut],
+        tags=["jobs"],
+    )
+    def list_queued_jobs(s: Session = Depends(get_db)):
+        """List all queued jobs (pending, launched, cancelled)."""
+        return [
+            schemas.QueuedJobOut(
+                id=j.id,
+                created_at=j.created_at,
+                config=j.config_json,
+                label=j.label,
+                status=j.status,
+                launched_at=j.launched_at,
+                job_id=j.job_id,
+            )
+            for j in store.list_queued_jobs(s)
+        ]
+
+    @app.post(
+        "/jobs/run/{queue_id}",
+        response_model=schemas.JobResponse,
+        tags=["jobs"],
+        dependencies=[Depends(_require_password)],
+    )
+    def run_queued_job(queue_id: str, s: Session = Depends(get_db)):
+        """Launch a pending queued job. Requires X-Password header."""
+        if AppState.SessionLocal is None:
+            raise HTTPException(500, "DB not initialised")
+        qj = store.get_queued_job(s, queue_id)
+        if qj is None:
+            raise HTTPException(404, "queued job not found")
+        if qj.status != "pending":
+            raise HTTPException(409, f"job is already {qj.status}")
+        if _is_pipeline_running():
+            raise HTTPException(409, "A pipeline run is already in flight")
+
+        body = schemas.RefreshRequest(**qj.config_json)
+        pipeline_cfg = _build_pipeline_cfg(body)
+        job_id = str(_uuid.uuid4())
+
+        store.delete_queued_job(s, queue_id)
+        jobs_mod._record_job(job_id, "queued")
+        _launch_pipeline(pipeline_cfg, job_id)
+        return schemas.JobResponse(job_id=job_id, status="queued")
+
+    @app.delete(
+        "/jobs/queue/{queue_id}",
+        tags=["jobs"],
+        dependencies=[Depends(_require_password)],
+    )
+    def delete_queued_job(queue_id: str, s: Session = Depends(get_db)):
+        """Delete a pending queued job. Requires X-Password header."""
+        deleted = store.delete_queued_job(s, queue_id)
+        if not deleted:
+            raise HTTPException(404, "queued job not found")
+        return {"ok": True}
+
+    @app.delete(
+        "/jobs/{job_id}/cancel",
+        tags=["jobs"],
+        dependencies=[Depends(_require_password)],
+    )
+    def cancel_job(job_id: str):
+        """Soft-cancel a running job. The thread finishes but results are discarded.
+        Requires X-Password header."""
+        cancelled = jobs_mod.request_cancel(job_id)
+        if not cancelled:
+            raise HTTPException(404, "job not found or not running")
+        return {"ok": True}
+
+    @app.get("/jobs/{job_id}", response_model=schemas.JobDetail, tags=["jobs"])
     def job_status(job_id: str):
-        rec = jobs_mod.get_job_status(job_id)
+        rec = jobs_mod.get_job_status(job_id, AppState.SessionLocal)
         if rec is None:
             raise HTTPException(404, "unknown job")
-        return schemas.JobResponse(job_id=job_id, status=rec["status"], detail=str(rec))
+        return schemas.JobDetail(
+            job_id=job_id,
+            status=rec["status"],
+            started_at=rec.get("started_at"),
+            updated_at=rec.get("updated_at"),
+            config=rec.get("config", {}),
+            logs=rec.get("logs", []),
+            run_id=rec.get("run_id"),
+            elapsed_s=rec.get("elapsed_s"),
+            error=rec.get("error"),
+        )
 
-    @app.get("/jobs", tags=["jobs"])
+    @app.get("/jobs", response_model=list[schemas.JobDetail], tags=["jobs"])
     def jobs_list(limit: int = Query(default=25, ge=1, le=100)):
-        return jobs_mod.list_jobs(limit)
+        return [
+            schemas.JobDetail(
+                job_id=item["job_id"],
+                status=item["status"],
+                started_at=item.get("started_at"),
+                updated_at=item.get("updated_at"),
+                config=item.get("config", {}),
+                logs=[],
+                run_id=item.get("run_id"),
+                elapsed_s=item.get("elapsed_s"),
+                error=item.get("error"),
+            )
+            for item in jobs_mod.list_jobs(limit, AppState.SessionLocal)
+        ]
 
-    # ----- Watchlist (HND.TO, HNU.TO, ^VIX, etc.) ----------------------
+    # ------------------------------------------------------------------ #
+    # Watchlist
+    # ------------------------------------------------------------------ #
 
     @app.get("/watchlist", response_model=list[schemas.WatchedItem], tags=["watchlist"])
     def watchlist(s: Session = Depends(get_db)):
         from stockpred.backend.models import PriceBar
-        from sqlalchemy import func, select
 
         rows = store.list_watched(s)
-        # Last-price lookup per ticker.
         latest = dict(
             s.execute(
                 select(PriceBar.ticker, func.max(PriceBar.date))
@@ -543,7 +719,6 @@ def register_routes(app: FastAPI) -> None:
     def watchlist_add(item: schemas.WatchedAdd, s: Session = Depends(get_db)):
         from stockpred.data import prices as prices_mod
 
-        # Pull a year of prices for the new ticker so the screener has data.
         try:
             df = prices_mod.fetch_one(item.ticker)
             if not df.empty:
@@ -581,7 +756,9 @@ def register_routes(app: FastAPI) -> None:
             raise HTTPException(404, "not in watchlist")
         return {"ok": True}
 
-    # ----- News --------------------------------------------------------
+    # ------------------------------------------------------------------ #
+    # News
+    # ------------------------------------------------------------------ #
 
     @app.get(
         "/tickers/{ticker}/news",
@@ -621,11 +798,6 @@ def register_routes(app: FastAPI) -> None:
 
 
 def register_static(app: FastAPI) -> None:
-    """If a built frontend exists at `web/dist/`, serve it from `/`.
-
-    Path-traversal-safe: any requested path is resolved against `dist` and
-    rejected if it escapes that directory (C3 fix).
-    """
     dist = Path(WEB_DIST).resolve()
     if not dist.exists():
         log.info("Static frontend not found at %s; SPA disabled", dist)
@@ -640,7 +812,6 @@ def register_static(app: FastAPI) -> None:
         return FileResponse(str(dist / "index.html"))
 
     def _safe_target(full_path: str) -> Path | None:
-        # Compute the absolute target path, then verify it stays within `dist`.
         target = (dist / full_path).resolve()
         try:
             target.relative_to(dist)
@@ -655,10 +826,7 @@ def register_static(app: FastAPI) -> None:
         target = _safe_target(full_path)
         if target is not None:
             return FileResponse(str(target))
-        # Anything else (including unknown routes and attempted traversal)
-        # falls through to the SPA index.
         return FileResponse(str(dist / "index.html"))
 
 
-# Instantiate at import time so uvicorn can find `app`.
 app = create_app()
