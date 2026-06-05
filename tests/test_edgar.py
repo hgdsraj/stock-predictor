@@ -538,6 +538,300 @@ def test_fetch_quarter_8k_handles_weekend_filing(monkeypatch, isolate_cache):
     assert int(out.loc[(mon, "AAPL"), "has_8k"]) == 1
 
 
+def test_items_contain_matches_codes():
+    """Helper: parse the SEC items field correctly."""
+    assert edgar._items_contain("2.02,9.01", ("2.02",))
+    assert edgar._items_contain("5.02", ("5.02",))
+    assert edgar._items_contain("1.01,2.01,8.01", ("8.01",))
+    # No match
+    assert not edgar._items_contain("9.01", ("2.02",))
+    # Empty / None
+    assert not edgar._items_contain("", ("2.02",))
+    assert not edgar._items_contain("  ", ("2.02",))
+
+
+SAMPLE_SUBMISSIONS = {
+    "cik": "0000320193",
+    "name": "Apple Inc.",
+    "tickers": ["AAPL"],
+    "filings": {
+        "recent": {
+            "accessionNumber": [
+                "0000320193-24-000003",
+                "0000320193-24-000007",
+                "0000320193-23-000099",
+                "0000320193-23-000050",
+            ],
+            "form": ["8-K", "10-K", "8-K", "8-K/A"],
+            "filingDate": ["2024-01-25", "2024-02-02", "2023-11-02", "2023-08-15"],
+            "items": [
+                "2.02,9.01",  # earnings
+                "",  # 10-K has no items
+                "5.02",  # CEO change
+                "8.01",  # M&A
+            ],
+        }
+    },
+}
+
+
+def test_fetch_8k_items_per_ticker_extracts_items(monkeypatch, isolate_cache):
+    """SEC submissions JSON has per-filing item codes for 8-Ks; we
+    must extract them and skip non-8-K forms."""
+    monkeypatch.setattr(edgar.time, "sleep", lambda s: None)
+    monkeypatch.setattr(
+        edgar.requests,
+        "get",
+        lambda url, **kw: _make_mock_response(json_obj=SAMPLE_SUBMISSIONS),
+    )
+
+    df = edgar.fetch_8k_items_per_ticker("AAPL", "0000320193", refresh=True)
+    # 10-K must be filtered out; 8-K and 8-K/A must be kept.
+    assert len(df) == 3
+    items_by_date = dict(zip(df["filing_date"], df["items"]))
+    assert items_by_date[pd.Timestamp("2024-01-25")] == "2.02,9.01"
+    assert items_by_date[pd.Timestamp("2023-11-02")] == "5.02"
+    assert items_by_date[pd.Timestamp("2023-08-15")] == "8.01"
+
+
+def test_fetch_8k_items_per_ticker_handles_missing_items(monkeypatch, isolate_cache):
+    """Old filings may have missing items lists; must not crash."""
+    monkeypatch.setattr(edgar.time, "sleep", lambda s: None)
+    no_items = {
+        "cik": "0000320193",
+        "filings": {
+            "recent": {
+                "accessionNumber": ["x"],
+                "form": ["8-K"],
+                "filingDate": ["2008-01-01"],
+                # No 'items' key at all
+            }
+        },
+    }
+    monkeypatch.setattr(
+        edgar.requests,
+        "get",
+        lambda url, **kw: _make_mock_response(json_obj=no_items),
+    )
+    df = edgar.fetch_8k_items_per_ticker("X", "0000999999", refresh=True)
+    assert len(df) == 1
+    assert df["items"].iloc[0] == ""
+
+
+def test_fetch_8k_items_per_ticker_handles_no_filings(monkeypatch, isolate_cache):
+    """Companies with no recent filings must return empty without crashing."""
+    monkeypatch.setattr(edgar.time, "sleep", lambda s: None)
+    empty_json = {"cik": "999", "filings": {"recent": {}}}
+    monkeypatch.setattr(
+        edgar.requests,
+        "get",
+        lambda url, **kw: _make_mock_response(json_obj=empty_json),
+    )
+    df = edgar.fetch_8k_items_per_ticker("X", "0000999999", refresh=True)
+    assert df.empty
+
+
+def test_build_8k_item_features_produces_per_family_flags(monkeypatch, isolate_cache):
+    """Item-family flags should fire on the right dates for the right groups."""
+    monkeypatch.setattr(edgar.time, "sleep", lambda s: None)
+
+    def mock_get(url, **kw):
+        if "company_tickers.json" in url:
+            return _make_mock_response(json_obj=SAMPLE_TICKER_JSON)
+        if "submissions/CIK" in url:
+            return _make_mock_response(json_obj=SAMPLE_SUBMISSIONS)
+        raise ValueError(f"Unexpected URL: {url}")
+
+    monkeypatch.setattr(edgar.requests, "get", mock_get)
+
+    trading_days = pd.bdate_range("2023-08-01", "2024-02-29")
+    out = edgar.build_8k_item_features(["AAPL"], trading_days, refresh=True)
+
+    assert not out.empty
+    # earnings (2.02) was filed 2024-01-25
+    earn_jan25 = out.loc[(pd.Timestamp("2024-01-25"), "AAPL"), "edgaritem_earnings_today"]
+    assert int(earn_jan25) == 1
+    # CEO change (5.02) on 2023-11-02
+    ceo_nov02 = out.loc[(pd.Timestamp("2023-11-02"), "AAPL"), "edgaritem_ceo_change_today"]
+    assert int(ceo_nov02) == 1
+    # M&A (8.01) on 2023-08-15
+    ma_aug15 = out.loc[(pd.Timestamp("2023-08-15"), "AAPL"), "edgaritem_ma_today"]
+    assert int(ma_aug15) == 1
+    # Memory-efficient dtypes
+    assert out["edgaritem_earnings_today"].dtype.name == "int8"
+    assert out["edgaritem_earnings_21d"].dtype.name == "int16"
+
+
+def test_build_8k_item_features_dedupes_dual_class_tickers(monkeypatch, isolate_cache):
+    """REGRESSION (Phase 13 reviewer CRIT-1): GOOG and GOOGL share CIK
+    0001652044. Without dedup we'd fetch the same submissions JSON
+    twice AND write the same flag into both columns, double-counting
+    the signal in the cross-section. Fetch should happen ONCE per CIK
+    and the resulting flags should be mirrored into BOTH ticker
+    columns."""
+    monkeypatch.setattr(edgar.time, "sleep", lambda s: None)
+    dual_class_map = {
+        "GOOG": "0001652044",
+        "GOOGL": "0001652044",
+    }
+    submissions_payload = {
+        "cik": "0001652044",
+        "tickers": ["GOOG", "GOOGL"],
+        "filings": {
+            "recent": {
+                "form": ["8-K"],
+                "filingDate": ["2024-01-25"],
+                "items": ["2.02"],
+            }
+        },
+    }
+
+    call_count = {"n": 0}
+
+    def mock_get(url, **kw):
+        if "company_tickers.json" in url:
+            return _make_mock_response(
+                json_obj={
+                    "0": {"cik_str": 1652044, "ticker": "GOOG", "title": "Alphabet"},
+                    "1": {"cik_str": 1652044, "ticker": "GOOGL", "title": "Alphabet"},
+                }
+            )
+        if "submissions/CIK" in url:
+            call_count["n"] += 1
+            return _make_mock_response(json_obj=submissions_payload)
+        raise ValueError(f"Unexpected URL: {url}")
+
+    monkeypatch.setattr(edgar.requests, "get", mock_get)
+
+    trading_days = pd.bdate_range("2024-01-01", "2024-02-29")
+    out = edgar.build_8k_item_features(
+        ["GOOG", "GOOGL"], trading_days, refresh=True, ticker_to_cik=dual_class_map
+    )
+
+    # MUST have fetched the submissions JSON exactly ONCE (not twice).
+    assert call_count["n"] == 1
+    # AND the earnings flag must be set on Jan 25 for BOTH tickers.
+    earn_goog = out.loc[(pd.Timestamp("2024-01-25"), "GOOG"), "edgaritem_earnings_today"]
+    earn_googl = out.loc[(pd.Timestamp("2024-01-25"), "GOOGL"), "edgaritem_earnings_today"]
+    assert int(earn_goog) == 1
+    assert int(earn_googl) == 1
+
+
+def test_fetch_8k_items_404_returns_empty(monkeypatch, isolate_cache):
+    """REGRESSION (Phase 13 reviewer CRIT-3): a 404 (CIK genuinely not
+    in submissions API) should return empty silently. Only 404."""
+    monkeypatch.setattr(edgar.time, "sleep", lambda s: None)
+
+    def mock_get_404(url, **kw):
+        r = MagicMock()
+        http_error = edgar.requests.HTTPError("404 Not Found")
+        http_error.response = MagicMock()
+        http_error.response.status_code = 404
+        r.raise_for_status = MagicMock(side_effect=http_error)
+        return r
+
+    monkeypatch.setattr(edgar.requests, "get", mock_get_404)
+    df = edgar.fetch_8k_items_per_ticker("FAKE", "9999999999", refresh=True)
+    assert df.empty
+
+
+def test_fetch_8k_items_403_reraises(monkeypatch, isolate_cache):
+    """REGRESSION (Phase 13 reviewer CRIT-3): a 403 (User-Agent
+    rejected) must re-raise so the operator notices, not silently
+    return empty data for every ticker."""
+    monkeypatch.setattr(edgar.time, "sleep", lambda s: None)
+
+    def mock_get_403(url, **kw):
+        r = MagicMock()
+        http_error = edgar.requests.HTTPError("403 Forbidden")
+        http_error.response = MagicMock()
+        http_error.response.status_code = 403
+        r.raise_for_status = MagicMock(side_effect=http_error)
+        return r
+
+    monkeypatch.setattr(edgar.requests, "get", mock_get_403)
+    with pytest.raises(edgar.requests.HTTPError, match="403"):
+        edgar.fetch_8k_items_per_ticker("AAPL", "0000320193", refresh=True)
+
+
+def test_fetch_8k_items_429_retries_once(monkeypatch, isolate_cache):
+    """REGRESSION (Phase 13 reviewer CRIT-3): a 429 (rate limit) must
+    sleep + retry once before either succeeding or raising."""
+    monkeypatch.setattr(edgar.time, "sleep", lambda s: None)
+    call_count = {"n": 0}
+
+    def mock_get_429_then_ok(url, **kw):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            r = MagicMock()
+            http_error = edgar.requests.HTTPError("429 Too Many")
+            http_error.response = MagicMock()
+            http_error.response.status_code = 429
+            r.raise_for_status = MagicMock(side_effect=http_error)
+            return r
+        return _make_mock_response(json_obj=SAMPLE_SUBMISSIONS)
+
+    monkeypatch.setattr(edgar.requests, "get", mock_get_429_then_ok)
+    df = edgar.fetch_8k_items_per_ticker("AAPL", "0000320193", refresh=True)
+    assert call_count["n"] == 2  # one 429, one success
+    assert not df.empty
+
+
+def test_fetch_8k_items_warns_on_paginated_files(monkeypatch, isolate_cache, caplog):
+    """REGRESSION (Phase 13 reviewer HIGH-3): SEC's filings.recent is
+    capped at ~1000 rows. For prolific filers, older filings spill
+    into filings.files[] which we don't fetch. We MUST log a warning
+    so the operator knows their early-backtest rows may be under-
+    counted."""
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="stockpred.data.edgar")
+    monkeypatch.setattr(edgar.time, "sleep", lambda s: None)
+
+    paginated = {
+        "cik": "0000320193",
+        "filings": {
+            "recent": {
+                "form": ["8-K"],
+                "filingDate": ["2024-01-25"],
+                "items": ["2.02"],
+            },
+            "files": [
+                {"name": "CIK0000320193-submissions-001.json"},
+                {"name": "CIK0000320193-submissions-002.json"},
+            ],
+        },
+    }
+
+    monkeypatch.setattr(
+        edgar.requests,
+        "get",
+        lambda url, **kw: _make_mock_response(json_obj=paginated),
+    )
+    edgar.fetch_8k_items_per_ticker("AAPL", "0000320193", refresh=True)
+    # Must have emitted a warning mentioning the paginated count
+    assert any(
+        "paginated" in rec.getMessage() and "AAPL" in rec.getMessage()
+        for rec in caplog.records
+        if rec.levelno >= logging.WARNING
+    )
+
+
+def test_build_8k_item_features_no_overlap_returns_empty(monkeypatch, isolate_cache):
+    """If none of the tickers have a CIK match, return empty."""
+    monkeypatch.setattr(edgar.time, "sleep", lambda s: None)
+
+    def mock_get(url, **kw):
+        if "company_tickers.json" in url:
+            return _make_mock_response(json_obj=SAMPLE_TICKER_JSON)
+        return _make_mock_response(json_obj=SAMPLE_SUBMISSIONS)
+
+    monkeypatch.setattr(edgar.requests, "get", mock_get)
+    trading_days = pd.bdate_range("2024-01-01", "2024-02-29")
+    out = edgar.build_8k_item_features(["FAKE1", "FAKE2"], trading_days, refresh=True)
+    assert out.empty
+
+
 def test_fetch_quarter_8k_zero_events_in_range(monkeypatch, isolate_cache):
     """If the date range has no 8-Ks at all, return empty without crashing."""
     monkeypatch.setattr(edgar.time, "sleep", lambda s: None)

@@ -553,3 +553,296 @@ def build_8k_features(
         len(present),
     )
     return out
+
+
+# --------------------------------------------------------------------- #
+# Phase 13: 8-K item-code extraction
+# --------------------------------------------------------------------- #
+# 8-K items signal WHY a filing happened. Raw 8-K counts treat all
+# filings as equivalent, but item 5.02 (CEO change) carries very
+# different sentiment from item 2.02 (earnings) or 8.01 (M&A).
+#
+# Data source: SEC's per-company submissions JSON at
+#   https://data.sec.gov/submissions/CIK{10-digit padded}.json
+# One request per ticker (~150 for our universe). Returns the last
+# ~1000 filings per company including an `items` field for 8-Ks.
+
+_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
+
+# Most-watched 8-K item families. Each maps to a list of item codes
+# that should be grouped (e.g. earnings = 2.02 only; CEO change =
+# 5.02 only; M&A umbrella = 1.01 + 2.01 + 8.01). Keep this list
+# short — adding more features just adds overfitting risk on a
+# strategy that's already been honest-negative on raw 8-K counts.
+_ITEM_GROUPS: dict[str, tuple[str, ...]] = {
+    "earnings": ("2.02",),  # Results of Operations and Financial Condition
+    "ceo_change": ("5.02",),  # Departure / Election of Directors or Officers
+    "ma": ("1.01", "2.01", "8.01"),  # Entry into agreement / Acquisition / Other Events
+    "guidance": ("7.01",),  # Regulation FD Disclosure (often guidance updates)
+    "going_concern": ("3.01", "3.03", "4.02"),  # Listing/restated financials
+}
+
+
+def fetch_8k_items_per_ticker(
+    ticker: str,
+    cik: str,
+    *,
+    refresh: bool = False,
+) -> pd.DataFrame:
+    """Return per-filing (filing_date, items) for one ticker's 8-Ks.
+
+    Returns DataFrame with columns [filing_date, items] where `items`
+    is a comma-separated string of 8-K item codes (e.g. "2.02,9.01")
+    or empty string if the filing had no items listed.
+
+    The per-company submissions JSON is ~50-200 KB per ticker (the
+    last ~1000 filings). Cached per-ticker as gzipped parquet at
+    data/cache/edgar/8k_items_{ticker}.parquet so re-runs are
+    offline + cheap.
+
+    NB: SEC's `items` field is only populated for relatively recent
+    filings (~2010+). Pre-2010 8-Ks may have empty `items`; those
+    rows are kept but contribute no item-code signal.
+    """
+    cache_path = CACHE_DIR_EDGAR / f"8k_items_{ticker.upper()}.parquet"
+    if cache_path.exists() and not refresh:
+        try:
+            return pd.read_parquet(cache_path)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Cached %s invalid (%s); refetching.", cache_path, e)
+
+    url = _SUBMISSIONS_URL.format(cik=cik)
+    try:
+        r = _http_get(url)
+    except requests.HTTPError as e:
+        # Reviewer CRIT-3: distinguish error classes. 404 = CIK not in
+        # SEC's submissions API (uncommon but valid: foreign issuers,
+        # very-old filings only). 429 = rate limit (we already sleep
+        # 0.11s/req; if this fires, SEC is overloaded — sleep + retry).
+        # 403 = User-Agent rejected (will hit ALL tickers); re-raise.
+        # 5xx = SEC outage; re-raise so the operator notices.
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        if status == 404:
+            log.info("Submissions JSON %s: CIK not found (404).", url)
+            return pd.DataFrame(columns=["filing_date", "items"])
+        if status == 429:
+            log.warning(
+                "Submissions JSON %s: SEC rate-limit (429). Sleeping 2s + retry once.",
+                url,
+            )
+            time.sleep(2)
+            try:
+                r = _http_get(url)
+            except requests.HTTPError as e2:
+                log.error("Retry after 429 failed: %s", e2)
+                raise
+        else:
+            # 403 / 5xx: re-raise. A single 403 means every ticker after
+            # this would silently fail; the operator MUST see it.
+            log.error("Submissions JSON %s failed with status %s: %s", url, status, e)
+            raise
+
+    payload = r.json()
+    # The JSON has filings.recent which is a column-oriented dict:
+    # { "accessionNumber": [...], "form": [...], "filingDate": [...],
+    #   "items": [...], "primaryDocument": [...], ... }
+    # NB (reviewer HIGH-3): filings.recent is capped at the most recent
+    # ~1000 filings. For prolific filers (mega-cap names with frequent
+    # 8-K activity), earlier filings spill into filings.files[] which
+    # we currently do NOT fetch. Warn so the operator knows their
+    # backtest's older rows may be under-counted for these names.
+    extra_files = payload.get("filings", {}).get("files", [])
+    if extra_files:
+        log.warning(
+            "fetch_8k_items_per_ticker[%s, CIK=%s]: SEC has %d additional "
+            "paginated submission file(s) NOT fetched. Backtest rows "
+            "earlier than the oldest filing in `filings.recent` may be "
+            "under-counted for this ticker. Consider extending the fetch "
+            "to cover paginated files for prolific filers.",
+            ticker,
+            cik,
+            len(extra_files),
+        )
+    recent = payload.get("filings", {}).get("recent", {})
+    forms = recent.get("form", [])
+    dates = recent.get("filingDate", [])
+    items_list = recent.get("items", [])
+    if not forms:
+        return pd.DataFrame(columns=["filing_date", "items"])
+
+    rows: list[tuple[str, str]] = []
+    for i, form in enumerate(forms):
+        # 8-K only (also 8-K/A amendments)
+        if form not in ("8-K", "8-K/A"):
+            continue
+        if i >= len(dates):
+            continue
+        items_str = items_list[i] if i < len(items_list) else ""
+        rows.append((dates[i], items_str or ""))
+
+    df = pd.DataFrame(rows, columns=["filing_date", "items"])
+    if not df.empty:
+        df["filing_date"] = pd.to_datetime(df["filing_date"])
+        df["items"] = df["items"].astype("string")
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(cache_path, compression="snappy", index=False)
+    log.info("fetch_8k_items_per_ticker[%s]: %d 8-Ks cached to %s", ticker, len(df), cache_path)
+    return df
+
+
+def _items_contain(items_str: str, family_codes: tuple[str, ...]) -> bool:
+    """Return True if `items_str` mentions ANY of the codes in
+    `family_codes`. SEC's items field is a comma-separated list like
+    "2.02,9.01" or "5.02"."""
+    if not items_str:
+        return False
+    parts = [s.strip() for s in items_str.split(",")]
+    family_set = set(family_codes)
+    return any(p in family_set for p in parts)
+
+
+def build_8k_item_features(
+    tickers: list[str],
+    trading_days: pd.DatetimeIndex,
+    *,
+    refresh: bool = False,
+    ticker_to_cik: dict[str, str] | None = None,
+    item_groups: dict[str, tuple[str, ...]] | None = None,
+    rolling_windows: tuple[int, ...] = (21, 63),
+) -> pd.DataFrame:
+    """Build per-(date, ticker) features for each 8-K item family.
+
+    For each item-group `g` and each rolling window `w`, produces:
+        edgaritem_{g}_today      (int8)   1 if ANY 8-K with this item
+                                          family was filed today
+        edgaritem_{g}_{w}d       (int16)  rolling count over last w
+                                          trading days
+
+    The column prefix is `edgaritem_` (not `edgar_`) so this feature
+    family is independent of Phase 12's `edgar_has_8k`/`edgar_count_*`.
+    Both prefixes are kept by ranks_only (matched by `edgar`).
+
+    Reviewer-flagged risk: if `items` is empty for a filing, that
+    filing contributes nothing here even if `edgar_has_8k=1`. This
+    is the correct behaviour — we WANT the item-code signal, not the
+    raw count.
+
+    Memory: one ~50-200 KB submissions JSON per ticker (cached); peak
+    RSS for 150 tickers ~ 30 MB. Output panel: int8 + int16 dtypes.
+    """
+    if item_groups is None:
+        item_groups = _ITEM_GROUPS
+    if ticker_to_cik is None:
+        ticker_to_cik = fetch_ticker_to_cik(refresh=refresh)
+
+    present = [t for t in tickers if t.upper() in ticker_to_cik]
+    missing = [t for t in tickers if t.upper() not in ticker_to_cik]
+    if missing:
+        log.info(
+            "build_8k_item_features: %d of %d tickers missing from SEC ticker map.",
+            len(missing),
+            len(tickers),
+        )
+    if not present:
+        log.warning("build_8k_item_features: no ticker had a CIK match; empty.")
+        return pd.DataFrame()
+
+    # Fetch per-ticker 8-K item history; build per-family panels.
+    today_frames: dict[str, pd.DataFrame] = {
+        g: pd.DataFrame(0, index=trading_days, columns=[t.upper() for t in present], dtype="int8")
+        for g in item_groups
+    }
+
+    # Reviewer CRIT-1: dedupe by CIK. SEC's ticker map has separate
+    # entries for dual-class names (GOOG/GOOGL both -> CIK 0001652044).
+    # Without dedup we'd (a) HTTP twice for the same data and (b) write
+    # the same flags into BOTH ticker columns, double-counting the
+    # signal in the cross-section. Build a cik -> list[ticker] map and
+    # fetch once per CIK, then mirror the result into every ticker
+    # sharing that CIK.
+    cik_to_tickers: dict[str, list[str]] = {}
+    for t in present:
+        cik = ticker_to_cik[t.upper()]
+        cik_to_tickers.setdefault(cik, []).append(t.upper())
+    dupes = {c: ts for c, ts in cik_to_tickers.items() if len(ts) > 1}
+    if dupes:
+        log.warning(
+            "build_8k_item_features: %d CIK(s) map to multiple tickers "
+            "(dual-class names); each CIK fetched once. Examples: %s",
+            len(dupes),
+            {c: ts for c, ts in list(dupes.items())[:5]},
+        )
+
+    for cik, tickers_for_cik in cik_to_tickers.items():
+        # Use the FIRST ticker as the cache filename anchor.
+        representative_ticker = tickers_for_cik[0]
+        df = fetch_8k_items_per_ticker(representative_ticker, cik, refresh=refresh)
+        if df.empty:
+            continue
+        # Build the events DataFrame, keeping date<->items rows aligned
+        # (a previous bug sorted dates separately from items, scrambling
+        # the mapping).
+        events = (
+            pd.DataFrame(
+                {
+                    "effective_day": pd.to_datetime(df["filing_date"]).astype("datetime64[ns]"),
+                    "items": df["items"].fillna("").astype(str),
+                }
+            )
+            .sort_values("effective_day")
+            .reset_index(drop=True)
+        )
+
+        # Map filing_date -> next trading day (handles weekends/holidays)
+        td_df = pd.DataFrame(
+            {"trading_day": pd.DatetimeIndex(trading_days).astype("datetime64[ns]")}
+        )
+        mapped = pd.merge_asof(
+            events,
+            td_df,
+            left_on="effective_day",
+            right_on="trading_day",
+            direction="forward",
+        )
+        mapped = mapped.dropna(subset=["trading_day"])
+        # For each item-group, mark today's flag.
+        # NB: use a default argument to bind `codes` per iteration
+        # (avoid late-binding closure bug if/when this gets refactored).
+        for g, codes in item_groups.items():
+            mask = mapped["items"].apply(lambda s, _codes=codes: _items_contain(s, _codes))
+            if not mask.any():
+                continue
+            days = mapped.loc[mask, "trading_day"].unique()
+            # Multiple events on same day -> still just 1 ("today" flag).
+            # Reviewer CRIT-1: mirror into ALL tickers sharing this CIK
+            # (handles GOOG/GOOGL etc.).
+            valid = today_frames[g].index.intersection(days)
+            for t_share in tickers_for_cik:
+                today_frames[g].loc[valid, t_share] = 1
+
+    # Build the long output panel.
+    feats: list[pd.Series] = []
+    for g in item_groups:
+        wide = today_frames[g]
+        today = wide.stack(future_stack=True).astype("int8").rename(f"edgaritem_{g}_today")
+        feats.append(today)
+        for w in rolling_windows:
+            roll = wide.rolling(window=w, min_periods=1).sum().astype("int16")
+            feats.append(roll.stack(future_stack=True).rename(f"edgaritem_{g}_{w}d"))
+
+    out = pd.concat(feats, axis=1)
+    out.index.names = ["date", "ticker"]
+
+    # Memory hygiene
+    del today_frames, feats
+    gc.collect()
+
+    log.info(
+        "build_8k_item_features: %d rows x %d cols (%d tickers, %d groups)",
+        out.shape[0],
+        out.shape[1],
+        len(present),
+        len(item_groups),
+    )
+    return out

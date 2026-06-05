@@ -195,6 +195,15 @@ class PipelineV5Config:
     # User-Agent rule (set EDGAR_USER_AGENT env var to override).
     use_edgar_features: bool = False
 
+    # Phase 13: SEC EDGAR 8-K item-code features. When True, fetches
+    # per-company 8-K item history (item 5.02 = CEO change, item 2.02
+    # = earnings, etc.) and builds per-item-family flags + rolling
+    # counts. Columns are prefixed `edgaritem_` (still matches the
+    # `edgar` prefix kept by ranks_only). This is the "with sentiment
+    # direction" version of Phase 12's raw counts. Same SEC rate limit
+    # / User-Agent rules apply.
+    use_edgar_item_features: bool = False
+
     # Stress
     bootstrap_n: int = 500
 
@@ -744,6 +753,42 @@ def run_pipeline_v5(cfg: PipelineV5Config | None = None) -> dict:
         ) as e:
             log.warning("EDGAR features failed (%s); continuing without.", e)
 
+    # Phase 13: SEC EDGAR 8-K item-code features. Independent from
+    # Phase 12; both can be enabled together. Uses SEC's per-company
+    # submissions JSON endpoint (one request per ticker, not per
+    # quarter -- much faster than Phase 12).
+    if cfg.use_edgar_item_features:
+        log.info("Building EDGAR 8-K item-code features...")
+        try:
+            from stockpred.data import edgar as edgar_mod
+
+            item_panel = edgar_mod.build_8k_item_features(
+                tickers=list(close.columns),
+                trading_days=close.index,
+                refresh=cfg.refresh_data,
+            )
+            if not item_panel.empty:
+                # Columns already prefixed `edgaritem_` by the builder.
+                feats = feats.join(item_panel, how="left")
+                # Fill NaN -> 0 (treat absent as no filings reported).
+                item_cols = [c for c in feats.columns if c.startswith("edgaritem_")]
+                for c in item_cols:
+                    feats[c] = feats[c].fillna(0).astype("int16")
+                log.info("After EDGAR items: %s rows x %s cols", *feats.shape)
+                del item_panel
+                import gc as _gc
+
+                _gc.collect()
+            else:
+                log.warning("EDGAR item-code features: empty panel returned.")
+        except (
+            _requests.RequestException,
+            OSError,
+            ValueError,
+            RuntimeError,
+        ) as e:
+            log.warning("EDGAR item-code features failed (%s); continuing.", e)
+
     # Phase 8: optionally drop the raw (non-rank) numeric columns. Per-feature
     # audit on the medium universe showed raw versions degrade ~100% under
     # the hard-cutoff audit while their _rank versions degrade only ~15-50%;
@@ -751,11 +796,12 @@ def run_pipeline_v5(cfg: PipelineV5Config | None = None) -> dict:
     if cfg.ranks_only:
         # Keep: anything ending in _rank, anything prefixed sec_ (sector
         # dummies), anything prefixed reg_ (regime broadcasts), anything
-        # prefixed edgar_ (Phase 12 event features). Drop the rest.
+        # prefixed edgar (Phase 12 has_8k/count_8k OR Phase 13
+        # edgaritem_). Drop the rest.
         keep_cols = [
             c
             for c in feats.columns
-            if c.endswith("_rank") or c.startswith(("sec_", "reg_", "edgar_"))
+            if c.endswith("_rank") or c.startswith(("sec_", "reg_", "edgar"))
         ]
         if keep_cols:
             log.info(

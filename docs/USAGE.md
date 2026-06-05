@@ -465,6 +465,56 @@ disk. RAM impact at backtest: <100 MB peak for 150 tickers × 11 yr.
 2-5 per year). Sharpe lift, if any, will be small. Run the full
 production sweep + bootstrap CI before claiming a result.
 
+**Phase 12 production result** (150 tickers × 11yr): hold Sharpe **−0.376**
+vs baseline −0.158. EDGAR raw counts HURT the strategy. Use
+`--edgar-items` (Phase 13) instead.
+
+### Phase 13 — SEC EDGAR 8-K item-code flags  *(IMPLEMENTED)*
+
+Same SEC data as Phase 12, but extracts the per-filing **item codes**
+(item 2.02 = earnings, item 5.02 = CEO change, item 8.01 = M&A, etc.)
+which carry directional information that raw counts don't.
+
+```bash
+# Quick smoke test (3 min)
+uv run python scripts/run_phase5.py \
+    --start 2014-01-01 --end 2024-12-31 --n-tickers 150 --horizons 5 \
+    --weighting equal --position-sizing hrp \
+    --k-pct 0.15 --sector-cap 0.30 --min-trade-threshold 0.005 \
+    --holdout-years 2 --no-sector --no-regime --no-tier2 \
+    --universe-sampling current --bootstrap-method block \
+    --meta-labelling --meta-threshold 0.55 --ranks-only \
+    --edgar-items
+```
+
+Adds 15 features per (date, ticker) — 5 item families × 3 windows:
+
+- `edgaritem_earnings_today` (int8); `edgaritem_earnings_21d`, `_63d` (int16)
+- `edgaritem_ceo_change_today`, `_21d`, `_63d`
+- `edgaritem_ma_today`, `_21d`, `_63d` (covers item 1.01 + 2.01 + 8.01)
+- `edgaritem_guidance_today`, `_21d`, `_63d`
+- `edgaritem_going_concern_today`, `_21d`, `_63d`
+
+Uses SEC's per-company submissions JSON endpoint:
+
+```bash
+# One-off curl per ticker (Python pipeline does this automatically):
+curl -A "Your Name your-email@example.com" \
+    "https://data.sec.gov/submissions/CIK0000320193.json" \
+    | jq '.filings.recent | {form, filingDate, items}' \
+    | head -20
+```
+
+**Honest result on production smoke** (150 tickers × 11 yr): hold Sharpe
+**+0.173** with 95% CI **[−0.32, +0.58]**. The point estimate is
+positive AND the holdout drawdown is the smallest across all phases
+(−8.2% vs −16% baseline). CI still straddles zero so this is not
+yet a statistically significant edge, but it's the closest the project
+has come.
+
+**Default recommendation**: enable `--edgar-items`, do NOT enable
+`--edgar-events` (Phase 12 raw counts hurt the strategy).
+
 ### Phase 13 — GDELT 2.0 tone + theme counts
 
 GDELT 2.0 publishes a global event/sentiment dataset every 15 minutes,

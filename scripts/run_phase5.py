@@ -141,6 +141,18 @@ def parse_args() -> argparse.Namespace:
             "EDGAR_USER_AGENT='Your Name email@x.com' to identify."
         ),
     )
+    p.add_argument(
+        "--edgar-items",
+        action="store_true",
+        help=(
+            "Phase 13: enable SEC EDGAR 8-K item-code features "
+            "(per-ticker daily flags for earnings / CEO change / "
+            "M&A / guidance / going-concern, plus rolling 21d/63d "
+            "counts per family). Same SEC rate limit / User-Agent "
+            "rules as --edgar-events. Independent of --edgar-events; "
+            "both can be enabled together."
+        ),
+    )
     p.add_argument("--refresh", action="store_true")
     p.add_argument("--verbose", "-v", action="store_true")
     return p.parse_args()
@@ -197,6 +209,7 @@ def main() -> int:
         tb_k_sigma=args.tb_k_sigma,
         ranks_only=args.ranks_only,
         use_edgar_features=args.edgar_events,
+        use_edgar_item_features=args.edgar_items,
         refresh_data=args.refresh,
     )
     r = run_pipeline_v5(cfg)

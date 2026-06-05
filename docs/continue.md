@@ -33,20 +33,31 @@ Each phase commit is on `main`. `git log --oneline` shows them in reverse order.
 | 10 | DONE | **+0.08** (confidence floor=0.60); −0.16 (binary) | [−0.38, +0.49] (best); [−0.67, +0.29] (binary) | Confidence-floor sweep on Phase 8 best config. Hypothesis confirmed: high floor (≥ 0.55) DOES recover Phase-8-like behavior; default Phase 9 floor=0.50 was the regression. **Best point estimate** at floor=0.60 (+0.077) but CI still straddles zero. NO config has CI strictly above zero. Reproducibility ✓: binary baseline matched documented Phase 8 (−0.158 vs −0.16); floor=0.50 matched documented Phase 9 (−0.570 vs −0.57). Reviewer caught C1 (baseline drift risk) + H1 (dead CLI flag) + 3 MED; all fixed. |
 | 11 | DONE | **−0.11** (drop bottom 25%); −0.16 (baseline); −0.19 (drop top 25%) | [−0.58, +0.38] / [−0.67, +0.29] / [−0.63, +0.24] | Feature pruning via per_feature_audit on big universe (20 features, all positive `pct_drop` — no leak suspects). Driver: `scripts/phase11_feature_pruning.py`. Pipeline hook: `PipelineV5Config.feature_exclude`. Dropped 5 lowest-impact features (adv_proxy_21, dist_low_252_rank, ret_252d_rank, kurt_63, dist_low_252) → marginally better point estimate (+0.048 vs baseline) AND smaller DD (−13.2% vs −16.0%). Sanity check passes: dropping top 5 (vol_21d, vol_21d_rank, vol_63d_rank, kurt_63_rank, macd_signal) made things worse. Still NO config CI strictly above zero. Honest top-line unchanged. 4 new tests + RSS logging added. |
 | 12 | DONE | **−0.38** (EDGAR enabled, WORSE than baseline) | [−0.84, +0.08] | SEC EDGAR 8-K event features. New module `src/stockpred/data/edgar.py` (free, full historical, no API key, SEC-compliant). New CLI flag `--edgar-events`. Adds 4 features: `edgar_has_8k`, `edgar_count_8k_{5,21,63}d`. **Honest finding**: HURT the strategy. Sharpe dropped −0.16 → −0.38, DD widened −16% → −20%. CI still straddles zero (not statistically worse) but point estimate clearly degraded vs Phase 11 baseline. Likely cause: count features are firm-size-noise; `has_8k` lacks sentiment direction. RAM: 0.97 GB peak (well under 6 GB budget); cold EDGAR fetch ~4 min (44 quarters, rate-limited). Sub-agent reviewer caught 2 CRITICAL + 1 HIGH (Procter&Gamble parser bug) + 1 production-smoke regression (alternate 'File Name' header spelling in 2014); all fixed before commit. 22 tests passing. Total suite: 127. |
+| 13 | DONE | **+0.17** (EDGAR items, BEST point estimate so far) | **[−0.32, +0.58]** | SEC EDGAR 8-K item-code features. New flag `--edgar-items`. Per-item-family flags + rolling counts: earnings (2.02), CEO change (5.02), M&A (1.01+2.01+8.01), guidance (7.01), going-concern (3.01+3.03+4.02). Output prefix `edgaritem_`. 15 features added (5 families × 3 windows). **Honest finding**: hypothesis confirmed — item-coded events DO carry directional signal that raw counts don't. Sharpe went from −0.11 (Phase 11 baseline) → **+0.17** (Phase 13). DD shrunk from −13% → **−8.2%** (smallest holdout DD across all phases). BUT 95% CI [−0.32, +0.58] still straddles zero — not statistically significant. This is honest progress, not yet proof. RAM: 1.03 GB peak; cold fetch ~30 sec (150 tickers × 0.11s). Sub-agent caught 3 real findings before production: CRIT-1 (dual-class GOOG/GOOGL double-count via shared CIK), CRIT-3 (HTTPError swallowing hides 429/403), HIGH-3 (submissions JSON pagination cap); all fixed. Internal bug caught during test: date↔items array misalignment after independent sort. 5 new regression tests. Total suite: 139. |
 
-**Best honest config (Phase 11; supersedes Phase 8)**:
+**Best honest config (Phase 13; supersedes Phase 11)**:
 ```bash
-uv run python scripts/phase11_feature_pruning.py \
+uv run python scripts/run_phase5.py \
     --start 2014-01-01 --end 2024-12-31 \
-    --n-tickers 150
-# -> baseline (Phase 8)   : hold Sharpe -0.158, CI [-0.67, +0.29]
-# -> drop bottom 25% (5)  : hold Sharpe -0.110, CI [-0.58, +0.38]  ← BEST
-# -> drop top 25%  (5)    : hold Sharpe -0.187, CI [-0.63, +0.24]  (sanity check)
+    --n-tickers 150 --horizons 5 \
+    --weighting equal --position-sizing hrp \
+    --k-pct 0.15 --sector-cap 0.30 --min-trade-threshold 0.005 \
+    --holdout-years 2 \
+    --no-sector --no-regime --no-tier2 \
+    --universe-sampling current \
+    --bootstrap-method block \
+    --meta-labelling --meta-threshold 0.55 \
+    --ranks-only --edgar-items
+# -> hold Sharpe +0.173, CI [-0.32, +0.58], DD -8.2%, RSS 1.03 GB
 ```
-The Phase 11 best config does NOT yet have a single-CLI form on
-`run_phase5.py` (would need a `--feature-exclude` arg). For now, use
-the driver. Phase 12+ should build on top of the same pruning by
-passing `feature_exclude=(...)` to `PipelineV5Config`.
+**Note**: do NOT add `--edgar-events` (Phase 12 raw counts hurt the
+strategy). Item codes (`--edgar-items`) carry directional signal that
+raw counts don't.
+
+**Earlier Phase 11 config (drop-bottom-5) and Phase 8 config still
+reproducible** via scripts/phase11_feature_pruning.py and the longer
+`run_phase5.py` invocation respectively. Phase 13 should be the
+starting baseline for Phase 14+.
 
 **Best honest config from Phase 8 (still reproducible)**:
 ```bash
@@ -207,39 +218,51 @@ Next candidates:
    codes (`item_5.02 = CEO change`, `item_2.02 = earnings release`,
    etc.) as separate per-(date, ticker) flags. Item-coded events
    carry directional information; raw counts don't.
-3. **Phase 13 — GDELT tone + event counts** *(user requested
-   2026-06-04)*: free GDELT 2.0 GKG (Global Knowledge Graph) per-ticker
-   daily tone score and theme counts, historical to 2015. Adds
-   sentiment-like signal layered on EDGAR's event flags. Bias risk:
-   left boundary at ~2015 reduces 2014 training rows.
-4. **Phase 14 — FinBERT live-mode sentiment** *(user requested
-   2026-06-04; DASHBOARD-ONLY, NOT a backtest feature)*: use existing
+3. **Phase 13 — EDGAR 8-K item-code extraction** *(DONE; FIRST
+   POSITIVE point estimate across all 13 phases)*: see ledger row 13.
+   Hold Sharpe +0.17, DD −8.2% (smallest). CI [−0.32, +0.58] still
+   straddles zero so not yet a statistically significant edge, but
+   the qualitative direction is clear: item-coded events DO carry
+   directional information that raw counts (Phase 12) don't.
+   **Recommended default**: `--edgar-items` ON, `--edgar-events` OFF.
+4. **Phase 14 — GDELT daily aggregates** *(user direction 2026-06-05;
+   "overnight" budget acknowledged)*: free GDELT 2.0 GKG daily
+   per-ticker tone score and theme counts, historical from 2015-02.
+   Bulk fetch via the daily aggregate files (~100 MB/day raw, ~3 GB
+   on disk after S&P-500 ticker filter + parquet compression). Cold
+   download takes ~6-12 hr at typical bandwidth; should be launched
+   overnight or in background. Memory plan: stream + filter + cache,
+   never hold a full daily file uncompressed. Bias risk: left
+   boundary at ~2015-02 reduces 2014-2015Q1 training rows.
+5. **Phase 15 — FinBERT live-mode sentiment** *(user direction
+   2026-06-05; DASHBOARD-ONLY, NOT a backtest feature)*: use existing
    yfinance news plumbing (`src/stockpred/data/news.py`) + local
    FinBERT model (~500 MB download) to score headlines for the Ticker
    detail page in the UI. Surface latest sentiment as a panel, not a
    model input. We do NOT use it as a backtest feature because
    yfinance only has ~30 days of history; using it as a feature would
    create catastrophic selection bias in walk-forward CV.
-5. **Phase 15 — chained TB + meta on the best config**: `--triple-barrier`
+6. **Phase 16 — chained TB + meta on the best config**: `--triple-barrier`
    + `--meta-labelling --ranks-only --position-sizing hrp` together,
-   layered on whatever the best result from Phases 11-13 ends up being.
+   layered on whatever the best result from Phases 11-14 ends up being.
    Consider also pinning `--meta-mode confidence --meta-conf-floor 0.60`
    (the Phase 10 sweet spot) as a third leg.
-6. **Phase 16 — Fama-MacBeth cross-sectional regression**: replace the
+7. **Phase 17 — Fama-MacBeth cross-sectional regression**: replace the
    per-date GBM-then-rank with a daily Fama-MacBeth regression of returns
    on factor exposures. Different model class, less prone to overfit on
    tabular data with weak signals.
-7. **Phase 17 — hyperparameter sweep on the best config**: with the
+8. **Phase 18 — hyperparameter sweep on the best config**: with the
    sensitivity grid runner, sweep GBM `num_leaves`, `learning_rate`,
-   `n_estimators`, `min_data_in_leaf` on the best post-Phase-15 config.
+   `n_estimators`, `min_data_in_leaf` on the best post-Phase-16 config.
    Report best holdout Sharpe + CI.
-8. **Phase 18 — robust signal aggregation**: replace `top_bottom_k` per
+9. **Phase 19 — robust signal aggregation**: replace `top_bottom_k` per
    day with a daily Bayesian shrinkage of the GBM output toward zero,
    weighted by historical sign-precision per ticker. Lopez de Prado
    Ch. 4 style.
-9. **OUT-OF-SCOPE without budget**: intraday data via Alpaca/Polygon
-   (paid); options-flow / IV-skew (paid); high-frequency news wire
-   (Bloomberg/Reuters, paid).
+10. **OUT-OF-SCOPE without budget**: intraday data via Alpaca/Polygon
+    (paid); options-flow / IV-skew (paid); high-frequency news wire
+    (Bloomberg/Reuters, paid); GDELT BigQuery export (requires GCP
+    account, which the project policy disallows).
 
 **None of these are guaranteed to flip HOLDOUT Sharpe above zero.** The
 strategy-research sub-agent's ceiling estimate for free-data daily-bar
