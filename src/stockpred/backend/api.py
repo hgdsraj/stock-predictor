@@ -118,6 +118,13 @@ async def lifespan(app: FastAPI):
             store.seed_default_watchlist(s)
     except Exception as e:  # noqa: BLE001
         log.warning("watchlist seed failed: %s", e)
+    try:
+        with session_scope(AppState.SessionLocal) as s:
+            crashed = store.mark_stale_jobs_crashed(s)
+            if crashed:
+                log.info("startup: marked %d stale job(s) as crashed", crashed)
+    except Exception as e:  # noqa: BLE001
+        log.warning("stale job cleanup failed: %s", e)
     AppState.scheduler = jobs_mod.make_scheduler(AppState.SessionLocal)
     if os.environ.get("STOCKPRED_DISABLE_SCHEDULER") != "1":
         AppState.scheduler.start()
@@ -600,7 +607,7 @@ def register_routes(app: FastAPI) -> None:
         pipeline_cfg = _build_pipeline_cfg(body)
         job_id = str(_uuid.uuid4())
 
-        store.mark_queued_launched(s, queue_id, job_id)
+        store.delete_queued_job(s, queue_id)
         jobs_mod._record_job(job_id, "queued")
         _launch_pipeline(pipeline_cfg, job_id)
         return schemas.JobResponse(job_id=job_id, status="queued")
@@ -632,7 +639,7 @@ def register_routes(app: FastAPI) -> None:
 
     @app.get("/jobs/{job_id}", response_model=schemas.JobDetail, tags=["jobs"])
     def job_status(job_id: str):
-        rec = jobs_mod.get_job_status(job_id)
+        rec = jobs_mod.get_job_status(job_id, AppState.SessionLocal)
         if rec is None:
             raise HTTPException(404, "unknown job")
         return schemas.JobDetail(
@@ -656,12 +663,12 @@ def register_routes(app: FastAPI) -> None:
                 started_at=item.get("started_at"),
                 updated_at=item.get("updated_at"),
                 config=item.get("config", {}),
-                logs=[],  # omit logs from list view
+                logs=[],
                 run_id=item.get("run_id"),
                 elapsed_s=item.get("elapsed_s"),
                 error=item.get("error"),
             )
-            for item in jobs_mod.list_jobs(limit)
+            for item in jobs_mod.list_jobs(limit, AppState.SessionLocal)
         ]
 
     # ------------------------------------------------------------------ #

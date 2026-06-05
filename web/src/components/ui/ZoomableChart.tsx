@@ -24,6 +24,7 @@ export interface ChartSeries {
   color: string; // any CSS color, e.g. "hsl(var(--primary))"
   yAxisId?: "left" | "right";
   strokeWidth?: number;
+  strokeDasharray?: string;
   fillOpacity?: number;
   dot?: boolean;
 }
@@ -217,6 +218,7 @@ export function ZoomableChart({
                     type="monotone"
                     stroke={s.color}
                     strokeWidth={s.strokeWidth ?? 1.5}
+                    strokeDasharray={s.strokeDasharray}
                     dot={s.dot ?? false}
                   />
                 );

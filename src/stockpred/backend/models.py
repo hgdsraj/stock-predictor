@@ -162,6 +162,22 @@ class QueuedJob(Base):
     job_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
 
 
+class JobRecord(Base):
+    """Persistent job execution record. Survives server restarts so crashed/
+    completed jobs remain queryable via GET /jobs/{job_id}."""
+
+    __tablename__ = "job_records"
+
+    job_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    started_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+    updated_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+    elapsed_s: Mapped[float | None] = mapped_column(Float, nullable=True)
+    run_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error: Mapped[str | None] = mapped_column(String(4096), nullable=True)
+    config_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+
+
 class NewsItem(Base):
     """Headline-level news from yfinance Ticker.news. Free, no API key.
 

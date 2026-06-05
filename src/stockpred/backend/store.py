@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 from stockpred.backend.models import (
     EquitySample,
     Fundamental,
+    JobRecord,
     NewsItem,
     PriceBar,
     Prediction,
@@ -437,3 +438,72 @@ def delete_queued_job(s: Session, queue_id: str) -> bool:
         return False
     s.delete(job)
     return True
+
+
+# --------------------------------------------------------------------- #
+# Job records (persistent across restarts)
+# --------------------------------------------------------------------- #
+
+
+def upsert_job_record(
+    s: Session,
+    job_id: str,
+    status: str,
+    *,
+    started_at=None,
+    updated_at=None,
+    elapsed_s=None,
+    run_id=None,
+    error=None,
+    config=None,
+) -> None:
+    stmt = sqlite_insert(JobRecord).values(
+        job_id=job_id,
+        status=status,
+        started_at=started_at,
+        updated_at=updated_at,
+        elapsed_s=elapsed_s,
+        run_id=run_id,
+        error=error,
+        config_json=config,
+    )
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["job_id"],
+        set_={
+            "status": stmt.excluded.status,
+            "started_at": stmt.excluded.started_at,
+            "updated_at": stmt.excluded.updated_at,
+            "elapsed_s": stmt.excluded.elapsed_s,
+            "run_id": stmt.excluded.run_id,
+            "error": stmt.excluded.error,
+            "config_json": stmt.excluded.config_json,
+        },
+    )
+    s.execute(stmt)
+
+
+def get_job_record(s: Session, job_id: str) -> JobRecord | None:
+    return s.get(JobRecord, job_id)
+
+
+def list_job_records(s: Session, *, limit: int = 50) -> list[JobRecord]:
+    return list(
+        s.execute(
+            select(JobRecord).order_by(desc(JobRecord.updated_at)).limit(limit)
+        )
+        .scalars()
+        .all()
+    )
+
+
+def mark_stale_jobs_crashed(s: Session) -> int:
+    """On startup, any job_records still in 'running'/'queued' state were
+    interrupted by a server crash/restart. Mark them crashed."""
+    from sqlalchemy import update
+
+    result = s.execute(
+        update(JobRecord)
+        .where(JobRecord.status.in_(["running", "queued", "cancelling"]))
+        .values(status="crashed", updated_at=_now())
+    )
+    return result.rowcount

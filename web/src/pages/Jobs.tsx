@@ -12,6 +12,8 @@ import {
   CheckCircle,
   AlertCircle,
   Loader2,
+  ExternalLink,
+  Copy,
 } from "lucide-react";
 import { api } from "@/api/client";
 import type { JobDetail, QueuedJob } from "@/api/types";
@@ -21,6 +23,37 @@ import { cn } from "@/lib/cn";
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
+function JobIdCell({ jobId, onClick }: { jobId: string; onClick?: () => void }) {
+  const [copied, setCopied] = useState(false);
+  function copy(e: React.MouseEvent) {
+    e.stopPropagation();
+    navigator.clipboard.writeText(jobId).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    });
+  }
+  return (
+    <span className="flex items-center gap-1 font-mono text-xs">
+      <button onClick={onClick} className="hover:underline" title={jobId}>
+        {jobId.slice(0, 8)}…
+      </button>
+      <button onClick={copy} title="Copy full ID" className="text-muted-foreground hover:text-foreground">
+        {copied ? <CheckCircle className="h-3 w-3 text-green-500" /> : <Copy className="h-3 w-3" />}
+      </button>
+      <a
+        href={`/jobs/${jobId}`}
+        target="_blank"
+        rel="noopener noreferrer"
+        title="Open raw JSON"
+        onClick={e => e.stopPropagation()}
+        className="text-muted-foreground hover:text-foreground"
+      >
+        <ExternalLink className="h-3 w-3" />
+      </a>
+    </span>
+  );
+}
+
 function statusBadge(status: string) {
   const map: Record<string, { cls: string; icon: React.ReactNode; label: string }> = {
     queued:     { cls: "bg-yellow-100 text-yellow-800 dark:bg-yellow-900/40 dark:text-yellow-300", icon: <Clock className="h-3 w-3" />, label: "Queued" },
@@ -28,6 +61,7 @@ function statusBadge(status: string) {
     cancelling: { cls: "bg-orange-100 text-orange-800 dark:bg-orange-900/40 dark:text-orange-300", icon: <Loader2 className="h-3 w-3 animate-spin" />, label: "Cancelling" },
     ok:         { cls: "bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300", icon: <CheckCircle className="h-3 w-3" />, label: "Completed" },
     failed:     { cls: "bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300",        icon: <AlertCircle className="h-3 w-3" />, label: "Failed" },
+    crashed:    { cls: "bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300",        icon: <AlertCircle className="h-3 w-3" />, label: "Crashed" },
     cancelled:  { cls: "bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400",       icon: <XCircle className="h-3 w-3" />, label: "Cancelled" },
     pending:    { cls: "bg-yellow-100 text-yellow-800 dark:bg-yellow-900/40 dark:text-yellow-300", icon: <Clock className="h-3 w-3" />, label: "Pending" },
     launched:   { cls: "bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300",    icon: <Play className="h-3 w-3" />, label: "Launched" },
@@ -60,10 +94,11 @@ function fmtTs(ts: string | null | undefined): string {
 
 function estimateTotalSeconds(config: Record<string, unknown>): number {
   const phase = (config.phase as number) ?? 1;
-  const nTickers = (config.n_tickers as number | null) ?? 100;
+  // null n_tickers means full S&P 500 universe (~500 tickers)
+  const nTickers = config.n_tickers as number | null;
   const effective = nTickers ?? 500;
-  const base = phase === 5 ? 900 : 300;
-  return base * (effective / 100);
+  const base = phase === 5 ? 7200 : 3600;
+  return base * (effective / 500);
 }
 
 function configSummary(config: Record<string, unknown>): string {
@@ -399,7 +434,7 @@ function JobDetailPanel({ jobId, onClose, onCancel }: JobDetailPanelProps) {
     <div className="mt-4 rounded-xl border border-border bg-card p-4">
       <div className="mb-3 flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <span className="font-mono text-xs text-muted-foreground">{jobId.slice(0, 8)}…</span>
+          <JobIdCell jobId={jobId} />
           {statusBadge(job.status)}
           {job.elapsed_s != null && (
             <span className="text-xs text-muted-foreground">Runtime: {fmtDuration(job.elapsed_s)}</span>
@@ -579,7 +614,9 @@ export function Jobs() {
                           "cursor-pointer border-b border-border/50 transition-colors hover:bg-accent/50",
                           isSelected && "bg-accent",
                         )}>
-                        <td className="px-4 py-2 font-mono text-xs">{j.job_id.slice(0, 8)}…</td>
+                        <td className="px-4 py-2">
+                          <JobIdCell jobId={j.job_id} onClick={() => setSelectedJobId(isSelected ? null : j.job_id)} />
+                        </td>
                         <td className="px-4 py-2">{statusBadge(j.status)}</td>
                         <td className="px-4 py-2">{(j.config.phase as number) ?? 1}</td>
                         <td className="px-4 py-2">{String(j.config.n_tickers ?? "all")}</td>
@@ -641,7 +678,6 @@ export function Jobs() {
                     <th className="px-4 py-2">Status</th>
                     <th className="px-4 py-2">Summary</th>
                     <th className="px-4 py-2">Created</th>
-                    <th className="px-4 py-2">Job</th>
                     <th className="px-4 py-2">Actions</th>
                   </tr>
                 </thead>
@@ -652,14 +688,6 @@ export function Jobs() {
                       <td className="px-4 py-2">{statusBadge(q.status)}</td>
                       <td className="px-4 py-2 text-xs text-muted-foreground">{configSummary(q.config)}</td>
                       <td className="px-4 py-2 text-xs">{fmtTs(q.created_at)}</td>
-                      <td className="px-4 py-2 text-xs font-mono">
-                        {q.job_id ? (
-                          <button className="text-primary underline"
-                            onClick={() => setSelectedJobId(q.job_id!)}>
-                            {q.job_id.slice(0, 8)}…
-                          </button>
-                        ) : "—"}
-                      </td>
                       <td className="px-4 py-2">
                         <div className="flex gap-1">
                           {q.status === "pending" && (

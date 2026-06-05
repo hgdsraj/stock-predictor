@@ -135,24 +135,63 @@ def _is_cancelled(job_id: str) -> bool:
 # ------------------------------------------------------------------ #
 
 
-def get_job_status(job_id: str) -> dict | None:
+def get_job_status(job_id: str, session_factory=None) -> dict | None:
     with _job_lock:
         rec = _jobs.get(job_id)
-        if rec is None:
-            return None
+    if rec is not None:
         result = dict(rec)
-    result["logs"] = get_job_logs(job_id)
-    return result
+        result["logs"] = get_job_logs(job_id)
+        return result
+    if session_factory is not None:
+        try:
+            with session_scope(session_factory) as s:
+                db_rec = store.get_job_record(s, job_id)
+                if db_rec is not None:
+                    return {
+                        "status": db_rec.status,
+                        "started_at": db_rec.started_at,
+                        "updated_at": db_rec.updated_at,
+                        "elapsed_s": db_rec.elapsed_s,
+                        "run_id": db_rec.run_id,
+                        "error": db_rec.error,
+                        "config": db_rec.config_json or {},
+                        "logs": [],
+                    }
+        except Exception:  # noqa: BLE001
+            pass
+    return None
 
 
-def list_jobs(limit: int = 25) -> list[dict]:
+def list_jobs(limit: int = 25, session_factory=None) -> list[dict]:
     with _job_lock:
-        items = sorted(
-            [{"job_id": k, **v} for k, v in _jobs.items()],
-            key=lambda x: x.get("updated_at") or datetime.min,
-            reverse=True,
-        )
-        return items[:limit]
+        memory_items = [{"job_id": k, **v} for k, v in _jobs.items()]
+        memory_ids = {item["job_id"] for item in memory_items}
+
+    db_items: list[dict] = []
+    if session_factory is not None:
+        try:
+            with session_scope(session_factory) as s:
+                for rec in store.list_job_records(s, limit=limit):
+                    if rec.job_id not in memory_ids:
+                        db_items.append({
+                            "job_id": rec.job_id,
+                            "status": rec.status,
+                            "started_at": rec.started_at,
+                            "updated_at": rec.updated_at,
+                            "elapsed_s": rec.elapsed_s,
+                            "run_id": rec.run_id,
+                            "error": rec.error,
+                            "config": rec.config_json or {},
+                        })
+        except Exception:  # noqa: BLE001
+            pass
+
+    combined = sorted(
+        memory_items + db_items,
+        key=lambda x: x.get("updated_at") or datetime.min,
+        reverse=True,
+    )
+    return combined[:limit]
 
 
 def is_any_job_running() -> bool:
@@ -186,12 +225,18 @@ def run_pipeline_job(
     _current_job_id.value = job_id
 
     started_at = _now()
-    _record_job(
-        job_id,
-        "running",
-        config=dataclasses.asdict(pipeline_cfg),
-        started_at=started_at,
-    )
+    cfg_dict = dataclasses.asdict(pipeline_cfg)
+    _record_job(job_id, "running", config=cfg_dict, started_at=started_at)
+
+    # Persist running state so a crash/restart leaves a "crashed" record.
+    try:
+        with session_scope(session_factory) as s:
+            store.upsert_job_record(
+                s, job_id, "running",
+                started_at=started_at, updated_at=started_at, config=cfg_dict,
+            )
+    except Exception:  # noqa: BLE001
+        pass
 
     try:
         if isinstance(pipeline_cfg, PipelineV5Config):
@@ -204,14 +249,23 @@ def run_pipeline_job(
         if _is_cancelled(job_id):
             log.info("job %s cancelled after pipeline finished (result discarded)", job_id)
             _record_job(job_id, "cancelled", started_at=started_at, elapsed_s=elapsed)
+            try:
+                with session_scope(session_factory) as s:
+                    store.upsert_job_record(
+                        s, job_id, "cancelled",
+                        started_at=started_at, updated_at=_now(),
+                        elapsed_s=elapsed, config=cfg_dict,
+                    )
+            except Exception:  # noqa: BLE001
+                pass
             return job_id
 
         with session_scope(session_factory) as s:
-            run = snapshot_run(
-                s,
-                result,
-                config=dataclasses.asdict(pipeline_cfg),
-                note=f"job {job_id}",
+            run = snapshot_run(s, result, config=cfg_dict, note=f"job {job_id}")
+            store.upsert_job_record(
+                s, job_id, "ok",
+                started_at=started_at, updated_at=_now(),
+                elapsed_s=elapsed, run_id=run.id, config=cfg_dict,
             )
         _record_job(job_id, "ok", run_id=run.id, started_at=started_at, elapsed_s=elapsed)
         log.info("job %s → run %d ok (%.0fs)", job_id, run.id, elapsed)
@@ -223,12 +277,13 @@ def run_pipeline_job(
         _record_job(job_id, "failed", error=str(e), started_at=started_at, elapsed_s=elapsed)
         try:
             with session_scope(session_factory) as s:
-                run = store.create_run(
-                    s,
-                    config=dataclasses.asdict(pipeline_cfg),
-                    note=f"job {job_id} (failed)",
-                )
+                run = store.create_run(s, config=cfg_dict, note=f"job {job_id} (failed)")
                 store.fail_run(s, run, error=str(e))
+                store.upsert_job_record(
+                    s, job_id, "failed",
+                    started_at=started_at, updated_at=_now(),
+                    elapsed_s=elapsed, run_id=run.id, error=str(e), config=cfg_dict,
+                )
         except Exception:  # noqa: BLE001
             pass
         return job_id
