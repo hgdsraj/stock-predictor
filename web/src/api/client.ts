@@ -9,6 +9,7 @@ import type {
   JobDetail,
   JobResponse,
   NewsHeadline,
+  Quote,
   QueuedJob,
   RunSummary,
   TickerDetail,
@@ -71,6 +72,8 @@ export const api = {
     get<TickerDetail>(`/tickers/${encodeURIComponent(ticker)}/details?days=${days}`),
   tickerNews: (ticker: string, limit = 20) =>
     get<NewsHeadline[]>(`/tickers/${encodeURIComponent(ticker)}/news?limit=${limit}`),
+  /** Latest delayed (~15min) quote. Server-cached a few seconds. */
+  quote: (ticker: string) => get<Quote>(`/quote/${encodeURIComponent(ticker)}`),
   latestPredictions: (top_k = 10) =>
     get<TopMovers>(`/predictions/latest?top_k=${top_k}`),
   runs: (limit = 20) => get<RunSummary[]>(`/runs?limit=${limit}`),

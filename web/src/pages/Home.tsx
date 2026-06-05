@@ -1,9 +1,12 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
-import { LineChart, Line, ResponsiveContainer, XAxis, YAxis, Tooltip, AreaChart, Area, CartesianGrid } from "recharts";
 import { TrendingUp, TrendingDown, Activity, Calendar } from "lucide-react";
 import { api } from "@/api/client";
 import { Card, CardHeader, CardTitle, CardSubtitle, CardContent } from "@/components/ui/Card";
+import { ZoomableChart, ChartSeries } from "@/components/ui/ZoomableChart";
+import { InfoTooltip, LabelWithInfo } from "@/components/ui/InfoTooltip";
+import { SignalBanner } from "@/components/SignalBanner";
+import { GlossaryKey } from "@/lib/glossary";
 import { formatPercent, formatPercentSigned, formatDate, signClass, formatNumber } from "@/lib/format";
 import { cn } from "@/lib/cn";
 
@@ -12,11 +15,25 @@ export function Home() {
   const summary = useQuery({ queryKey: ["backtest"], queryFn: () => api.backtestSummary().catch(() => null) });
 
   const metrics = summary.data?.run.metrics ?? {};
-  const equity = (summary.data?.equity_curve ?? []).map((p) => ({
-    date: p.date,
-    value: p.cumulative_return !== null ? p.cumulative_return + 1 : null,
-    dd: p.drawdown,
-  }));
+
+  // Recompute strategy AND inverse growth-of-$1 from daily returns so the two
+  // curves are directly comparable on the same basis.
+  let cumStrat = 1;
+  let cumInv = 1;
+  const equity = (summary.data?.equity_curve ?? []).map((p) => {
+    const r = p.daily_return ?? 0;
+    cumStrat *= 1 + r;
+    cumInv *= 1 - r;
+    return { date: p.date, strategy: cumStrat, inverse: cumInv };
+  });
+
+  const equitySeries: ChartSeries[] = [
+    { type: "area", dataKey: "strategy", name: "Strategy", color: "hsl(var(--primary))", fillOpacity: 0.18, strokeWidth: 1.8 },
+    { type: "line", dataKey: "inverse", name: "Inverse", color: "hsl(var(--muted-foreground))", strokeWidth: 1.2 },
+  ];
+
+  const topLong = movers.data?.long?.[0];
+  const topShort = movers.data?.short?.[0];
 
   return (
     <div className="space-y-6">
@@ -34,57 +51,53 @@ export function Home() {
         </div>
       </div>
 
-      {/* KPI cards */}
-      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-        <KPI label="Sharpe (net)" value={metrics.sharpe} kind="number" />
-        <KPI label="Ann. return" value={metrics.ann_return} kind="percent" signed />
-        <KPI label="Max drawdown" value={metrics.max_drawdown} kind="percent" />
-        <KPI label="Ann. vol" value={metrics.ann_vol} kind="percent" />
+      {/* Headline signals (highest-conviction calls for next session) */}
+      <div className="grid gap-3 md:grid-cols-2">
+        <Link to={topLong ? `/ticker/${encodeURIComponent(topLong.ticker)}` : "#"} className="block">
+          <SignalBanner score={topLong?.score ?? null} side="long" subject={topLong?.ticker} asOf={movers.data?.date} />
+        </Link>
+        <Link to={topShort ? `/ticker/${encodeURIComponent(topShort.ticker)}` : "#"} className="block">
+          <SignalBanner score={topShort?.score ?? null} side="short" subject={topShort?.ticker} asOf={movers.data?.date} />
+        </Link>
       </div>
 
-      {/* Equity curve */}
+      {/* KPI cards */}
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <KPI label="Sharpe (net)" termKey="sharpe" value={metrics.sharpe} kind="number" />
+        <KPI label="Ann. return" termKey="ann_return" value={metrics.ann_return} kind="percent" signed />
+        <KPI label="Max drawdown" termKey="max_drawdown" value={metrics.max_drawdown} kind="percent" />
+        <KPI label="Ann. vol" termKey="ann_vol" value={metrics.ann_vol} kind="percent" />
+      </div>
+
+      {/* Equity curve (strategy vs inverse) */}
       <Card>
         <CardHeader>
-          <CardTitle>Equity curve</CardTitle>
-          <CardSubtitle>Cumulative growth of $1 (long/short ensemble). Honest, walk-forward.</CardSubtitle>
+          <div className="flex items-center gap-2">
+            <CardTitle>Equity curve</CardTitle>
+            <InfoTooltip termKey="inverse" title="Strategy vs Inverse" />
+          </div>
+          <CardSubtitle>
+            Growth of $1, walk-forward. The faint line is the <strong>inverse</strong> — doing the exact
+            opposite of every trade. For a real signal the inverse should lose; if it wins, the signal is
+            backwards. Drag on the chart to zoom; drag the bar below to scroll.
+          </CardSubtitle>
         </CardHeader>
         <CardContent>
-          <div className="h-72 w-full">
-            {summary.isLoading ? (
-              <Skeleton />
-            ) : equity.length === 0 ? (
-              <EmptyChart message="No backtest yet. Trigger a refresh." />
-            ) : (
-              <ResponsiveContainer>
-                <AreaChart data={equity}>
-                  <defs>
-                    <linearGradient id="g1" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="0%" stopColor="hsl(var(--primary))" stopOpacity={0.4} />
-                      <stop offset="100%" stopColor="hsl(var(--primary))" stopOpacity={0} />
-                    </linearGradient>
-                  </defs>
-                  <CartesianGrid stroke="hsl(var(--border))" strokeDasharray="3 3" vertical={false} />
-                  <XAxis dataKey="date" tick={{ fontSize: 11 }} stroke="hsl(var(--muted-foreground))" />
-                  <YAxis tick={{ fontSize: 11 }} stroke="hsl(var(--muted-foreground))" />
-                  <Tooltip
-                    contentStyle={{
-                      background: "hsl(var(--card))",
-                      border: "1px solid hsl(var(--border))",
-                      borderRadius: 6,
-                      fontSize: 12,
-                    }}
-                  />
-                  <Area
-                    type="monotone"
-                    dataKey="value"
-                    stroke="hsl(var(--primary))"
-                    fill="url(#g1)"
-                    strokeWidth={1.5}
-                  />
-                </AreaChart>
-              </ResponsiveContainer>
-            )}
-          </div>
+          {summary.isLoading ? (
+            <Skeleton />
+          ) : equity.length === 0 ? (
+            <EmptyChart message="No backtest yet. Queue a job on the Jobs page." />
+          ) : (
+            <ZoomableChart
+              data={equity}
+              xKey="date"
+              series={equitySeries}
+              height={300}
+              legend
+              leftFormatter={(v) => `$${v.toFixed(2)}`}
+              xTickFormatter={(v) => (v || "").slice(0, 7)}
+            />
+          )}
         </CardContent>
       </Card>
 
@@ -113,11 +126,13 @@ export function Home() {
 
 function KPI({
   label,
+  termKey,
   value,
   kind,
   signed = false,
 }: {
   label: string;
+  termKey: GlossaryKey;
   value: number | undefined;
   kind: "percent" | "number";
   signed?: boolean;
@@ -133,7 +148,11 @@ function KPI({
   return (
     <Card>
       <CardContent className="space-y-1">
-        <div className="text-xs uppercase tracking-wide text-muted-foreground">{label}</div>
+        <LabelWithInfo
+          label={label}
+          termKey={termKey}
+          className="text-xs uppercase tracking-wide text-muted-foreground"
+        />
         <div className={cn("text-2xl font-semibold tabular", signed && signClass(value))}>{display}</div>
       </CardContent>
     </Card>
@@ -156,6 +175,7 @@ function MoversCard({ title, subtitle, rows, icon, loading, side }: MoversProps)
         <div className="flex items-center gap-2">
           {icon}
           <CardTitle>{title}</CardTitle>
+          <InfoTooltip termKey="score" title="What is the score?" />
         </div>
         <CardSubtitle>{subtitle}</CardSubtitle>
       </CardHeader>
@@ -188,12 +208,12 @@ function MoversCard({ title, subtitle, rows, icon, loading, side }: MoversProps)
 }
 
 function Skeleton() {
-  return <div className="h-full w-full animate-pulse rounded-md bg-muted" />;
+  return <div className="h-72 w-full animate-pulse rounded-md bg-muted" />;
 }
 
 function EmptyChart({ message }: { message: string }) {
   return (
-    <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+    <div className="flex h-72 items-center justify-center text-sm text-muted-foreground">
       <Activity className="mr-2 h-4 w-4" /> {message}
     </div>
   );

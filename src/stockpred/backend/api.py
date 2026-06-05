@@ -67,6 +67,12 @@ WRITE_PW = os.environ.get("STOCKPRED_PW")
 
 _refresh_lock = threading.Lock()
 
+# Server-side quote cache: {ticker: (fetched_at, payload)}. TTL throttles
+# outbound yfinance calls so frontend polling can't rate-limit our IP.
+_QUOTE_TTL_S = 8.0
+_quote_cache: dict[str, tuple[float, dict]] = {}
+_quote_lock = threading.Lock()
+
 
 def _is_pipeline_running() -> bool:
     return _refresh_lock.locked()
@@ -372,6 +378,47 @@ def register_routes(app: FastAPI) -> None:
             ],
             predictions=preds_out,
         )
+
+    @app.get("/quote/{ticker}", response_model=schemas.QuoteOut, tags=["tickers"])
+    def quote(ticker: str):
+        """Latest delayed quote (~15 min, market hours only). Server-cached
+        for a few seconds so frontend polling can't rate-limit our IP."""
+        import time as _time
+
+        from stockpred.data import prices as prices_mod
+
+        try:
+            ticker = schemas._validate_ticker(ticker)
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from None
+
+        now = _time.monotonic()
+        with _quote_lock:
+            cached = _quote_cache.get(ticker)
+            if cached is not None and (now - cached[0]) < _QUOTE_TTL_S:
+                return cached[1]
+
+        q = prices_mod.latest_quote(ticker)
+        price = q.get("price")
+        prev = q.get("previous_close")
+        change = (price - prev) if (price is not None and prev is not None) else None
+        change_pct = (change / prev) if (change is not None and prev) else None
+        payload = schemas.QuoteOut(
+            ticker=ticker,
+            price=price,
+            previous_close=prev,
+            open=q.get("open"),
+            day_high=q.get("day_high"),
+            day_low=q.get("day_low"),
+            volume=q.get("volume"),
+            market_cap=q.get("market_cap"),
+            change=change,
+            change_pct=change_pct,
+            as_of=dt.datetime.now(dt.timezone.utc),
+        ).model_dump()
+        with _quote_lock:
+            _quote_cache[ticker] = (now, payload)
+        return payload
 
     # ------------------------------------------------------------------ #
     # Predictions

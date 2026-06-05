@@ -1,18 +1,10 @@
 import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
-import {
-  ResponsiveContainer,
-  AreaChart,
-  Area,
-  XAxis,
-  YAxis,
-  Tooltip,
-  CartesianGrid,
-  LineChart,
-  Line,
-} from "recharts";
 import { api } from "@/api/client";
 import { Card, CardContent, CardHeader, CardTitle, CardSubtitle } from "@/components/ui/Card";
+import { ZoomableChart, ChartSeries } from "@/components/ui/ZoomableChart";
+import { InfoTooltip, LabelWithInfo } from "@/components/ui/InfoTooltip";
+import { GlossaryKey } from "@/lib/glossary";
 import { formatPercent, formatPercentSigned, formatNumber, signClass } from "@/lib/format";
 import { cn } from "@/lib/cn";
 
@@ -22,11 +14,24 @@ export function Backtest() {
     queryFn: () => api.backtestSummary().catch(() => null),
   });
 
-  const equityRows = (data?.equity_curve ?? []).map((p) => ({
-    date: p.date,
-    equity: p.cumulative_return !== null ? p.cumulative_return + 1 : null,
-    dd: p.drawdown,
-  }));
+  // Recompute strategy + inverse growth-of-$1 from daily returns so both curves
+  // are directly comparable. Drawdown comes straight from the stored curve.
+  let cumStrat = 1;
+  let cumInv = 1;
+  const equityRows = (data?.equity_curve ?? []).map((p) => {
+    const r = p.daily_return ?? 0;
+    cumStrat *= 1 + r;
+    cumInv *= 1 - r;
+    return { date: p.date, equity: cumStrat, inverse: cumInv, dd: p.drawdown };
+  });
+
+  const equitySeries: ChartSeries[] = [
+    { type: "area", dataKey: "equity", name: "Strategy", color: "hsl(var(--primary))", fillOpacity: 0.18, strokeWidth: 1.8 },
+    { type: "line", dataKey: "inverse", name: "Inverse", color: "hsl(var(--muted-foreground))", strokeWidth: 1.2 },
+  ];
+  const ddSeries: ChartSeries[] = [
+    { type: "area", dataKey: "dd", name: "Drawdown", color: "hsl(var(--negative))", fillOpacity: 0.18, strokeWidth: 1.4 },
+  ];
 
   const yearly = useMemo(() => {
     const map: Record<string, { rets: number[]; sumLog: number }> = {};
@@ -77,72 +82,56 @@ export function Backtest() {
       </div>
 
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-        <Tile label="Ann. return" value={formatPercentSigned(m.ann_return)} signed={m.ann_return} />
-        <Tile label="Sharpe" value={formatNumber(m.sharpe)} signed={m.sharpe} />
-        <Tile label="Sortino" value={formatNumber(m.sortino)} signed={m.sortino} />
-        <Tile label="Max DD" value={formatPercent(m.max_drawdown)} />
-        <Tile label="Calmar" value={formatNumber(m.calmar)} signed={m.calmar} />
-        <Tile label="Vol" value={formatPercent(m.ann_vol)} />
-        <Tile label="Hit ratio" value={formatPercent(m.hit_ratio)} />
+        <Tile label="Ann. return" termKey="ann_return" value={formatPercentSigned(m.ann_return)} signed={m.ann_return} />
+        <Tile label="Sharpe" termKey="sharpe" value={formatNumber(m.sharpe)} signed={m.sharpe} />
+        <Tile label="Sortino" termKey="sortino" value={formatNumber(m.sortino)} signed={m.sortino} />
+        <Tile label="Max DD" termKey="max_drawdown" value={formatPercent(m.max_drawdown)} />
+        <Tile label="Calmar" termKey="calmar" value={formatNumber(m.calmar)} signed={m.calmar} />
+        <Tile label="Vol" termKey="ann_vol" value={formatPercent(m.ann_vol)} />
+        <Tile label="Hit ratio" termKey="hit_ratio" value={formatPercent(m.hit_ratio)} />
         <Tile label="Days" value={String(m.n_days ?? "—")} />
       </div>
 
       <Card>
         <CardHeader>
-          <CardTitle>Equity curve</CardTitle>
-          <CardSubtitle>Walk-forward, net of costs. Honest — including the bad parts.</CardSubtitle>
+          <div className="flex items-center gap-2">
+            <CardTitle>Equity curve</CardTitle>
+            <InfoTooltip termKey="inverse" title="Strategy vs Inverse" />
+          </div>
+          <CardSubtitle>
+            Growth of $1, walk-forward, net of costs. The faint line is the inverse (doing the opposite of
+            every trade). Drag on the chart to zoom; drag the bar below to scroll.
+          </CardSubtitle>
         </CardHeader>
         <CardContent>
-          <div className="h-72 w-full">
-            <ResponsiveContainer>
-              <AreaChart data={equityRows}>
-                <defs>
-                  <linearGradient id="eq" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="hsl(var(--primary))" stopOpacity={0.4} />
-                    <stop offset="100%" stopColor="hsl(var(--primary))" stopOpacity={0} />
-                  </linearGradient>
-                </defs>
-                <CartesianGrid stroke="hsl(var(--border))" strokeDasharray="3 3" vertical={false} />
-                <XAxis dataKey="date" tick={{ fontSize: 11 }} stroke="hsl(var(--muted-foreground))" />
-                <YAxis tick={{ fontSize: 11 }} stroke="hsl(var(--muted-foreground))" />
-                <Tooltip
-                  contentStyle={{
-                    background: "hsl(var(--card))",
-                    border: "1px solid hsl(var(--border))",
-                    borderRadius: 6,
-                    fontSize: 12,
-                  }}
-                />
-                <Area type="monotone" dataKey="equity" stroke="hsl(var(--primary))" fill="url(#eq)" strokeWidth={1.5} />
-              </AreaChart>
-            </ResponsiveContainer>
-          </div>
+          <ZoomableChart
+            data={equityRows}
+            xKey="date"
+            series={equitySeries}
+            height={300}
+            legend
+            leftFormatter={(v) => `$${v.toFixed(2)}`}
+            xTickFormatter={(v) => (v || "").slice(0, 7)}
+          />
         </CardContent>
       </Card>
 
       <Card>
         <CardHeader>
-          <CardTitle>Drawdown</CardTitle>
+          <div className="flex items-center gap-2">
+            <CardTitle>Drawdown</CardTitle>
+            <InfoTooltip termKey="max_drawdown" title="Drawdown" />
+          </div>
         </CardHeader>
         <CardContent>
-          <div className="h-48 w-full">
-            <ResponsiveContainer>
-              <LineChart data={equityRows}>
-                <CartesianGrid stroke="hsl(var(--border))" strokeDasharray="3 3" vertical={false} />
-                <XAxis dataKey="date" tick={{ fontSize: 11 }} stroke="hsl(var(--muted-foreground))" />
-                <YAxis tickFormatter={(v) => `${(v * 100).toFixed(0)}%`} tick={{ fontSize: 11 }} stroke="hsl(var(--muted-foreground))" />
-                <Tooltip
-                  contentStyle={{
-                    background: "hsl(var(--card))",
-                    border: "1px solid hsl(var(--border))",
-                    borderRadius: 6,
-                    fontSize: 12,
-                  }}
-                />
-                <Line type="monotone" dataKey="dd" stroke="hsl(var(--negative))" strokeWidth={1.5} dot={false} />
-              </LineChart>
-            </ResponsiveContainer>
-          </div>
+          <ZoomableChart
+            data={equityRows}
+            xKey="date"
+            series={ddSeries}
+            height={210}
+            leftFormatter={(v) => `${(v * 100).toFixed(0)}%`}
+            xTickFormatter={(v) => (v || "").slice(0, 7)}
+          />
         </CardContent>
       </Card>
 
@@ -156,9 +145,15 @@ export function Backtest() {
             <thead className="text-xs uppercase text-muted-foreground">
               <tr>
                 <th className="py-2 text-left">Horizon</th>
-                <th className="py-2 text-right">Hit rate</th>
-                <th className="py-2 text-right">IC mean</th>
-                <th className="py-2 text-right">IC IR</th>
+                <th className="py-2 text-right">
+                  <LabelWithInfo label="Hit rate" termKey="hit_rate" className="justify-end" side="top" align="end" />
+                </th>
+                <th className="py-2 text-right">
+                  <LabelWithInfo label="IC mean" termKey="ic" className="justify-end" side="top" align="end" />
+                </th>
+                <th className="py-2 text-right">
+                  <LabelWithInfo label="IC IR" termKey="ic_ir" className="justify-end" side="top" align="end" />
+                </th>
               </tr>
             </thead>
             <tbody className="divide-y divide-border">
@@ -206,11 +201,21 @@ export function Backtest() {
   );
 }
 
-function Tile({ label, value, signed }: { label: string; value: string; signed?: number }) {
+function Tile({
+  label,
+  termKey,
+  value,
+  signed,
+}: {
+  label: string;
+  termKey?: GlossaryKey;
+  value: string;
+  signed?: number;
+}) {
   return (
     <Card>
       <CardContent className="space-y-1">
-        <div className="text-xs uppercase text-muted-foreground">{label}</div>
+        <LabelWithInfo label={label} termKey={termKey} className="text-xs uppercase text-muted-foreground" />
         <div className={cn("text-xl font-semibold tabular", signed !== undefined && signClass(signed))}>{value}</div>
       </CardContent>
     </Card>

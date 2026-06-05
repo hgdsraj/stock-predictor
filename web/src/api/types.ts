@@ -113,6 +113,21 @@ export interface HealthResponse {
   scheduler: string;
 }
 
+export interface Quote {
+  ticker: string;
+  price: number | null;
+  previous_close: number | null;
+  open: number | null;
+  day_high: number | null;
+  day_low: number | null;
+  volume: number | null;
+  market_cap: number | null;
+  change: number | null;
+  change_pct: number | null;
+  as_of: string;
+  delayed: boolean;
+}
+
 export interface WatchedItem {
   ticker: string;
   label: string | null;

@@ -250,6 +250,24 @@ class HealthResponse(BaseModel):
     scheduler: str
 
 
+class QuoteOut(BaseModel):
+    """Latest (delayed) quote from yfinance fast_info. ~15 min delayed; only
+    moves during market hours. Fields are None when unavailable."""
+
+    ticker: str
+    price: float | None = None
+    previous_close: float | None = None
+    open: float | None = None
+    day_high: float | None = None
+    day_low: float | None = None
+    volume: float | None = None
+    market_cap: float | None = None
+    change: float | None = None  # price - previous_close
+    change_pct: float | None = None  # change / previous_close
+    as_of: dt.datetime  # server time the quote was fetched
+    delayed: bool = True
+
+
 class WatchedItem(BaseModel):
     ticker: str
     label: str | None = None

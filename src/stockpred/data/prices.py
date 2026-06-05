@@ -96,6 +96,51 @@ def fetch_one(
     return pd.DataFrame(columns=OHLCV_COLS)
 
 
+def latest_quote(ticker: str) -> dict:
+    """Best-effort latest (delayed) quote via yfinance fast_info.
+
+    yfinance quotes are ~15 min delayed and only move during market hours.
+    Returns a dict with whatever fields are available; missing fields are None.
+    Never raises — returns {"ticker": ticker, "price": None, ...} on failure.
+    """
+
+    def _pick(fi, *keys):
+        for k in keys:
+            try:
+                v = fi[k]
+            except Exception:  # noqa: BLE001
+                v = getattr(fi, k, None) if not isinstance(fi, dict) else fi.get(k)
+            if v is not None:
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    return v
+        return None
+
+    out = {
+        "ticker": ticker,
+        "price": None,
+        "previous_close": None,
+        "open": None,
+        "day_high": None,
+        "day_low": None,
+        "volume": None,
+        "market_cap": None,
+    }
+    try:
+        fi = yf.Ticker(ticker).fast_info
+        out["price"] = _pick(fi, "lastPrice", "last_price")
+        out["previous_close"] = _pick(fi, "previousClose", "previous_close")
+        out["open"] = _pick(fi, "open")
+        out["day_high"] = _pick(fi, "dayHigh", "day_high")
+        out["day_low"] = _pick(fi, "dayLow", "day_low")
+        out["volume"] = _pick(fi, "lastVolume", "last_volume")
+        out["market_cap"] = _pick(fi, "marketCap", "market_cap")
+    except Exception as e:  # noqa: BLE001
+        log.warning("latest_quote failed for %s: %s", ticker, e)
+    return out
+
+
 def fetch_many(
     tickers: list[str],
     *,
