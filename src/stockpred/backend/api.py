@@ -3,12 +3,16 @@
 Routes:
   GET  /healthz                     — DB + scheduler health
   GET  /tickers                     — list all tickers with summary
-  GET  /tickers/{ticker}/details    — fundamentals + extended history
+  GET  /tickers/{ticker}/details    — fundamentals + extended history (?run_id= optional)
   GET  /tickers/{ticker}/news       — headlines
-  GET  /predictions/latest          — top-k long / bottom-k short
-  GET  /runs                        — recent runs (metadata)
-  GET  /runs/{run_id}/equity        — backtest equity curve
-  GET  /backtest/summary            — latest backtest tearsheet payload
+  GET  /predictions/latest          — top-k long / bottom-k short (?run_id= optional)
+  GET  /runs                        — recent runs (metadata + config + job_id + is_active)
+  GET  /runs/{run_id}               — single run summary
+  GET  /runs/{run_id}/equity        — backtest equity curve for that run
+  GET  /runs/{run_id}/backtest      — full BacktestSummary for arbitrary run
+  POST /runs/{run_id}/activate      — pin a run as the active data source (X-Password)
+  POST /runs/deactivate             — clear the active-run pin (X-Password)
+  GET  /backtest/summary            — backtest tearsheet (?run_id= optional; default = active/latest)
 
   POST /jobs/refresh                — trigger run (requires X-API-Key)
   GET  /jobs                        — list recent jobs (in-memory)
@@ -197,6 +201,56 @@ def get_db():
         yield s
 
 
+# ----- Run serialisation -------------------------------------------------
+
+
+def _job_id_for_run(s: Session, run_id: int) -> str | None:
+    """Reverse-lookup the JobRecord that owns this run, if any.
+
+    Cheap — JobRecord rows are bounded by retention and we only call this
+    when serialising a small number of RunSummary rows at a time.
+    """
+    from stockpred.backend.models import JobRecord
+
+    return s.execute(
+        select(JobRecord.job_id).where(JobRecord.run_id == run_id).limit(1)
+    ).scalar_one_or_none()
+
+
+def _run_to_summary(s: Session, run) -> "schemas.RunSummary":
+    """Build a RunSummary payload from an ORM Run, including config + job_id."""
+    summary = run.summary_json or {}
+    return schemas.RunSummary(
+        id=run.id,
+        started_at=run.started_at,
+        completed_at=run.completed_at,
+        status=run.status,
+        metrics=summary.get("metrics", {}),
+        per_horizon_diagnostics=summary.get("per_horizon_diagnostics", {}),
+        tickers_count=summary.get("tickers_count", 0),
+        note=run.note,
+        config=run.config_json or {},
+        job_id=_job_id_for_run(s, run.id),
+        # is_active may not exist on rows from very old DBs that predate the
+        # migration; getattr-with-default keeps the API forward-compatible.
+        is_active=bool(getattr(run, "is_active", False)),
+    )
+
+
+def _equity_to_payload(rows) -> list["schemas.EquityPoint"]:
+    return [
+        schemas.EquityPoint(
+            date=r.date,
+            daily_return=r.daily_return,
+            cumulative_return=r.cumulative_return,
+            drawdown=r.drawdown,
+            turnover=r.turnover,
+            benchmark_return=r.benchmark_return,
+        )
+        for r in rows
+    ]
+
+
 # ----- Pipeline config builder (shared by /refresh and /jobs/run) --------
 
 
@@ -361,6 +415,14 @@ def register_routes(app: FastAPI) -> None:
     def ticker_details(
         ticker: str,
         days: int = Query(default=365, ge=1, le=2000),
+        run_id: int | None = Query(
+            default=None,
+            description=(
+                "If set, return predictions from this exact run instead of the "
+                "active/latest run. Lets the UI compare historical model "
+                "predictions for the same ticker across runs."
+            ),
+        ),
         s: Session = Depends(get_db),
     ):
         fund = store.fundamental_for(s, ticker)
@@ -368,7 +430,7 @@ def register_routes(app: FastAPI) -> None:
             raise HTTPException(404, f"unknown ticker {ticker}")
         start = dt.date.today() - dt.timedelta(days=days)
         prices = store.prices_for_ticker(s, ticker, start=start)
-        run = store.latest_run(s)
+        run = store.resolve_run(s, run_id)
         preds_out: list[schemas.PredictionOut] = []
         if run:
             for p in store.predictions_for_ticker(s, run.id, ticker):
@@ -459,8 +521,18 @@ def register_routes(app: FastAPI) -> None:
     # ------------------------------------------------------------------ #
 
     @app.get("/predictions/latest", response_model=schemas.TopMovers, tags=["predictions"])
-    def latest_movers(top_k: int = Query(default=10, ge=1, le=100), s: Session = Depends(get_db)):
-        run = store.latest_run(s)
+    def latest_movers(
+        top_k: int = Query(default=10, ge=1, le=100),
+        run_id: int | None = Query(
+            default=None,
+            description=(
+                "If set, return predictions from this exact run instead of the "
+                "active/latest run. Lets the UI switch its data source live."
+            ),
+        ),
+        s: Session = Depends(get_db),
+    ):
+        run = store.resolve_run(s, run_id)
         if run is None:
             return schemas.TopMovers(date=None, long=[], short=[])
         data = store.latest_predictions(s, run.id, top_k=top_k)
@@ -500,63 +572,89 @@ def register_routes(app: FastAPI) -> None:
     @app.get("/runs", response_model=list[schemas.RunSummary], tags=["runs"])
     def runs(limit: int = Query(default=20, ge=1, le=100), s: Session = Depends(get_db)):
         rows = store.list_runs(s, limit=limit)
-        return [
-            schemas.RunSummary(
-                id=r.id,
-                started_at=r.started_at,
-                completed_at=r.completed_at,
-                status=r.status,
-                metrics=r.summary_json.get("metrics", {}),
-                per_horizon_diagnostics=r.summary_json.get("per_horizon_diagnostics", {}),
-                tickers_count=r.summary_json.get("tickers_count", 0),
-                note=r.note,
-            )
-            for r in rows
-        ]
+        return [_run_to_summary(s, r) for r in rows]
+
+    @app.get("/runs/{run_id}", response_model=schemas.RunSummary, tags=["runs"])
+    def get_run_endpoint(run_id: int, s: Session = Depends(get_db)):
+        """Single run by id, including config + linked job_id + is_active."""
+        run = store.get_run(s, run_id)
+        if run is None:
+            raise HTTPException(404, f"run {run_id} not found")
+        return _run_to_summary(s, run)
 
     @app.get("/runs/{run_id}/equity", response_model=list[schemas.EquityPoint], tags=["runs"])
     def equity_curve(run_id: int, s: Session = Depends(get_db)):
-        rows = store.equity_for_run(s, run_id)
-        return [
-            schemas.EquityPoint(
-                date=r.date,
-                daily_return=r.daily_return,
-                cumulative_return=r.cumulative_return,
-                drawdown=r.drawdown,
-                turnover=r.turnover,
-                benchmark_return=r.benchmark_return,
-            )
-            for r in rows
-        ]
+        return _equity_to_payload(store.equity_for_run(s, run_id))
+
+    @app.get(
+        "/runs/{run_id}/backtest",
+        response_model=schemas.BacktestSummary,
+        tags=["runs"],
+    )
+    def run_backtest(run_id: int, s: Session = Depends(get_db)):
+        """Full BacktestSummary for an arbitrary run. Used by the Runs history
+        page and by `Backtest.tsx` when the user pins / switches runs."""
+        run = store.get_run(s, run_id)
+        if run is None:
+            raise HTTPException(404, f"run {run_id} not found")
+        return schemas.BacktestSummary(
+            run=_run_to_summary(s, run),
+            equity_curve=_equity_to_payload(store.equity_for_run(s, run.id)),
+        )
+
+    @app.post(
+        "/runs/{run_id}/activate",
+        response_model=schemas.ActivateRunResponse,
+        tags=["runs"],
+        dependencies=[Depends(_require_password)],
+    )
+    def activate_run_endpoint(run_id: int, s: Session = Depends(get_db)):
+        """Pin `run_id` as the global default data source for /predictions/latest,
+        /backtest/summary, etc. Requires X-Password (same as job launch — this
+        affects every viewer of the live site)."""
+        try:
+            run = store.activate_run(s, run_id)
+        except ValueError as e:
+            raise HTTPException(409, str(e)) from None
+        if run is None:
+            raise HTTPException(404, f"run {run_id} not found")
+        return schemas.ActivateRunResponse(
+            active_run_id=run.id,
+            message=f"run {run.id} is now the active data source",
+        )
+
+    @app.post(
+        "/runs/deactivate",
+        response_model=schemas.ActivateRunResponse,
+        tags=["runs"],
+        dependencies=[Depends(_require_password)],
+    )
+    def deactivate_runs_endpoint(s: Session = Depends(get_db)):
+        """Clear the active-run pin. The API reverts to "latest ok run" behaviour.
+        Requires X-Password."""
+        cleared = store.deactivate_all_runs(s)
+        return schemas.ActivateRunResponse(
+            active_run_id=None,
+            message=f"cleared {cleared} active-run pin(s); reverting to latest-ok",
+        )
 
     @app.get("/backtest/summary", response_model=schemas.BacktestSummary, tags=["backtest"])
-    def backtest_summary(s: Session = Depends(get_db)):
-        run = store.latest_run(s)
+    def backtest_summary(
+        run_id: int | None = Query(
+            default=None,
+            description=(
+                "If set, return this exact run's backtest instead of the "
+                "active/latest run. Lets the UI switch its data source live."
+            ),
+        ),
+        s: Session = Depends(get_db),
+    ):
+        run = store.resolve_run(s, run_id)
         if run is None:
             raise HTTPException(404, "no runs yet")
-        equity = store.equity_for_run(s, run.id)
         return schemas.BacktestSummary(
-            run=schemas.RunSummary(
-                id=run.id,
-                started_at=run.started_at,
-                completed_at=run.completed_at,
-                status=run.status,
-                metrics=run.summary_json.get("metrics", {}),
-                per_horizon_diagnostics=run.summary_json.get("per_horizon_diagnostics", {}),
-                tickers_count=run.summary_json.get("tickers_count", 0),
-                note=run.note,
-            ),
-            equity_curve=[
-                schemas.EquityPoint(
-                    date=r.date,
-                    daily_return=r.daily_return,
-                    cumulative_return=r.cumulative_return,
-                    drawdown=r.drawdown,
-                    turnover=r.turnover,
-                    benchmark_return=r.benchmark_return,
-                )
-                for r in equity
-            ],
+            run=_run_to_summary(s, run),
+            equity_curve=_equity_to_payload(store.equity_for_run(s, run.id)),
         )
 
     # ------------------------------------------------------------------ #

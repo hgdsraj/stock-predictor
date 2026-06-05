@@ -72,11 +72,23 @@ export interface RunSummary {
   per_horizon_diagnostics: Record<string, Record<string, number>>;
   tickers_count: number;
   note: string | null;
+  /** Full PipelineConfig snapshot. Defaults to {} for old runs that
+   *  predate the API change. */
+  config: Record<string, unknown>;
+  /** UUID of the JobRecord that produced this run, if any. */
+  job_id: string | null;
+  /** True if this run is the server-side default data source. */
+  is_active: boolean;
 }
 
 export interface BacktestSummary {
   run: RunSummary;
   equity_curve: EquityPoint[];
+}
+
+export interface ActivateRunResponse {
+  active_run_id: number | null;
+  message: string;
 }
 
 export interface JobResponse {

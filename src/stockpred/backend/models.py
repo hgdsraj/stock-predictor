@@ -19,6 +19,7 @@ from typing import Any
 
 from sqlalchemy import (
     JSON,
+    Boolean,
     Date,
     DateTime,
     Float,
@@ -43,6 +44,14 @@ class Run(Base):
     config_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     summary_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     note: Mapped[str | None] = mapped_column(String(512), nullable=True)
+
+    # When True, this run is the server-side default data source for /predictions/latest,
+    # /backtest/summary, etc. Only one row should have is_active=True at a time;
+    # store.activate_run() enforces this invariant. If no row is active, the API
+    # falls back to "most recent ok run" (legacy behaviour).
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0"
+    )
 
     predictions: Mapped[list["Prediction"]] = relationship(
         back_populates="run", cascade="all, delete-orphan"

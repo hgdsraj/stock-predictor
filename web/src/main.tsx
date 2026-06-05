@@ -9,6 +9,7 @@ import { Screener } from "./pages/Screener";
 import { Ticker } from "./pages/Ticker";
 import { Backtest } from "./pages/Backtest";
 import { Jobs } from "./pages/Jobs";
+import { Runs } from "./pages/Runs";
 import { About } from "./pages/About";
 import "./index.css";
 
@@ -33,6 +34,7 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
               <Route path="/screener" element={<Screener />} />
               <Route path="/ticker/:ticker" element={<Ticker />} />
               <Route path="/backtest" element={<Backtest />} />
+              <Route path="/runs" element={<Runs />} />
               <Route path="/jobs" element={<Jobs />} />
               <Route path="/about" element={<About />} />
               <Route path="*" element={<Home />} />

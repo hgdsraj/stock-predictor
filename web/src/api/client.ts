@@ -4,6 +4,7 @@
 // "just work".
 
 import type {
+  ActivateRunResponse,
   BacktestSummary,
   HealthResponse,
   JobDetail,
@@ -64,24 +65,54 @@ async function del<T>(path: string, headers?: Record<string, string>): Promise<T
   return (await res.json()) as T;
 }
 
+// Helper: build a querystring from an object, omitting null/undefined values.
+function qs(params: Record<string, string | number | null | undefined>): string {
+  const entries = Object.entries(params).filter(([, v]) => v !== null && v !== undefined);
+  if (entries.length === 0) return "";
+  return "?" + entries.map(([k, v]) => `${k}=${encodeURIComponent(String(v))}`).join("&");
+}
+
 export const api = {
   // ── Existing read endpoints ────────────────────────────────────────────
   health: () => get<HealthResponse>("/healthz"),
   tickers: () => get<TickerSummary[]>("/tickers"),
-  tickerDetail: (ticker: string, days = 365) =>
-    get<TickerDetail>(`/tickers/${encodeURIComponent(ticker)}/details?days=${days}`),
+  /** Ticker detail. `runId` selects the model run whose predictions block to embed
+   *  (defaults to the active/latest run on the server). */
+  tickerDetail: (ticker: string, days = 365, runId?: number | null) =>
+    get<TickerDetail>(
+      `/tickers/${encodeURIComponent(ticker)}/details${qs({ days, run_id: runId })}`,
+    ),
   tickerNews: (ticker: string, limit = 20) =>
     get<NewsHeadline[]>(`/tickers/${encodeURIComponent(ticker)}/news?limit=${limit}`),
   /** Latest delayed (~15min) quote. Server-cached a few seconds. */
   quote: (ticker: string) => get<Quote>(`/quote/${encodeURIComponent(ticker)}`),
-  latestPredictions: (top_k = 10) =>
-    get<TopMovers>(`/predictions/latest?top_k=${top_k}`),
+  /** Top long/short movers for the active or specified run. */
+  latestPredictions: (top_k = 10, runId?: number | null) =>
+    get<TopMovers>(`/predictions/latest${qs({ top_k, run_id: runId })}`),
+  /** List of recent runs (newest first). */
   runs: (limit = 20) => get<RunSummary[]>(`/runs?limit=${limit}`),
+  /** Single run by id. */
+  run: (run_id: number) => get<RunSummary>(`/runs/${run_id}`),
+  /** Equity curve for a single run. */
   runEquity: (run_id: number) =>
     get<{ date: string; cumulative_return: number | null; drawdown: number | null }[]>(
       `/runs/${run_id}/equity`,
     ),
-  backtestSummary: () => get<BacktestSummary>("/backtest/summary"),
+  /** Full BacktestSummary for an arbitrary run id. */
+  runBacktest: (run_id: number) => get<BacktestSummary>(`/runs/${run_id}/backtest`),
+  /** Backtest summary for the active/latest run, or the explicitly-requested run. */
+  backtestSummary: (runId?: number | null) =>
+    get<BacktestSummary>(`/backtest/summary${qs({ run_id: runId })}`),
+  /** Pin a run as the server-side default data source. Requires X-Password. */
+  activateRun: (run_id: number, password: string) =>
+    post<ActivateRunResponse>(`/runs/${run_id}/activate`, undefined, {
+      "X-Password": password,
+    }),
+  /** Clear the active-run pin. Requires X-Password. */
+  deactivateRun: (password: string) =>
+    post<ActivateRunResponse>("/runs/deactivate", undefined, {
+      "X-Password": password,
+    }),
   watchlist: () => get<WatchedItem[]>("/watchlist"),
 
   // ── Jobs (read) ────────────────────────────────────────────────────────

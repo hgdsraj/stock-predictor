@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
-import { TrendingUp, TrendingDown, Activity, Calendar } from "lucide-react";
+import { TrendingUp, TrendingDown, Activity, Calendar, Pin } from "lucide-react";
 import { api } from "@/api/client";
 import { Card, CardHeader, CardTitle, CardSubtitle, CardContent } from "@/components/ui/Card";
 import { ZoomableChart, ChartSeries } from "@/components/ui/ZoomableChart";
@@ -8,11 +8,22 @@ import { InfoTooltip, LabelWithInfo } from "@/components/ui/InfoTooltip";
 import { SignalBanner } from "@/components/SignalBanner";
 import { GlossaryKey } from "@/lib/glossary";
 import { formatPercent, formatPercentSigned, formatDate, signClass, formatNumber } from "@/lib/format";
+import { useActiveRun } from "@/hooks/useActiveRun";
 import { cn } from "@/lib/cn";
 
 export function Home() {
-  const movers = useQuery({ queryKey: ["movers"], queryFn: () => api.latestPredictions(10) });
-  const summary = useQuery({ queryKey: ["backtest"], queryFn: () => api.backtestSummary().catch(() => null) });
+  // The active run determines what data we fetch. Pinning is reflected in the
+  // URL (?run_id=…) and the header RunPicker, but we surface a small banner
+  // here too so a user can't forget they're looking at a non-default run.
+  const { runId, isPinned, queryKeyPart, setRunId } = useActiveRun();
+  const movers = useQuery({
+    queryKey: ["movers", queryKeyPart],
+    queryFn: () => api.latestPredictions(10, runId),
+  });
+  const summary = useQuery({
+    queryKey: ["backtest", queryKeyPart],
+    queryFn: () => api.backtestSummary(runId).catch(() => null),
+  });
 
   const metrics = summary.data?.run.metrics ?? {};
 
@@ -41,12 +52,42 @@ export function Home() {
 
   return (
     <div className="space-y-6">
+      {/* Pinned-run notice: shown only when the user has explicitly overridden
+          the server default. Clicking "Clear" reverts to the default. */}
+      {isPinned && (
+        <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-primary/30 bg-primary/5 px-3 py-2 text-sm">
+          <span className="flex items-center gap-2">
+            <Pin className="h-3.5 w-3.5 text-primary" />
+            Viewing pinned run{" "}
+            <Link to={`/runs?expanded=${runId}`} className="font-mono font-semibold text-primary underline-offset-2 hover:underline">
+              #{runId}
+            </Link>{" "}
+            — not the server default.
+          </span>
+          <button
+            onClick={() => setRunId(null)}
+            className="rounded-md border border-primary/30 px-2 py-0.5 text-xs text-primary hover:bg-primary/10"
+          >
+            Clear pin
+          </button>
+        </div>
+      )}
+
       {/* Header / status */}
       <div className="flex flex-wrap items-end justify-between gap-4">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Today’s view</h1>
           <p className="text-sm text-muted-foreground">
-            Long/short cross-sectional signal. As of {formatDate(movers.data?.date)}.
+            Long/short cross-sectional signal. As of {formatDate(movers.data?.date)}
+            {summary.data?.run.id != null && (
+              <>
+                {" · "}
+                <Link to="/runs" className="hover:underline">
+                  Run #{summary.data.run.id}
+                </Link>
+              </>
+            )}
+            .
           </p>
         </div>
         <div className="flex items-center gap-2 text-xs text-muted-foreground">

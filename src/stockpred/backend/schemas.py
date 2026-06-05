@@ -89,6 +89,16 @@ class EquityPoint(BaseModel):
 
 
 class RunSummary(BaseModel):
+    """Summary of a single pipeline run. Returned by /runs and embedded in
+    /backtest/summary.
+
+    `config` is the full PipelineConfig snapshot (was previously only on the
+    job record); the Runs history UI surfaces phase / model / feature flags
+    out of it without a second fetch. `job_id` is the originating job's UUID
+    if known — looked up from JobRecord.run_id at serialise time.
+    `is_active` marks the server-side default data source.
+    """
+
     id: int
     started_at: dt.datetime
     completed_at: dt.datetime | None
@@ -97,11 +107,21 @@ class RunSummary(BaseModel):
     per_horizon_diagnostics: dict
     tickers_count: int
     note: str | None
+    config: dict = {}
+    job_id: str | None = None
+    is_active: bool = False
 
 
 class BacktestSummary(BaseModel):
     run: RunSummary
     equity_curve: list[EquityPoint]
+
+
+class ActivateRunResponse(BaseModel):
+    """Returned by POST /runs/{id}/activate and POST /runs/deactivate."""
+
+    active_run_id: int | None
+    message: str
 
 
 class CVParams(BaseModel):
