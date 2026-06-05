@@ -324,6 +324,11 @@ optimal. **This doc will be updated after each phase completes.**
 - **Date**: 2026-06-05.
 - **Production smoke**: HOLDOUT Sharpe +0.173, CI [−0.32, +0.58], DD
   −8.2%, peak RSS 1.03 GB, runtime ~3 min on warm cache.
+- **REPRODUCIBILITY VERIFIED** by independent re-run as part of Phase 16
+  chain sweep (commit `9aaab46`): same config produced **exact same**
+  numbers: Sharpe +0.173, CI [−0.321, +0.583], DD −8.16%. The result
+  is deterministic given the cached yfinance prices and EDGAR
+  submissions JSON.
 - **Test suite**: 176+ tests passing on Phase 6-19 modules.
 - **Universe**: 150 S&P 500 tickers, current-membership sampled,
   2014-01-01 to 2024-12-31, last 2 years as OOS holdout.
