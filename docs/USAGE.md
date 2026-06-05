@@ -629,7 +629,93 @@ Planned env vars:
 
 ---
 
-## 6d. Memory budget (8 GB / 8 vCPU target)
+## 6d. Hyperparameter search (find the best config automatically)
+
+`scripts/run_hypersearch.py` runs a **Bayesian hyperparameter search** (Optuna
+TPE) across 20 pipeline parameters to find the combination that maximises
+**holdout Sharpe** — the most honest metric, because the holdout window is
+never touched during tuning.
+
+### Quick start
+
+```bash
+# Smoke test: 20 trials, ~25 tickers, ~30-80 min total
+uv run python scripts/run_hypersearch.py --n-trials 20
+
+# Recommended: 50 trials on 25 tickers (~2-4 hours)
+uv run python scripts/run_hypersearch.py
+
+# Longer overnight run for higher confidence
+uv run python scripts/run_hypersearch.py --n-trials 100 --n-tickers 40
+```
+
+### What it searches
+
+| Group | Parameters |
+| ----- | ---------- |
+| Portfolio | `position_sizing`, `k_per_side_pct`, `leverage_per_side`, `sector_cap_gross`, `min_trade_threshold` |
+| Signal | `horizons`, `ensemble_weighting` |
+| Features | `use_tier2_features`, `use_regime_features`, `use_sector_features`, `ranks_only`, `beta_neutralise` |
+| Meta-labelling | `use_meta_labelling`, `meta_threshold`, `meta_mode`, `meta_conf_floor` (conditional) |
+| GBM | `num_leaves`, `learning_rate`, `n_estimators` |
+| CV | `train_years` |
+
+### CLI flags
+
+| Flag | Default | Meaning |
+| ---- | ------- | ------- |
+| `--n-trials` | `50` | Number of Optuna trials |
+| `--n-tickers` | `25` | Universe size per trial (25 ≈ 2-4 min/trial) |
+| `--start` | `2015-01-01` | History start date |
+| `--holdout-years` | `2` | Years held out (never seen during tuning) |
+| `--bootstrap-n` | `50` | Bootstrap samples (50=fast; 500=honest) |
+| `--server-url` | `http://localhost:8000` | Used to generate the curl command in the report |
+| `--storage` | none | SQLite/PostgreSQL URL for persistence/parallel workers |
+| `--study-name` | auto | Name for the Optuna study |
+
+### Outputs
+
+After every run the script writes two files to `reports/`:
+
+| File | Contents |
+| ---- | -------- |
+| `hypersearch_<name>_n<N>_<year>.csv` | All trials sorted by holdout Sharpe |
+| `hypersearch_<name>_n<N>_<year>.md` | Human-readable report with top-10 table, honest CI interpretation, best config JSON, and a ready-to-paste `curl` command |
+
+### Reading the results honestly
+
+The markdown report includes a **95% block-bootstrap Sharpe CI** for every
+trial. A Sharpe CI that straddles zero means the result is statistically
+indistinguishable from noise. Only configs where the **CI lower bound > 0**
+have a statistically detectable edge.
+
+After tuning, run the best config at full scale to validate:
+
+```bash
+uv run python scripts/run_phase5.py \
+    --n-tickers 150 --start 2015-01-01 \
+    <best params from the report> \
+    --bootstrap-n 500
+```
+
+### Parallel / resumed studies
+
+Pass `--storage` to persist the study to SQLite or PostgreSQL. Multiple
+terminals sharing the same storage and study name run trials independently:
+
+```bash
+# Terminal 1
+uv run python scripts/run_hypersearch.py \
+    --storage sqlite:///reports/hypersearch.db --study-name prod --n-trials 50
+
+# Terminal 2 (same storage → shared study, no duplicate work)
+uv run python scripts/run_hypersearch.py \
+    --storage sqlite:///reports/hypersearch.db --study-name prod --n-trials 50
+```
+
+---
+
+## 6e. Memory budget (8 GB / 8 vCPU target)
 
 User direction 2026-06-04: production deploy target is an 8 GB / 8
 vCPU box. Each pipeline run now logs peak RSS at the end:

@@ -345,3 +345,50 @@ hookup is a 3-line code change in `jobs.py`; left as an exercise for now).
   [`PROJECT_LOG.md`](./PROJECT_LOG.md).
 - Replace your judgement. Treat all numbers shown on the dashboard as
   research output, not advice.
+
+---
+
+## Future: zero-downtime deploys + managed infra
+
+Currently `railway up` kills the container immediately, which terminates any
+in-flight pipeline thread. This is acceptable for now — just check `/jobs`
+before deploying. Options when this becomes a real problem:
+
+### Option A — SIGTERM graceful drain (easy, no infra change)
+
+Catch `SIGTERM` in the lifespan and stall shutdown until the running job
+finishes or a timeout expires. Set `stopTimeoutSeconds = 7200` in
+`railway.toml`. Railway queues the new deploy behind the drain. Works for
+planned deploys; does not protect against OOM kills or `railway down`.
+
+Estimated effort: ~30 min. No new infrastructure.
+
+### Option B — Separate Railway worker service (proper fix)
+
+Split into two Railway services sharing a database:
+
+- **`web`** — FastAPI + SPA. Deploys freely, just reads DB and enqueues jobs.
+- **`worker`** — Long-running process that polls `queued_jobs` and runs
+  pipelines. Only deploy when idle (or implement its own graceful drain).
+
+Jobs survive web server deploys entirely. Requires a shared DB that both
+services can reach — which means dropping SQLite.
+
+Estimated effort: 1–2 days including DB migration.
+
+### On switching to managed Postgres
+
+Postgres removes the SQLite write-serialisation limit and enables the web +
+worker split, but it complicates local development:
+
+- Local runs currently need zero infra (just `uv run` or `docker compose up`).
+- With Postgres, local dev needs a running Postgres instance.
+
+**Mitigation**: keep SQLite for local dev, use Postgres in production. The
+SQLAlchemy layer already abstracts the difference — only the connection URL
+changes. One `if "sqlite" in DB_URL` branch in `db.py` handles the
+`PRAGMA journal_mode=WAL` that SQLite needs but Postgres doesn't.
+
+`railway.toml` would set `DATABASE_URL` to Railway's managed Postgres;
+local `.env` keeps `STOCKPRED_DB=data/app.db`. No code changes needed in
+most places; just make sure to test both dialects in CI.

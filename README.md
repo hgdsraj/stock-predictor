@@ -65,6 +65,8 @@ web/                       # React + Vite + TS + Tailwind + shadcn-style UI
 
 scripts/
 ├── run_phase1.py          # end-to-end CLI: data → backtest → tearsheet
+├── run_phase5.py          # Phase 5 pipeline (IC-IR ensemble, vol-scaled, HRP, meta-labelling)
+├── run_hypersearch.py     # Bayesian hyperparameter search (Optuna TPE) → reports/ CSV + MD
 └── serve.py               # uvicorn server
 
 tests/                     # 45 tests; leakage canary + endpoint round-trip
@@ -84,6 +86,9 @@ cd web && npm ci && cd ..
 # Run the pipeline once, write a tearsheet
 uv run python scripts/run_phase1.py --start 2018-01-01 --n-tickers 60 \
     --horizons 1 5 21 --k 10 --model gbm
+
+# Find the best hyperparameters (50 trials, ~2-4 hours, optimises holdout Sharpe)
+uv run python scripts/run_hypersearch.py
 
 # Serve the backend
 uv run python scripts/serve.py
