@@ -127,23 +127,23 @@ class RefreshRequest(BaseModel):
     """Body for POST /jobs/refresh. All fields are optional; defaults mirror the pipeline configs."""
 
     phase: Literal[1, 5] = Field(
-        default=1,
+        default=5,
         description="Which pipeline to run. 1 = Phase 1 (basic GBM), 5 = Phase 5 (vol-scaled, regime-aware).",
     )
 
     # --- Universe / history ---
-    start_date: str = Field(default="2010-01-01", description="ISO date, e.g. '2015-01-01'")
+    start_date: str = Field(default="2013-01-01", description="ISO date, e.g. '2015-01-01'")
     end_date: str | None = Field(default=None, description="ISO date; None = today")
-    n_tickers: int | None = Field(default=100, ge=1, description="Universe size; None = all")
+    n_tickers: int | None = Field(default=None, ge=1, description="Universe size; None = all")
     universe_sampling: Literal["random", "current", "first"] = Field(
-        default="random",
+        default="current",
         description="How tickers are sampled from S&P 500 membership history.",
     )
     refresh_data: bool = Field(default=False, description="Force-refetch cached price/fundamental data")
 
     # --- Horizons + model ---
     horizons: list[int] | None = Field(
-        default=None,
+        default=[5],
         description=(
             "Forecast horizons in trading days. "
             "Defaults to [1, 5, 21] for phase 1 and [1, 5] for phase 5 "
@@ -151,7 +151,7 @@ class RefreshRequest(BaseModel):
         ),
     )
     model: Literal["gbm", "logistic"] = Field(default="gbm")
-    use_sector_features: bool = Field(default=True)
+    use_sector_features: bool = Field(default=False)
 
     # --- CV ---
     cv: CVParams = Field(default_factory=CVParams)
@@ -169,11 +169,11 @@ class RefreshRequest(BaseModel):
 
     # --- Phase 5 only ---
     use_tier2_features: bool = Field(
-        default=True,
+        default=False,
         description="[Phase 5] Include 12-1 momentum, IVOL, beta, max-ret, Amihud features.",
     )
     use_regime_features: bool = Field(
-        default=True,
+        default=False,
         description="[Phase 5] Include VIX, term spread, USD, cross-sectional dispersion features.",
     )
     beta_neutralise: bool = Field(
@@ -204,7 +204,7 @@ class RefreshRequest(BaseModel):
         default=0.005, ge=0, description="[Phase 5] Ignore weight changes smaller than this."
     )
     ensemble_weighting: Literal["ic_ir", "equal"] = Field(
-        default="ic_ir",
+        default="equal",
         description="[Phase 5] How to weight horizons in the ensemble score.",
     )
     bootstrap_n: int = Field(
