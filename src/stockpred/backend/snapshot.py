@@ -96,7 +96,6 @@ def snapshot_run(
     # --- Equity curve ----------------------------------------------------
     bt = pipeline_result["backtest"]
     eq_rows = []
-    cum = 1.0
     daily_returns = bt.returns.fillna(0.0).clip(-5.0, 5.0)
     cum_curve = (1 + daily_returns).cumprod()
     peak = cum_curve.cummax()
@@ -113,6 +112,29 @@ def snapshot_run(
                 "benchmark_return": None,
             }
         )
+
+    # Populate SPY daily log-returns as the benchmark column.
+    # SPY is in the default watchlist so its prices are in the DB; fall back
+    # gracefully if they're not present or the range doesn't overlap.
+    try:
+        if eq_rows:
+            spy_bars = store.prices_for_ticker(
+                s, "SPY",
+                start=eq_rows[0]["date"],
+                end=eq_rows[-1]["date"],
+            )
+            if spy_bars:
+                spy_adj = pd.Series(
+                    {bar.date: bar.adj_close for bar in spy_bars if bar.adj_close is not None}
+                ).sort_index()
+                spy_log_ret = np.log(spy_adj).diff()
+                spy_dict = spy_log_ret.to_dict()
+                for row in eq_rows:
+                    br = spy_dict.get(row["date"])
+                    row["benchmark_return"] = float(br) if (br is not None and np.isfinite(br)) else 0.0
+    except Exception as e:  # noqa: BLE001
+        log.warning("benchmark_return: SPY fetch failed: %s", e)
+
     store.upsert_equity(s, run, eq_rows)
 
     # --- Run summary -----------------------------------------------------

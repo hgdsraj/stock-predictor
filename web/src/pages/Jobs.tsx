@@ -101,8 +101,14 @@ function estimateTotalSeconds(config: Record<string, unknown>): number {
   return base * (effective / 500);
 }
 
+function detectPhase(config: Record<string, unknown>): number {
+  // "phase" is stored explicitly for new jobs; fall back to config shape for old ones.
+  if (config.phase != null) return config.phase as number;
+  return "k_per_side_pct" in config || "position_sizing" in config ? 5 : 1;
+}
+
 function configSummary(config: Record<string, unknown>): string {
-  const phase = config.phase ?? 1;
+  const phase = detectPhase(config);
   const n = config.n_tickers ?? "all";
   const start = (config.start_date as string ?? "").slice(0, 7);
   return `Phase ${phase} · ${n} tickers · from ${start}`;
@@ -618,7 +624,7 @@ export function Jobs() {
                           <JobIdCell jobId={j.job_id} onClick={() => setSelectedJobId(isSelected ? null : j.job_id)} />
                         </td>
                         <td className="px-4 py-2">{statusBadge(j.status)}</td>
-                        <td className="px-4 py-2">{(j.config.phase as number) ?? 1}</td>
+                        <td className="px-4 py-2">{detectPhase(j.config)}</td>
                         <td className="px-4 py-2">{String(j.config.n_tickers ?? "all")}</td>
                         <td className="px-4 py-2 text-xs">
                           {isActive ? fmtElapsed(j.started_at) + " ago" : fmtTs(j.started_at)}

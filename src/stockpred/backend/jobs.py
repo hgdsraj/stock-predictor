@@ -225,7 +225,8 @@ def run_pipeline_job(
     _current_job_id.value = job_id
 
     started_at = _now()
-    cfg_dict = dataclasses.asdict(pipeline_cfg)
+    phase = 5 if isinstance(pipeline_cfg, PipelineV5Config) else 1
+    cfg_dict = {"phase": phase, **dataclasses.asdict(pipeline_cfg)}
     _record_job(job_id, "running", config=cfg_dict, started_at=started_at)
 
     # Persist running state so a crash/restart leaves a "crashed" record.
