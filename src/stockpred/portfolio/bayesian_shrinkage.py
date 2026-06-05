@@ -58,7 +58,9 @@ def compute_per_ticker_sign_precision(
     """
     df = pd.DataFrame({"pred": pred, "realised": realised}).dropna()
     if df.empty:
-        return pd.Series(dtype=float, name="sign_precision")
+        empty = pd.Series(dtype=float, name="sign_precision")
+        empty.index.name = "ticker"
+        return empty
     df["sign_match"] = (np.sign(df["pred"]) == np.sign(df["realised"])).astype(float)
     # Per-ticker mean (sign_match) AND count, filter <min_obs
     g = df.groupby(level="ticker", observed=True)
@@ -66,6 +68,7 @@ def compute_per_ticker_sign_precision(
     means = g["sign_match"].mean()
     out = means.where(counts >= min_obs)
     out.name = "sign_precision"
+    out.index.name = "ticker"  # H4: be explicit for downstream merges
     return out
 
 
@@ -92,6 +95,7 @@ def compute_shrinkage_factors(
     excess = filled - 0.5
     shrink = (excess / 0.5).clip(lower=0.0, upper=1.0) * alpha
     shrink.name = "shrink_factor"
+    shrink.index.name = "ticker"  # H4: preserve index name for merge
     return shrink
 
 
@@ -104,9 +108,28 @@ def apply_shrinkage_to_panel(
     Returns a Series with the same index as `score`. Missing tickers
     (no row in `shrink_factors`) get factor 0 (i.e. dropped from the
     cross-section).
+
+    Reviewer H4: enforce that `shrink_factors` is indexed by ticker
+    name; without this guard the downstream merge silently produces a
+    column-name collision when the caller has accidentally relabelled
+    the index.
     """
     if score.empty:
         return score
+    if shrink_factors.index.name != "ticker":
+        raise ValueError(
+            f"shrink_factors.index.name must be 'ticker', got "
+            f"{shrink_factors.index.name!r}. Set it explicitly with "
+            f"shrink_factors.index.name = 'ticker'."
+        )
+    # Defensive: dedupe duplicate ticker rows (reviewer M6).
+    if shrink_factors.index.duplicated().any():
+        log.warning(
+            "apply_shrinkage_to_panel: %d duplicate ticker(s) in shrink_factors; "
+            "keeping first occurrence of each.",
+            int(shrink_factors.index.duplicated().sum()),
+        )
+        shrink_factors = shrink_factors.loc[~shrink_factors.index.duplicated()]
     # score has MultiIndex (date, ticker); join shrink_factors by ticker
     df = score.to_frame("score").reset_index()
     df = df.merge(

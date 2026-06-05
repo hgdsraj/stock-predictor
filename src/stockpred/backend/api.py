@@ -828,33 +828,66 @@ def register_routes(app: FastAPI) -> None:
         # Phase 15: score headlines via FinBERT (lazy-loaded; cached
         # per headline). If not installed, all sentiment_* fields stay
         # None and the legacy payload is preserved exactly.
-        scores: list[dict | None] = [None] * len(rows)
-        if with_sentiment and rows:
-            try:
+        #
+        # Reviewer C3 (2026-06-05): the try block wraps BOTH the
+        # scorer call AND the serialization step, since malformed
+        # results (truncated list, non-dict entries) would otherwise
+        # raise AttributeError in the list comprehension below.
+        try:
+            scores: list[dict | None] = [None] * len(rows)
+            if with_sentiment and rows:
                 from stockpred.data import sentiment as sent_mod
 
                 titles = [r.title or "" for r in rows]
                 scored = sent_mod.score_headlines(titles)
-                scores = [s if s.get("label") != "unavailable" else None for s in scored]
-            except Exception as e:  # noqa: BLE001
-                log.warning("Sentiment scoring failed (%s); skipping.", e)
+                # Defensive: scorer contract says len(scored) == len(titles)
+                # but a future drift would silently truncate / extend.
+                if len(scored) != len(rows):
+                    log.warning(
+                        "Sentiment scorer returned %d items for %d input headlines; "
+                        "skipping sentiment fields.",
+                        len(scored),
+                        len(rows),
+                    )
+                else:
+                    scores = [
+                        (s if isinstance(s, dict) and s.get("label") != "unavailable" else None)
+                        for s in scored
+                    ]
 
-        return [
-            schemas.NewsHeadline(
-                uuid=r.uuid,
-                title=r.title,
-                publisher=r.publisher,
-                link=r.link,
-                type=r.type,
-                published_at=r.published_at,
-                sentiment_label=(scores[i] or {}).get("label") if scores[i] else None,
-                sentiment_net=(scores[i] or {}).get("net") if scores[i] else None,
-                sentiment_positive=(scores[i] or {}).get("positive") if scores[i] else None,
-                sentiment_neutral=(scores[i] or {}).get("neutral") if scores[i] else None,
-                sentiment_negative=(scores[i] or {}).get("negative") if scores[i] else None,
+            return [
+                schemas.NewsHeadline(
+                    uuid=r.uuid,
+                    title=r.title,
+                    publisher=r.publisher,
+                    link=r.link,
+                    type=r.type,
+                    published_at=r.published_at,
+                    sentiment_label=(scores[i] or {}).get("label") if scores[i] else None,
+                    sentiment_net=(scores[i] or {}).get("net") if scores[i] else None,
+                    sentiment_positive=(scores[i] or {}).get("positive") if scores[i] else None,
+                    sentiment_neutral=(scores[i] or {}).get("neutral") if scores[i] else None,
+                    sentiment_negative=(scores[i] or {}).get("negative") if scores[i] else None,
+                )
+                for i, r in enumerate(rows)
+            ]
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "Sentiment scoring or serialization failed (%s); "
+                "returning headlines without sentiment.",
+                e,
             )
-            for i, r in enumerate(rows)
-        ]
+            return [
+                schemas.NewsHeadline(
+                    uuid=r.uuid,
+                    title=r.title,
+                    publisher=r.publisher,
+                    link=r.link,
+                    type=r.type,
+                    published_at=r.published_at,
+                )
+                for r in rows
+            ]
 
 
 # ----- Static frontend ---------------------------------------------------

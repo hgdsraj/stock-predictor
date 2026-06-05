@@ -158,18 +158,17 @@ def fit_predict_fama_macbeth(
         shrinkage,
     )
 
-    # Predict OOS: y_hat = X_te @ lambda_hat
+    # Predict OOS: y_hat = X_te @ lambda_hat.
+    # Median-impute NaN cells using TRAIN medians (X_tr never sees
+    # X_te; this is leakage-safe — the medians come from the past).
+    # Reviewer H2: compute medians ONCE here (not on every NaN cell)
+    # and avoid re-materializing the full X_tr array twice.
     X_te_arr = X_te.to_numpy(dtype=np.float32, copy=False)
-    # Median-impute NaN cells using train medians (could leak past->future,
-    # but the bias is small and uniform; honest comparison vs gbm which
-    # does its own imputation internally).
     nan_mask = np.isnan(X_te_arr)
     if nan_mask.any():
         col_medians = np.nanmedian(X_tr.to_numpy(dtype=np.float32, copy=False), axis=0)
-        X_te_arr = X_te_arr.copy()
-        for c in range(X_te_arr.shape[1]):
-            X_te_arr[np.isnan(X_te_arr[:, c]), c] = (
-                col_medians[c] if not np.isnan(col_medians[c]) else 0.0
-            )
+        col_medians = np.where(np.isnan(col_medians), 0.0, col_medians)
+        # Vectorised fill: replace NaN cells with their column's median
+        X_te_arr = np.where(nan_mask, col_medians[np.newaxis, :], X_te_arr)
     y_hat = X_te_arr @ lambda_hat
     return pd.Series(y_hat, index=X_te.index, name="prediction")

@@ -106,6 +106,58 @@ def test_apply_shrinkage_zeroes_missing_tickers():
     assert out.xs("MISSING", level="ticker").iloc[0] == 0.0
 
 
+def test_apply_shrinkage_rejects_unnamed_index():
+    """REGRESSION (reviewer H4): apply_shrinkage_to_panel must reject
+    shrink_factors with the wrong index name to prevent silent merge
+    bugs."""
+    idx = pd.MultiIndex.from_product(
+        [pd.bdate_range("2024-01-01", periods=2), ["A"]],
+        names=["date", "ticker"],
+    )
+    score = pd.Series(1.0, index=idx, name="score")
+    sf = pd.Series({"A": 0.5})
+    # Index name is None (default), not 'ticker'
+    with pytest.raises(ValueError, match="index.name must be 'ticker'"):
+        apply_shrinkage_to_panel(score, sf)
+
+
+def test_apply_shrinkage_dedupes_duplicate_tickers(caplog):
+    """REGRESSION (reviewer M6): duplicate tickers in shrink_factors
+    must be deduped with a WARNING, not silently row-multiplied."""
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="stockpred.portfolio.bayesian_shrinkage")
+    idx = pd.MultiIndex.from_product(
+        [pd.bdate_range("2024-01-01", periods=2), ["A"]],
+        names=["date", "ticker"],
+    )
+    score = pd.Series(1.0, index=idx, name="score")
+    # Duplicate 'A' in factors
+    sf = pd.Series([0.5, 0.7], index=pd.Index(["A", "A"], name="ticker"))
+    out = apply_shrinkage_to_panel(score, sf)
+    # Must not crash; first occurrence wins
+    assert len(out) == 2
+    assert out.xs("A", level="ticker").iloc[0] == 0.5
+    # Warning was emitted
+    assert any("duplicate" in rec.getMessage().lower() for rec in caplog.records)
+
+
+def test_compute_per_ticker_sign_precision_sets_ticker_index_name():
+    """REGRESSION (reviewer H4): the result must have index.name='ticker'
+    so it works with apply_shrinkage_to_panel without manual renaming."""
+    pred, realised = _make_panel({"X": 0.7, "Y": 0.5}, n_days=100, seed=10)
+    sp = compute_per_ticker_sign_precision(pred, realised, min_obs=10)
+    assert sp.index.name == "ticker"
+
+
+def test_compute_shrinkage_factors_preserves_ticker_index_name():
+    """REGRESSION (reviewer H4): the shrink factors must also have
+    index.name='ticker' for the downstream merge."""
+    sp = pd.Series([0.6, 0.4], index=pd.Index(["X", "Y"], name="ticker"))
+    sf = compute_shrinkage_factors(sp, alpha=1.0)
+    assert sf.index.name == "ticker"
+
+
 def test_apply_shrinkage_empty_input():
     empty = pd.Series(dtype=float, name="score")
     out = apply_shrinkage_to_panel(empty, pd.Series({"A": 0.5}))

@@ -1009,16 +1009,27 @@ def run_pipeline_v5(cfg: PipelineV5Config | None = None) -> dict:
     # ---------------- Phase 19: Bayesian per-ticker shrinkage ----------
     # Drop tickers with worse-than-random historical sign-precision;
     # downweight tickers proportional to their (precision - 0.5).
-    # Fit shrinkage on the FIRST 80% of dev, apply to the FULL dev
-    # ensemble. This is leakage-safe because we never look at holdout
-    # to choose the factors.
+    #
+    # REVIEWER C1 FIX (2026-06-05): we ONLY fit the shrinkage factors here
+    # (to reuse on holdout) and explicitly DO NOT apply them to the dev
+    # ensemble score. Applying shrinkage on the dev window where the
+    # factors were fit is self-reflexively leaky -- it would silently
+    # inflate the dev backtest Sharpe by re-using the same realised
+    # returns that drove the per-ticker precision. The dev backtest must
+    # remain a clean OOS sanity check; only the HOLDOUT backtest carries
+    # the shrunken weights, where the factors are honest OOS.
+    #
+    # Also REVIEWER H1: use a multi-horizon AVERAGE realised return for
+    # the precision computation (not just the shortest horizon), so
+    # tickers active in some horizons but not the shortest don't get
+    # silently dropped from holdout selection. We average per-horizon
+    # vol-scaled returns reindexed onto the ensemble score's index.
     _shrink_factors_for_holdout = None
     if cfg.bayesian_shrinkage_alpha > 0.0:
         try:
             from stockpred.portfolio.bayesian_shrinkage import (
                 compute_per_ticker_sign_precision,
                 compute_shrinkage_factors,
-                apply_shrinkage_to_panel,
             )
 
             dev_dates_sorted = (
@@ -1027,23 +1038,35 @@ def run_pipeline_v5(cfg: PipelineV5Config | None = None) -> dict:
             n_split = max(1, int(0.8 * len(dev_dates_sorted)))
             fit_dates = dev_dates_sorted[:n_split]
             fit_mask = dev_ensemble_score.index.get_level_values("date").isin(fit_dates)
-            shortest_h = min(per_horizon_preds.keys())
-            fit_realised = per_horizon_returns[shortest_h].reindex(dev_ensemble_score.index)
+            # H1: multi-horizon-averaged realised return aligned to the
+            # ensemble score's index. Filling missing-horizon rows with
+            # NaN (dropped by sign-precision) is the honest behaviour.
+            realised_frame = pd.concat(
+                {
+                    h: per_horizon_returns[h].reindex(dev_ensemble_score.index)
+                    for h in per_horizon_returns
+                },
+                axis=1,
+            )
+            fit_realised_avg = realised_frame.mean(axis=1, skipna=True)
             sp = compute_per_ticker_sign_precision(
                 dev_ensemble_score[fit_mask],
-                fit_realised[fit_mask],
+                fit_realised_avg[fit_mask],
                 min_obs=cfg.bayesian_shrinkage_min_obs,
             )
             sf = compute_shrinkage_factors(sp, alpha=cfg.bayesian_shrinkage_alpha)
-            dev_ensemble_score = apply_shrinkage_to_panel(dev_ensemble_score, sf)
             _shrink_factors_for_holdout = sf  # reuse on holdout below
             log.info(
-                "Phase 19 shrinkage (alpha=%.2f): n_tickers=%d, n_active=%d, n_dropped=%d",
+                "Phase 19 shrinkage (alpha=%.2f) factors fit: n_tickers=%d, "
+                "n_active=%d, n_dropped=%d. NOT applied to dev (leakage-safe); "
+                "will be applied to holdout only.",
                 cfg.bayesian_shrinkage_alpha,
                 len(sf),
                 int((sf > 0).sum()),
                 int((sf == 0).sum()),
             )
+            # Free intermediate
+            del realised_frame, fit_realised_avg
         except Exception as e:  # noqa: BLE001
             log.warning("Phase 19 shrinkage failed (%s); continuing with raw scores.", e)
 
