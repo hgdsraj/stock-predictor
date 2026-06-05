@@ -20,6 +20,7 @@ completion; we just discard the result).
 
 from __future__ import annotations
 
+import ctypes
 import dataclasses
 import logging
 import threading
@@ -38,11 +39,41 @@ from stockpred.pipeline_v5 import PipelineV5Config, run_pipeline_v5
 log = logging.getLogger(__name__)
 
 # ------------------------------------------------------------------ #
+# Thread interrupt for hard-cancel
+# ------------------------------------------------------------------ #
+
+
+class _CancelInterrupt(BaseException):
+    """Raised inside the pipeline thread when cancel is requested.
+    Inherits from BaseException so it propagates through most try/except
+    blocks in dependencies (lightgbm, pandas, etc.)."""
+
+
+def _raise_in_thread(ident: int) -> None:
+    """Inject _CancelInterrupt into thread `ident` at the next Python bytecode."""
+    res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+        ctypes.c_ulong(ident),
+        ctypes.py_object(_CancelInterrupt),
+    )
+    if res > 1:  # shouldn't happen; undo to be safe
+        ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(ident), None)
+
+
+# ------------------------------------------------------------------ #
 # In-memory job registry
 # ------------------------------------------------------------------ #
 
 _job_lock = threading.Lock()
 _jobs: dict[str, dict] = {}
+
+# Thread references for hard-cancel
+_job_threads: dict[str, threading.Thread] = {}
+_thread_lock = threading.Lock()
+
+
+def register_job_thread(job_id: str, thread: threading.Thread) -> None:
+    with _thread_lock:
+        _job_threads[job_id] = thread
 
 
 def _now() -> datetime:
@@ -100,6 +131,7 @@ def _ensure_log_handler() -> None:
         )
         handler.setLevel(logging.INFO)
         logging.getLogger().addHandler(handler)
+        logging.getLogger("stockpred").setLevel(logging.INFO)
         _log_handler_installed = True
 
 
@@ -116,14 +148,27 @@ _cancel_flags: dict[str, bool] = {}
 
 
 def request_cancel(job_id: str) -> bool:
-    """Mark a running job for soft-cancel.  Returns True if the job existed."""
+    """Hard-cancel a running job by injecting _CancelInterrupt into its thread.
+    Returns True if the job existed and was active."""
     with _job_lock:
         rec = _jobs.get(job_id)
         if rec is None or rec["status"] not in ("running", "queued"):
             return False
         _cancel_flags[job_id] = True
         _jobs[job_id] = {**rec, "status": "cancelling", "updated_at": _now()}
-        return True
+
+    # Fire the hard interrupt — raises at the next Python bytecode in the thread.
+    # If the pipeline is deep in C code (e.g. LightGBM training) this won't take
+    # effect until the C extension yields back to Python, which may still take
+    # seconds to minutes per fold. But it's far faster than waiting for the whole run.
+    with _thread_lock:
+        t = _job_threads.get(job_id)
+    if t is not None and t.is_alive() and t.ident is not None:
+        try:
+            _raise_in_thread(t.ident)
+        except Exception:  # noqa: BLE001
+            pass
+    return True
 
 
 def _is_cancelled(job_id: str) -> bool:
@@ -186,11 +231,15 @@ def list_jobs(limit: int = 25, session_factory=None) -> list[dict]:
         except Exception:  # noqa: BLE001
             pass
 
-    combined = sorted(
-        memory_items + db_items,
-        key=lambda x: x.get("updated_at") or datetime.min,
-        reverse=True,
-    )
+    def _sort_key(x):
+        v = x.get("updated_at") or datetime.min
+        # Normalise to naive UTC so timezone-aware (in-memory) and
+        # timezone-naive (DB) datetimes can be compared together.
+        if getattr(v, "tzinfo", None) is not None:
+            v = v.replace(tzinfo=None)
+        return v
+
+    combined = sorted(memory_items + db_items, key=_sort_key, reverse=True)
     return combined[:limit]
 
 
@@ -225,7 +274,8 @@ def run_pipeline_job(
     _current_job_id.value = job_id
 
     started_at = _now()
-    cfg_dict = dataclasses.asdict(pipeline_cfg)
+    phase = 5 if isinstance(pipeline_cfg, PipelineV5Config) else 1
+    cfg_dict = {"phase": phase, **dataclasses.asdict(pipeline_cfg)}
     _record_job(job_id, "running", config=cfg_dict, started_at=started_at)
 
     # Persist running state so a crash/restart leaves a "crashed" record.
@@ -238,6 +288,18 @@ def run_pipeline_job(
     except Exception:  # noqa: BLE001
         pass
 
+    def _persist_cancelled(elapsed: float) -> None:
+        _record_job(job_id, "cancelled", started_at=started_at, elapsed_s=elapsed)
+        try:
+            with session_scope(session_factory) as s:
+                store.upsert_job_record(
+                    s, job_id, "cancelled",
+                    started_at=started_at, updated_at=_now(),
+                    elapsed_s=elapsed, config=cfg_dict,
+                )
+        except Exception:  # noqa: BLE001
+            pass
+
     try:
         if isinstance(pipeline_cfg, PipelineV5Config):
             result = run_pipeline_v5(pipeline_cfg)
@@ -248,16 +310,7 @@ def run_pipeline_job(
 
         if _is_cancelled(job_id):
             log.info("job %s cancelled after pipeline finished (result discarded)", job_id)
-            _record_job(job_id, "cancelled", started_at=started_at, elapsed_s=elapsed)
-            try:
-                with session_scope(session_factory) as s:
-                    store.upsert_job_record(
-                        s, job_id, "cancelled",
-                        started_at=started_at, updated_at=_now(),
-                        elapsed_s=elapsed, config=cfg_dict,
-                    )
-            except Exception:  # noqa: BLE001
-                pass
+            _persist_cancelled(elapsed)
             return job_id
 
         with session_scope(session_factory) as s:
@@ -269,6 +322,12 @@ def run_pipeline_job(
             )
         _record_job(job_id, "ok", run_id=run.id, started_at=started_at, elapsed_s=elapsed)
         log.info("job %s → run %d ok (%.0fs)", job_id, run.id, elapsed)
+        return job_id
+
+    except _CancelInterrupt:
+        elapsed = (_now() - started_at).total_seconds()
+        log.info("job %s hard-cancelled via thread interrupt (%.0fs)", job_id, elapsed)
+        _persist_cancelled(elapsed)
         return job_id
 
     except Exception as e:  # noqa: BLE001
@@ -291,6 +350,8 @@ def run_pipeline_job(
     finally:
         _current_job_id.value = None
         _cancel_flags.pop(job_id, None)
+        with _thread_lock:
+            _job_threads.pop(job_id, None)
 
 
 # ------------------------------------------------------------------ #

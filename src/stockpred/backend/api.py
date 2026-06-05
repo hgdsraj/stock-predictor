@@ -255,8 +255,9 @@ def _build_pipeline_cfg(
             meta_conf_cap=body.meta_conf_cap,
             meta_walk_forward_folds=body.meta_walk_forward_folds,
             meta_per_sector=body.meta_per_sector,
-            # Phase 7 triple-barrier
+            # Phase 7/8 triple-barrier
             use_triple_barrier_labels=body.use_triple_barrier_labels,
+            tb_k_sigma=body.tb_k_sigma,
             # Phase 11 feature pruning
             feature_exclude=tuple(body.feature_exclude),
             # Phase 12 / 13 EDGAR
@@ -294,7 +295,9 @@ def _launch_pipeline(pipeline_cfg, job_id: str) -> None:
                 AppState.SessionLocal, pipeline_cfg=pipeline_cfg, job_id=job_id
             )
 
-    threading.Thread(target=_run, daemon=True).start()
+    t = threading.Thread(target=_run, daemon=True)
+    jobs_mod.register_job_thread(job_id, t)
+    t.start()
 
 
 # ----- Routes ------------------------------------------------------------

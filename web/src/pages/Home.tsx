@@ -18,10 +18,10 @@ export function Home() {
 
   // Recompute strategy, S&P 500, and inverse growth-of-$1 from daily returns
   // so all three curves share the same $1 basis.
-  let cumStrat = 1;
-  let cumInv = 1;
-  let cumSPY = 1;
-  const equity = (summary.data?.equity_curve ?? []).map((p) => {
+  const rawCurve = summary.data?.equity_curve ?? [];
+  const hasSPY = rawCurve.some((p) => p.benchmark_return != null && p.benchmark_return !== 0);
+  let cumStrat = 1, cumInv = 1, cumSPY = 1;
+  const equity = rawCurve.map((p) => {
     const r = p.daily_return ?? 0;
     const br = p.benchmark_return ?? 0;
     cumStrat *= 1 + r;
@@ -32,7 +32,7 @@ export function Home() {
 
   const equitySeries: ChartSeries[] = [
     { type: "area", dataKey: "strategy", name: "Strategy", color: "hsl(var(--primary))", fillOpacity: 0.18, strokeWidth: 1.8 },
-    { type: "line", dataKey: "spy", name: "S&P 500", color: "#f59e0b", strokeWidth: 1.5, strokeDasharray: "5 3" },
+    ...(hasSPY ? [{ type: "line" as const, dataKey: "spy", name: "S&P 500", color: "#f59e0b", strokeWidth: 1.5, strokeDasharray: "5 3" }] : []),
     { type: "line", dataKey: "inverse", name: "Inverse", color: "hsl(var(--muted-foreground))", strokeWidth: 1.2 },
   ];
 
