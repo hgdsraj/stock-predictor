@@ -325,6 +325,14 @@ def walk_forward_predict(
         )
         try:
             pred = _fit_and_predict_fold(model, X_tr, y_tr, X_te, gbm_cfg)
+        except (ImportError, OSError) as e:
+            # System-level failure (missing native library, dylib load error, etc.).
+            # Retrying the next fold won't help — raise immediately so callers get
+            # a clear error instead of silently producing no predictions.
+            raise RuntimeError(
+                f"System dependency missing — fold {fold} cannot run. "
+                f"Install the required native library and retry. Original error: {e}"
+            ) from e
         except Exception as e:  # noqa: BLE001
             log.warning("Fold %d failed: %s -- skipping", fold, e)
             continue

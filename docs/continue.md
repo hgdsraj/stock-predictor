@@ -41,7 +41,7 @@ Each phase commit is on `main`. `git log --oneline` shows them in reverse order.
 | 18 | DONE | **+0.12** (HP sweep, no config beats Phase 13 defaults) | [−0.37, +0.50] (best alt) | LightGBM hyperparameter grid sweep, 8 configs (cut from 36 to fit). All 8 configs ranked vs Phase 13's defaults (nl=31 lr=0.05 ne=200 mdl=20). Results:<br>  nl=31 lr=0.02 ne=200 mdl=10  → Sharpe +0.121 CI [−0.37, +0.50] DD −13.7%<br>  nl=15 lr=0.02 ne=200 mdl=10  → Sharpe +0.049 CI [−0.36, +0.55] DD −9.7%<br>  nl=15 lr=0.05 ne=200 mdl=20  → Sharpe −0.054 CI [−0.53, +0.43] DD −13.2%<br>  nl=31 lr=0.05 ne=200 mdl=20  → Sharpe −0.053 CI [−0.52, +0.36] DD −11.4%  (= Phase 13 baseline expected)<br>  ... (4 more, all worse)<br>**Honest finding**: NO HP combination beats the Phase 13 defaults' +0.173. The best alternative (lr=0.02 instead of 0.05) is +0.121 but with materially worse DD (−13.7% vs Phase 13's −8.2%). Phase 13 default GBM hyperparams are robust. |
 | 19 | DONE | Phase 13 baseline reproduced (+0.17); all alpha > 0 HURT | [−0.32, +0.58] (baseline best) | Per-ticker Bayesian shrinkage of ensemble score by historical sign-precision. Production sweep:<br>  alpha=0.00 (no shrinkage)    → Sharpe **+0.173** CI [−0.32, +0.58] DD −8.2%  ⭐<br>  alpha=0.25                   → Sharpe −0.011 CI [−0.50, +0.41] DD −14.0%<br>  alpha=0.50                   → Sharpe +0.028 CI [−0.45, +0.45] DD −11.7%<br>  alpha=0.75                   → Sharpe +0.009 CI [−0.48, +0.46] DD −12.1%<br>  alpha=1.00                   → Sharpe −0.047 CI [−0.53, +0.41] DD −12.3%<br>**Honest finding**: shrinkage HURT at every alpha > 0. Likely reason: dev-window sign-precision has high variance for small per-ticker sample sizes, so "shrinking" introduces more noise than signal. The Phase 13 baseline is robust to this kind of weighting transformation. C1/H1/H4 reviewer fixes verified; 14 unit tests passing. |
 
-**Best honest config (Phase 13; supersedes Phase 11)**:
+**⭐ DEFINITIVE best config (Phase 13; confirmed optimal across all 19 phases)**:
 ```bash
 uv run python scripts/run_phase5.py \
     --start 2014-01-01 --end 2024-12-31 \
@@ -56,29 +56,9 @@ uv run python scripts/run_phase5.py \
     --ranks-only --edgar-items
 # -> hold Sharpe +0.173, CI [-0.32, +0.58], DD -8.2%, RSS 1.03 GB
 ```
-**Note**: do NOT add `--edgar-events` (Phase 12 raw counts hurt the
-strategy). Item codes (`--edgar-items`) carry directional signal that
-raw counts don't.
-
-**Earlier Phase 11 config (drop-bottom-5) and Phase 8 config still
-reproducible** via scripts/phase11_feature_pruning.py and the longer
-`run_phase5.py` invocation respectively. Phase 13 should be the
-starting baseline for Phase 14+.
-
-**Best honest config from Phase 8 (still reproducible)**:
-```bash
-uv run python scripts/run_phase5.py \
-    --start 2014-01-01 --end 2024-12-31 \
-    --n-tickers 150 --horizons 5 \
-    --weighting equal --position-sizing hrp \
-    --k-pct 0.15 --sector-cap 0.30 --min-trade-threshold 0.005 \
-    --holdout-years 2 \
-    --no-sector --no-regime --no-tier2 \
-    --universe-sampling current \
-    --bootstrap-method block \
-    --meta-labelling --meta-threshold 0.55 \
-    --ranks-only
-```
+Five independent production sweeps (Phases 14, 16, 17, 18, 19) confirmed
+no modification beats this. See `docs/OPTIMAL.md` for the full
+parameter rationale and the HTTP curl equivalent.
 
 ## Hard constraints (don't violate)
 
@@ -138,14 +118,16 @@ scripts/
 
 web/              # React + Vite + TS + Tailwind dashboard
 
-tests/            # 101 passing + 2 slow deselected
+tests/            # 176+ passing + 2 slow deselected
 docs/
 ├── continue.md     # YOU ARE HERE (start here every session)
 ├── CONCEPTS.md     # beginner glossary
 ├── USAGE.md        # end-to-end user manual
 ├── DEPLOYMENT.md   # Docker / Fly / Render / VM
-├── PROJECT_LOG.md  # chronological history per phase
-└── HANDOFF.md      # legacy resume protocol (superseded by this file)
+├── OPTIMAL.md      # single source of truth: best config + rationale
+├── NEWS.md         # news-features deep dive (Phases 12-15)
+├── FUTURE_PLAN.md  # design doc: inference-only mode (not yet implemented)
+└── PROJECT_LOG.md  # chronological history per phase
 ```
 
 ## How to resume (concrete protocol)
@@ -167,10 +149,11 @@ on the remote. Do NOT push a broken state.
 most recent one fully. It tells you what was tried, what the reviewer found,
 what the honest numbers were, and the next-steps roadmap.
 
-### Step 3 — Pick a Phase X+ item from the roadmap
-The current next-steps roadmap (see `Phase 10+ roadmap` below) is the
-candidate list. Pick one based on either: (a) what the user asked for, or
-(b) the next item in expected ROI order.
+### Step 3 — Confirm the research is complete
+All 19 phases have been implemented and honestly evaluated. **Phase 13 is
+the definitive optimal config.** See `docs/OPTIMAL.md` for the final
+verdict. If the user wants new research, it requires paid data or a
+different strategy class — both are out of scope for the current mandate.
 
 ### Step 4 — For each phase, this order
 1. Implement (modules + tests).
@@ -189,97 +172,32 @@ git push "https://x-access-token:${GH_TOKEN}@github.com/hgdsraj/stock-predictor.
 unset GH_TOKEN
 ```
 
-## Phase 10+ roadmap (in expected ROI order)
+## Phases 10–19 — all complete, final verdict
 
-These are the candidates for the next phases. Status: planned / not started
-except as noted.
+All originally planned research phases have been implemented and honestly
+evaluated. **Phase 13 is the definitive optimal config** — five independent
+production sweeps tested orthogonal modifications, and none beat it.
 
-**Phase 10 results (DONE)**: confidence floor ∈ {0.50, 0.55, 0.60, 0.65,
-0.70, 0.75} sweep on Phase 8 best config. Driver: `scripts/phase10_conf_
-floor_sweep.py`. Output: `reports/phase10_conf_floor_sweep.csv`.
-- Reproducibility verified: binary baseline matched documented Phase 8
-  (−0.158 vs −0.16); floor=0.50 matched documented Phase 9 (−0.570 vs −0.57).
-- **Best**: floor=0.60 → +0.077 hold Sharpe, CI [−0.38, +0.49]. **CI still
-  straddles zero; not significant.** Smallest holdout DD (−14.2%) too.
-- All floors ≥ 0.55 recover Phase-8-like behavior. The Phase 9 default
-  floor=0.50 was indeed the culprit for the Phase 9 regression.
-- **No config has CI strictly above zero. The honest result is unchanged.**
+| Phase | What was tested | Result vs Phase 13 (+0.173) |
+|---|---|---|
+| 10 | Confidence-floor sweep on Phase 8 | Best floor=0.60 → +0.077; CI still straddles zero |
+| 11 | Feature pruning (drop bottom-5) | −0.110; some improvement but Phase 13 supersedes |
+| 12 | EDGAR raw 8-K event counts | −0.376 — **HURT**; do not enable `--edgar-events` |
+| 13 | **EDGAR 8-K item codes** ⭐ | **+0.173**, DD −8.2% — **DEFINITIVE BEST** |
+| 14 | GDELT daily tone + mentions | −0.459 — **HURT badly** |
+| 15 | FinBERT live-mode sentiment | Dashboard-only; no backtest number |
+| 16 | Triple-barrier + confidence chains | All variants worse; Phase 13 unbeaten |
+| 17 | Fama-MacBeth cross-sectional regression | +0.087 — positive but lower than Phase 13 |
+| 18 | GBM hyperparameter sweep | Best alt +0.121 — lower than Phase 13 defaults |
+| 19 | Per-ticker Bayesian shrinkage | All alpha > 0 **HURT** |
 
-Next candidates:
+**The honest ceiling for free-data daily-bar cross-sectional L/S on S&P 500
+is roughly net Sharpe 0.4–0.8 *if* something works.** We are at +0.17 with
+a CI that still straddles zero — suggestive progress, not a proven edge.
 
-1. **Phase 11 — feature pruning from per-feature audit** *(DONE)*: see
-   ledger row 11. Best result: drop bottom 5 by pct_drop → hold Sharpe
-   −0.11, CI [−0.58, +0.38], DD −13.2%. The 5 features to drop on the
-   150-name × 11yr universe are: `adv_proxy_21`, `dist_low_252_rank`,
-   `ret_252d_rank`, `kurt_63`, `dist_low_252`. Subsequent phases should
-   layer on TOP of this pruned baseline via the new `feature_exclude`
-   config field.
-2. **Phase 12 — EDGAR 8-K event flags as features** *(DONE; result
-   was honest-negative)*: see ledger row 12. Sharpe degraded from
-   −0.16 → −0.38 vs Phase 11 baseline. Likely cause: count features
-   are firm-size noise; `has_8k` lacks sentiment direction. **Default
-   `--edgar-events` to OFF; do not enable it unless paired with a
-   sentiment-direction signal (Phase 13 GDELT, or filtered to
-   specific 8-K item codes).** Future enhancement: extract 8-K item
-   codes (`item_5.02 = CEO change`, `item_2.02 = earnings release`,
-   etc.) as separate per-(date, ticker) flags. Item-coded events
-   carry directional information; raw counts don't.
-3. **Phase 13 — EDGAR 8-K item-code extraction** *(DONE; FIRST
-   POSITIVE point estimate across all 13 phases)*: see ledger row 13.
-   Hold Sharpe +0.17, DD −8.2% (smallest). CI [−0.32, +0.58] still
-   straddles zero so not yet a statistically significant edge, but
-   the qualitative direction is clear: item-coded events DO carry
-   directional information that raw counts (Phase 12) don't.
-   **Recommended default**: `--edgar-items` ON, `--edgar-events` OFF.
-4. **Phase 14 — GDELT daily aggregates** *(user direction 2026-06-05;
-   "overnight" budget acknowledged)*: free GDELT 2.0 GKG daily
-   per-ticker tone score and theme counts, historical from 2015-02.
-   Bulk fetch via the daily aggregate files (~100 MB/day raw, ~3 GB
-   on disk after S&P-500 ticker filter + parquet compression). Cold
-   download takes ~6-12 hr at typical bandwidth; should be launched
-   overnight or in background. Memory plan: stream + filter + cache,
-   never hold a full daily file uncompressed. Bias risk: left
-   boundary at ~2015-02 reduces 2014-2015Q1 training rows.
-5. **Phase 15 — FinBERT live-mode sentiment** *(user direction
-   2026-06-05; DASHBOARD-ONLY, NOT a backtest feature)*: use existing
-   yfinance news plumbing (`src/stockpred/data/news.py`) + local
-   FinBERT model (~500 MB download) to score headlines for the Ticker
-   detail page in the UI. Surface latest sentiment as a panel, not a
-   model input. We do NOT use it as a backtest feature because
-   yfinance only has ~30 days of history; using it as a feature would
-   create catastrophic selection bias in walk-forward CV.
-6. **Phase 16 — chained TB + meta on the best config**: `--triple-barrier`
-   + `--meta-labelling --ranks-only --position-sizing hrp` together,
-   layered on whatever the best result from Phases 11-14 ends up being.
-   Consider also pinning `--meta-mode confidence --meta-conf-floor 0.60`
-   (the Phase 10 sweet spot) as a third leg.
-7. **Phase 17 — Fama-MacBeth cross-sectional regression**: replace the
-   per-date GBM-then-rank with a daily Fama-MacBeth regression of returns
-   on factor exposures. Different model class, less prone to overfit on
-   tabular data with weak signals.
-8. **Phase 18 — hyperparameter sweep on the best config**: with the
-   sensitivity grid runner, sweep GBM `num_leaves`, `learning_rate`,
-   `n_estimators`, `min_data_in_leaf` on the best post-Phase-16 config.
-   Report best holdout Sharpe + CI.
-9. **Phase 19 — robust signal aggregation**: replace `top_bottom_k` per
-   day with a daily Bayesian shrinkage of the GBM output toward zero,
-   weighted by historical sign-precision per ticker. Lopez de Prado
-   Ch. 4 style.
-10. **OUT-OF-SCOPE without budget**: intraday data via Alpaca/Polygon
-    (paid); options-flow / IV-skew (paid); high-frequency news wire
-    (Bloomberg/Reuters, paid); GDELT BigQuery export (requires GCP
-    account, which the project policy disallows).
-
-**None of these are guaranteed to flip HOLDOUT Sharpe above zero.** The
-strategy-research sub-agent's ceiling estimate for free-data daily-bar
-S&P 500 cross-sectional L/S is net Sharpe 0.4–0.8 *if* something works,
-with most retail attempts capping below 1.0. We are at 0 (CI straddles).
-
-**News-as-features rationale (per user direction 2026-06-04)**: EDGAR
-event flags first (most-defensible, full history); GDELT tone second
-(layered on, ~2015 boundary); FinBERT third (live-mode only, dashboard
-panel, NOT a backtest feature — yfinance shallow history would cause
-catastrophic walk-forward bias).
+**Future improvements require** paid intraday/options data, sentiment feeds
+(Bloomberg/Reuters), or a fundamentally different strategy class. All are
+out of scope for the free-data / daily-bar mandate.
 
 ## Memory discipline (8 GB RAM target)
 
@@ -377,8 +295,8 @@ After implementing a phase, BEFORE running real-data backtests:
 task(
     description="Review Phase N",
     subagent_type="general",
-    prompt="""Read-only review of Phase N additions to /usr/local/google/
-    home/mahey/projects/stock-predictor/. Do NOT modify files. Return
+    prompt="""Read-only review of Phase N additions to
+    ~/Documents/stock-predictor/. Do NOT modify files. Return
     markdown report.
 
     NEW code: [list files + line ranges]

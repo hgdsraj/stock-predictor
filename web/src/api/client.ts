@@ -159,9 +159,9 @@ export const api = {
   jobStatus: (job_id: string) => get<JobDetail>(`/jobs/${encodeURIComponent(job_id)}`),
 
   // ── Hypersearch ────────────────────────────────────────────────────────
-  /** Queue a hypersearch job. No auth required. */
+  /** Queue a hypersearch job. No auth required. Separate endpoint avoids union-type ambiguity. */
   queueHypersearch: (cfg: HypersearchRequest) =>
-    post<QueuedJob>("/jobs/queue", cfg),
+    post<QueuedJob>("/hypersearch/queue", cfg),
 
   /** List all hypersearch runs (metadata, no trials). */
   listHypersearchRuns: (limit = 25) =>

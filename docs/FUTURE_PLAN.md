@@ -1,5 +1,12 @@
 # Future Plan: Daily Inference Without Full Retraining
 
+> **Status: not yet implemented.** This is a design doc for a planned
+> inference-only mode. None of the phases (A–D), API endpoints, or
+> scheduler changes below exist in the codebase yet. The current
+> production config (Phase 13) runs a full retrain on every pipeline
+> invocation. See [`docs/OPTIMAL.md`](OPTIMAL.md) for the current
+> best config and [`docs/DEPLOYMENT.md`](DEPLOYMENT.md) for operations.
+
 ## Problem
 
 Running a full Phase 5 pipeline on the S&P 500 takes 30–80 minutes and uses 4–8 GB of RAM because

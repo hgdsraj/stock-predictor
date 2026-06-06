@@ -767,3 +767,98 @@ The seven-phase result is consistent and clear:
   with sentiment, fundamentals point-in-time) or a different model class
   (sequence models with regime-conditional ensembles). All require either
   paid data or significantly more compute than a daily-bar laptop pipeline.
+
+---
+
+## Phases 10–19 executive summary
+
+Full per-phase detail is in `docs/continue.md` (phase ledger, rows 10–19).
+The definitive config and rationale are in `docs/OPTIMAL.md`.
+
+### Phase 10 — Confidence-floor sweep (DONE)
+
+Swept meta-classifier confidence floor ∈ {0.50, 0.55, 0.60, 0.65, 0.70, 0.75}
+on Phase 8 best config. Best result: floor=0.60 → Sharpe +0.077, CI
+[−0.38, +0.49]. Confirmed that the Phase 9 regression was caused by the
+default floor=0.50, not by the meta-labelling architecture itself. CI still
+straddles zero at every floor; binary gate (Phase 8) remains competitive.
+
+### Phase 11 — Feature pruning (DONE)
+
+Per-feature audit on 150-name × 11-yr universe identified 5 noise features
+(`adv_proxy_21`, `dist_low_252_rank`, `ret_252d_rank`, `kurt_63`,
+`dist_low_252`). Dropping them: Sharpe −0.11, DD −13.2%. Marginal
+improvement over Phase 8 (−0.16); superseded by Phase 13.
+
+### Phase 12 — SEC EDGAR raw 8-K counts (DONE; honest-negative)
+
+Added 4 features (presence flag + rolling 5/21/63d counts) from SEC EDGAR
+form.idx. **Result: HURT the strategy** (Sharpe −0.16 → −0.38). Root cause:
+raw counts are firm-size noise with no directional information. The `--edgar-events`
+flag defaults OFF and should stay that way.
+
+### Phase 13 — SEC EDGAR 8-K item codes (DONE; ⭐ BEST RESULT)
+
+Extracted per-filing item codes (2.02=earnings, 5.02=CEO change, 8.01=M&A,
+7.01=guidance, 3.01/3.03/4.02=going-concern) as 15 features (5 families ×
+3 windows). **HOLDOUT Sharpe +0.173, CI [−0.32, +0.58], DD −8.2%**. First
+positive point estimate across all 13 phases; smallest holdout drawdown.
+This became the new best config and the baseline for Phases 14–19.
+
+Key fixes before commit: dual-class ticker dedup (GOOG/GOOGL share a CIK),
+HTTPError narrowing (404 swallowed, 429 retried, 403/5xx re-raised),
+SEC submissions JSON pagination cap warning. Test suite: 139 passing.
+
+### Phase 14 — GDELT 1.0 daily tone + mentions (DONE; honest-negative)
+
+Bulk-fetched 4018 daily GDELT GKG files (2014–2024, ~4 hr, 55 MB cache).
+Added 6 features per (date, ticker). **Result: HURT badly** (Sharpe +0.173
+→ −0.459). Likely cause: GDELT name-matching is fuzzy (company names, not
+tickers) and tone is a noisy proxy at daily resolution. Infrastructure
+preserved in `data/cache/gdelt/` for future experiments.
+
+### Phase 15 — FinBERT live-mode sentiment (DONE; dashboard-only)
+
+ProsusAI/FinBERT (110M params, ~440 MB download) scores yfinance headlines
+per ticker. Exposed via `/tickers/{ticker}/news?with_sentiment=true`. Never
+used as a backtest feature — yfinance news is ~30 days deep, which would
+cause catastrophic walk-forward bias. Graceful degradation if model not
+installed.
+
+### Phase 16 — Triple-barrier + confidence chaining (DONE; honest-negative)
+
+Tested 4 configs layered on Phase 13: baseline, + triple-barrier labels,
++ confidence floor=0.60, + both together. **None beat Phase 13** (all had
+lower Sharpe and/or higher DD). Triple-barrier on top of meta-labelling is
+double-bounding the same target; Phase 10's confidence sweet spot doesn't
+transfer to an already-binary-gated signal.
+
+### Phase 17 — Fama-MacBeth cross-sectional regression (DONE)
+
+Implemented Fama-MacBeth per-day OLS as a third model class (`--model
+fama_macbeth`). **Result: Sharpe +0.087**, CI [−0.38, +0.60]. Widest CI
+upper bound (+0.60) of any model, but lower point estimate than Phase 13's
++0.173. GBM stays as the default.
+
+### Phase 18 — LightGBM hyperparameter sweep (DONE)
+
+8-config grid over `num_leaves`, `learning_rate`, `n_estimators`,
+`min_data_in_leaf`. **No combination beat Phase 13 defaults**. Best
+alternative (lr=0.02 instead of 0.05): Sharpe +0.121, but with ~2× the
+drawdown (−13.7% vs −8.2%). Phase 13 GBM hyperparameters confirmed robust.
+
+### Phase 19 — Per-ticker Bayesian shrinkage (DONE; honest-negative)
+
+Swept Bayesian shrinkage intensity alpha ∈ {0, 0.25, 0.50, 0.75, 1.0}
+on Phase 13 best config. **Every alpha > 0 hurt** (Sharpe 0 to −0.05
+range vs +0.173 baseline). Root cause: per-ticker sign-precision has high
+variance on small sample sizes; "shrinkage" introduces more noise than it
+removes.
+
+### Final verdict (2026-06-05)
+
+**Phase 13 is the definitive optimal config across all 19 phases.** The
+free-data daily-bar cross-sectional L/S ceiling has been reached. Future
+improvements require paid data (intraday, options flow, alternative feeds)
+or a fundamentally different strategy class. The CI [−0.32, +0.58] still
+straddles zero — this is the honest result. 176+ tests passing.

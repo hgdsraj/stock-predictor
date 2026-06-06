@@ -165,6 +165,20 @@ def run_hypersearch(
     """
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
+    # Pre-flight: verify LightGBM's native library loads before spending
+    # any trial budget. An OSError here means libomp/libgomp is missing —
+    # no trial will ever succeed and the error would otherwise be silently
+    # swallowed N times and reported only as individual trial failures.
+    try:
+        import lightgbm as _lgb  # noqa: F401
+    except (ImportError, OSError) as e:
+        raise RuntimeError(
+            "LightGBM failed to load its native library before the search started. "
+            "On macOS install OpenMP with: brew install libomp\n"
+            "On Linux/Docker ensure libgomp1 is installed (apt-get install libgomp1).\n"
+            f"Original error: {e}"
+        ) from e
+
     if study is None:
         sampler = optuna.samplers.TPESampler(seed=cfg.seed)
         study = optuna.create_study(direction="maximize", sampler=sampler)

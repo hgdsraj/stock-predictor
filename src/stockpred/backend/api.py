@@ -18,15 +18,16 @@ Routes:
   GET  /jobs                        — list recent jobs (in-memory)
   GET  /jobs/{job_id}               — job detail + logs
 
-  POST /jobs/queue                  — queue a pipeline OR hypersearch job (no auth, max 5)
-                                      include job_type="hypersearch" in body for hypersearch
+  POST /jobs/queue                  — queue a pipeline job (no auth, max 5)
   GET  /jobs/queue                  — list queued jobs
   POST /jobs/run/{queue_id}         — launch a queued job (requires X-Password)
   DELETE /jobs/queue/{queue_id}     — delete a queued job (requires X-Password)
   DELETE /jobs/{job_id}/cancel      — cancel a running job (requires X-Password)
 
+  POST /hypersearch/queue           — queue a hypersearch job (no auth, max 5)
   GET  /hypersearch/runs            — list all hypersearch run results
   GET  /hypersearch/runs/{run_id}   — detail for one hypersearch run (trials, best params)
+  GET  /hypersearch/runs/by-job/{job_id} — hypersearch run linked to a specific job
 
   GET  /watchlist                   — watched tickers
   POST /watchlist                   — add ticker (requires X-API-Key)
@@ -704,23 +705,16 @@ def register_routes(app: FastAPI) -> None:
         response_model=schemas.QueuedJobOut,
         tags=["jobs"],
     )
-    def queue_job(body: schemas.RefreshRequest | schemas.HypersearchRequest, s: Session = Depends(get_db)):
-        """Queue a pipeline or hypersearch job for later password-protected launch.
-        No auth required. Up to 5 pending jobs at once.
-        Include job_type='hypersearch' for a hypersearch job (use HypersearchRequest body)."""
-        config = body.model_dump()
-        if isinstance(body, schemas.HypersearchRequest):
-            config["job_type"] = "hypersearch"
+    def queue_job(body: schemas.RefreshRequest, s: Session = Depends(get_db)):
+        """Queue a pipeline job for later password-protected launch. No auth required.
+        Up to 5 pending jobs at once. For hypersearch, use POST /hypersearch/queue."""
         try:
-            qj = store.create_queued_job(s, config=config)
+            qj = store.create_queued_job(s, config=body.model_dump())
         except ValueError as e:
             raise HTTPException(429, str(e)) from None
         return schemas.QueuedJobOut(
-            id=qj.id,
-            created_at=qj.created_at,
-            config=qj.config_json,
-            label=qj.label,
-            status=qj.status,
+            id=qj.id, created_at=qj.created_at, config=qj.config_json,
+            label=qj.label, status=qj.status,
         )
 
     @app.get(
@@ -897,6 +891,21 @@ def register_routes(app: FastAPI) -> None:
             best_sharpe=run.best_sharpe,
             best_params=run.best_params_json,
             trials=trials,
+        )
+
+    @app.post("/hypersearch/queue", response_model=schemas.QueuedJobOut, tags=["hypersearch"])
+    def queue_hypersearch(body: schemas.HypersearchRequest, s: Session = Depends(get_db)):
+        """Queue a hyperparameter search job. No auth required. Up to 5 pending at once.
+        Launch via POST /jobs/run/{queue_id} with X-Password."""
+        config = body.model_dump()
+        config["job_type"] = "hypersearch"
+        try:
+            qj = store.create_queued_job(s, config=config)
+        except ValueError as e:
+            raise HTTPException(429, str(e)) from None
+        return schemas.QueuedJobOut(
+            id=qj.id, created_at=qj.created_at, config=qj.config_json,
+            label=qj.label, status=qj.status,
         )
 
     @app.get("/hypersearch/runs", response_model=list[schemas.HypersearchRunOut], tags=["hypersearch"])

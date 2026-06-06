@@ -63,47 +63,18 @@ curl -X POST -H "X-API-Key: $STOCKPRED_API_KEY" \
      -d '{"phase": 5, "n_tickers": 50}' \
      http://127.0.0.1:8000/jobs/refresh
 
-# BEST honest config (Phase 13: SEC EDGAR item codes; hold Sharpe +0.17).
-# Designed for 8 GB / 8 vCPU box; peak RSS ~1 GB; runtime ~3-7 min.
+# BEST honest config (Phase 13: SEC EDGAR item codes).
+# Full curl + all parameters: see docs/OPTIMAL.md
+# HOLDOUT Sharpe +0.17, CI [-0.32, +0.58], DD -8.2%, RSS ~1 GB
 curl -X POST -H "X-API-Key: $STOCKPRED_API_KEY" \
      -H "Content-Type: application/json" \
-     --max-time 1800 \
-     -d '{
-       "phase": 5,
-       "start_date": "2014-01-01",
-       "n_tickers": 150,
-       "universe_sampling": "current",
-       "horizons": [5],
-       "model": "gbm",
-       "use_sector_features": false,
-       "use_tier2_features": false,
-       "use_regime_features": false,
-       "beta_neutralise": false,
-       "bootstrap_method": "block",
-       "holdout_years": 2,
-       "position_sizing": "hrp",
-       "k_per_side_pct": 0.15,
-       "sector_cap_gross": 0.30,
-       "min_trade_threshold": 0.005,
-       "ensemble_weighting": "equal",
-       "bootstrap_n": 500,
-       "use_meta_labelling": true,
-       "meta_threshold": 0.55,
-       "ranks_only": true,
-       "meta_mode": "binary",
-       "use_edgar_item_features": true
-     }' \
+     -d '{"phase": 5, "use_edgar_item_features": true, ...}' \
      http://127.0.0.1:8000/jobs/refresh
 ```
 
-The full body reference is in [DEPLOYMENT.md](DEPLOYMENT.md#trigger-a-refresh-from-cli).
-Honest expectations on the Phase 13 config: HOLDOUT Sharpe **+0.17** with
-95% CI **[-0.32, +0.58]** and DD **-8.2%**. CI still straddles zero so
-not statistically significant, but the smallest holdout DD across all
-13 phases and the only positive point estimate. **Do NOT add
-`"use_edgar_features": true`** — Phase 12 raw 8-K counts hurt the
-strategy (Sharpe -0.16 → -0.38). **Phase 14 (`"use_gdelt_features":
-true`)** requires running the overnight bulk-fetch first (see §6c).
+See [`docs/OPTIMAL.md`](OPTIMAL.md) for the complete curl, all parameter
+values, and honest expectations. **Do NOT add `"use_edgar_features": true`**
+— Phase 12 raw 8-K counts hurt the strategy (Sharpe −0.16 → −0.38).
 
 Open <http://127.0.0.1:8000> in a browser. The dashboard will be empty until
 the refresh job completes (1–5 minutes depending on your universe size and
@@ -352,410 +323,55 @@ The script also runs:
 
 ---
 
-## 6b. Phase 6–11 improvements (advanced flags)
+## 6b. Phase 6–11 advanced flags
 
-Phases 6–11 layer in research-grade portfolio tooling. None of them is
-guaranteed to flip HOLDOUT Sharpe above zero (see `docs/continue.md`
-phase ledger for the honest numbers), but each adds a tool you can
-combine with the Phase 5 baseline.
+Quick reference for flags introduced in Phases 6–11. For honest backtest
+results on each, see [`docs/continue.md`](continue.md) phase ledger.
+The **Phase 13 best config** (see §9 and `docs/OPTIMAL.md`) uses
+`--position-sizing hrp --meta-labelling --meta-threshold 0.55 --ranks-only`
+and has **all tier2/regime/sector features OFF**.
 
-### Phase 6 — Tier-2 features, regime features, beta neutralisation, block bootstrap
-
-```bash
-uv run python scripts/run_phase5.py \
-    --start 2014-01-01 --end 2024-12-31 --n-tickers 150 \
-    --beta-neutralise \
-    --bootstrap-method block
-```
-
-- `--beta-neutralise`: subtract SPY exposure from the daily long-short
-  PnL so the strategy is a pure-alpha bet.
-- `--bootstrap-method block` (default): the bootstrap re-samples in
-  blocks of size = horizon to preserve autocorrelation from overlapping
-  positions. The IID alternative (`--bootstrap-method iid`) over-states
-  significance for overlapping-horizon strategies.
-- `--no-tier2 / --no-regime / --no-sector`: turn OFF the Tier-2 features
-  (12-1 momentum, IVOL, β, Amihud illiquidity), regime broadcasts (VIX
-  quintile, term-spread quintile), and sector dummies respectively. The
-  Phase 8 best config has all three OFF.
-
-### Phase 7 — HRP portfolio + triple-barrier label scaffold
-
-```bash
-uv run python scripts/run_phase5.py \
-    --start 2014-01-01 --end 2024-12-31 --n-tickers 150 \
-    --position-sizing hrp
-```
-
-- `--position-sizing hrp`: Hierarchical Risk Parity weights (López de
-  Prado Ch. 16). Splits the long sleeve and short sleeve into clusters
-  by correlation and allocates inverse-variance within each cluster.
-- The backtest engine clips per-name `pct_change` at ±50% to defend
-  against delisted-ticker price corruptions from yfinance (cosmetic
-  warning spam in the log when this fires).
-
-### Phase 8 — meta-labelling + ranks_only + triple-barrier labels
-
-```bash
-uv run python scripts/run_phase5.py \
-    --start 2014-01-01 --end 2024-12-31 --n-tickers 150 \
-    --meta-labelling --meta-threshold 0.55 \
-    --ranks-only \
-    [--triple-barrier --tb-k-sigma 2.0]
-```
-
-- `--meta-labelling`: train a secondary binary classifier per fold
-  predicting `P(primary score has correct sign)`. Gate the primary
-  score: zero-out rows where `P < --meta-threshold`. Reduces turnover
-  and improves precision at the cost of recall.
-- `--meta-threshold 0.55`: gate threshold (default 0.55).
-- `--ranks-only`: drop the raw feature columns and keep only the
-  cross-sectional `_rank` columns (plus sector dummies / regime
-  broadcasts if enabled). Per-feature audit on the 150-name × 11-yr
-  universe shows raw columns degrade ~100% under hard-cutoff while
-  the ranked versions degrade only 15–50%.
-- `--triple-barrier`: switch from the simple forward-return label to
-  the López de Prado triple-barrier signed return per horizon. Bounded
-  by construction (clipped at ±`tb-k-sigma` units of trailing vol).
-
-### Phase 9 — confidence-weighted sizing + walk-forward meta-CV
-
-```bash
-uv run python scripts/run_phase5.py [...same as Phase 8...] \
-    --meta-mode confidence --meta-conf-floor 0.60 --meta-conf-cap 1.0 \
-    --meta-walk-forward-folds 3 \
-    [--meta-per-sector]
-```
-
-- `--meta-mode confidence`: scale signal by
-  `clip((P-floor)/(cap-floor), 0, 1)` instead of a hard binary gate.
-- `--meta-conf-floor 0.60`: the Phase 10 sweet spot. **Do NOT use the
-  default `0.5`** — Phase 10 swept floors {0.50…0.75} and 0.50
-  reproducibly underperforms binary by ~0.4 Sharpe; 0.60 has the best
-  point estimate.
-- `--meta-walk-forward-folds 3`: K folds of expanding-window
-  meta-classifier CV. K=1 reproduces the Phase 8 single-pass behaviour.
-- `--meta-per-sector`: one meta classifier per sector (requires
-  fundamentals successfully loaded; falls back to global meta if not).
-
-### Phase 10 — confidence-floor sweep
-
-```bash
-uv run python scripts/phase10_conf_floor_sweep.py \
-    --start 2014-01-01 --end 2024-12-31 --n-tickers 150 \
-    --floors 0.50 0.55 0.60 0.65 0.70 0.75
-```
-
-Runs the Phase 8 best config 7 times: once with `--meta-mode binary`
-(baseline) and once per floor with `--meta-mode confidence`. Reports
-holdout Sharpe + 95% block-bootstrap CI per run. Output:
-`reports/phase10_conf_floor_sweep_<start>_<end>_n<N>.csv`.
-
-### Phase 11 — feature pruning by per-feature audit
-
-```bash
-# Step 1: re-build the per-feature audit on your universe (~30 min)
-uv run python scripts/per_feature_audit.py \
-    --start 2014-01-01 --end 2024-12-31 \
-    --n-tickers 150 --horizon 5 --top-n 20
-
-# Step 2: run the 3-config sweep (~10 min)
-uv run python scripts/phase11_feature_pruning.py \
-    --start 2014-01-01 --end 2024-12-31 --n-tickers 150
-```
-
-The driver reads `reports/per_feature_audit.csv` and runs three configs
-on top of the Phase 8 best config:
-- baseline (no pruning)
-- drop bottom 25% by `pct_drop` (least same-day work — noise candidates)
-- drop top 25% by `pct_drop` (most same-day work — sanity check; should
-  be worse than baseline)
-
-The pipeline now exposes a `PipelineV5Config.feature_exclude:
-tuple[str, ...]` field so future phases can chain pruning with new
-features.
+| Phase | Key flags | What it does | Honest holdout result |
+|---|---|---|---|
+| 6 | `--beta-neutralise`, `--no-tier2`, `--no-regime`, `--no-sector` | Tier-2 features (12-1 momentum, IVOL, β, Amihud), VIX regime broadcasts, SPY beta neutralisation | Sharpe −0.95; all three extra feature sets hurt holdout |
+| 7 | `--position-sizing hrp` | Hierarchical Risk Parity weights; in Phase 13 best config | Sharpe −0.69 (alone); in best config as of Phase 13 |
+| 8 | `--meta-labelling --meta-threshold 0.55 --ranks-only` | Binary meta-classifier gate + keep only rank columns; in Phase 13 best config | Sharpe −0.16, first CI to straddle zero |
+| 8 | `--triple-barrier --tb-k-sigma 2.0` | Triple-barrier labels (Phase 16 found this hurt; do not combine with meta) | Phase 16: worse than Phase 13 |
+| 9 | `--meta-mode confidence --meta-conf-floor 0.60 --meta-walk-forward-folds 3` | Confidence-weighted sizing; floor=0.60 is the Phase 10 sweet spot | Confidence mode generally worse than binary; binary @ 0.55 is the Phase 13 default |
+| 10 | `scripts/phase10_conf_floor_sweep.py --floors 0.50 … 0.75` | Sweep meta confidence floor; output to `reports/phase10_conf_floor_sweep.csv` | Best floor=0.60 gave +0.077; binary still wins at +0.17 |
+| 11 | `scripts/phase11_feature_pruning.py` (uses `PipelineV5Config.feature_exclude`) | Drop the bottom-5 features by per-feature audit; run `scripts/per_feature_audit.py` first | Sharpe −0.11; superseded by Phase 13 |
 
 ---
 
 ## 6c. News features (Phase 12–15)
 
-**Want the BEST config in one curl command?** See
-[`docs/OPTIMAL.md`](OPTIMAL.md) — single source of truth for the
-best-known config, full parameter explanation, honest expectations.
+See [`docs/NEWS.md`](NEWS.md) for the complete operator guide: one-time
+setup commands, leakage-safety arguments, memory budget, and known caveats.
+See [`docs/OPTIMAL.md`](OPTIMAL.md) for the production curl command.
 
-**See the dedicated [`docs/NEWS.md`](NEWS.md)** for the complete
-end-to-end guide to the four news data sources (EDGAR 8-K events,
-EDGAR 8-K item codes, GDELT daily tone, FinBERT live-mode sentiment),
-including one-time setup curl commands, daily-run examples, full
-results table, and leakage-safety arguments.
+| Phase | Flag | Features added | Honest holdout result |
+|---|---|---|---|
+| 12 | `--edgar-events` | 4 cols: `edgar_has_8k`, `edgar_count_8k_{5,21,63}d` | Sharpe **−0.376** — **HURT**; do not enable |
+| 13 ⭐ | `--edgar-items` | 15 cols: 5 event families × 3 windows (`edgaritem_*`) | Sharpe **+0.173**, DD −8.2% — **best config** |
+| 14 | `--gdelt` | 6 cols: `gdelt_mention_count`, `gdelt_tone_mean`, rolling 5/21d | Sharpe **−0.459** — **HURT badly**; do not enable |
+| 15 | *(no flag)* | None — dashboard `/tickers/{t}/news?with_sentiment=true` only | N/A (not a backtest feature) |
 
-This section is the abbreviated quick-reference; **NEWS.md is the
-canonical doc**.
+**Set `EDGAR_USER_AGENT="Your Name your-email@example.com"** before any
+run that uses `--edgar-events` or `--edgar-items` (SEC compliance).
 
-### Phase 12 — SEC EDGAR 8-K event flags  *(IMPLEMENTED)*
-
-8-K is the SEC form a public company files when a "material event"
-happens (CEO change, earnings pre-release, M&A, etc.). Free, full
-historical coverage from 2001, no API key.
-
+**Phase 14 requires an overnight bulk fetch first** (~2–3 hr):
 ```bash
-# Quick smoke test (40 tickers x 3 years) — completes in ~50 sec
-uv run python scripts/run_phase5.py \
-    --start 2022-01-01 --end 2024-12-31 --n-tickers 40 --horizons 5 \
-    --weighting equal --position-sizing hrp \
-    --k-pct 0.15 --sector-cap 0.30 --min-trade-threshold 0.005 \
-    --holdout-years 1 --no-sector --no-regime --no-tier2 \
-    --universe-sampling current --bootstrap-method block \
-    --meta-labelling --meta-threshold 0.55 --ranks-only \
-    --edgar-events --bootstrap-n 50
-
-# Production (150 tickers x 11 years)
-uv run python scripts/run_phase5.py \
-    --start 2014-01-01 --end 2024-12-31 --n-tickers 150 \
-    [...same flags...] \
-    --edgar-events
-```
-
-Adds 4 features per (date, ticker):
-- `edgar_has_8k`        (int8)  1 if 8-K filed on this trading day
-- `edgar_count_8k_5d`   (int16) rolling 5-trading-day count
-- `edgar_count_8k_21d`  (int16) rolling 21-trading-day count
-- `edgar_count_8k_63d`  (int16) rolling 63-trading-day count
-
-The `edgar_` prefix is recognised by `--ranks-only` so these
-discrete event-count features are kept (they have no `_rank`
-counterpart by design — counts don't need cross-sectional ranking).
-
-**SEC compliance is mandatory.** SEC requires a User-Agent header
-identifying you and rate-limits at 10 req/sec. We default to:
-
-```bash
-export EDGAR_USER_AGENT="Your Name your-email@example.com"
-```
-
-If you don't set it, requests use a generic UA `stock-predictor/0.2
-(raj.axisos@gmail.com)` which SEC may rate-limit harder if many
-unrelated users share it.
-
-**Equivalent `curl` recipes** (if you want to fetch caches manually
-before running the pipeline):
-
-```bash
-UA="Your Name your-email@example.com"
-mkdir -p data/cache/edgar
-
-# Ticker -> CIK mapping (one-shot, ~3 MB)
-curl -A "$UA" -o data/cache/edgar/ticker_to_cik.json \
-    https://www.sec.gov/files/company_tickers.json
-
-# Per-quarter form index (~2 MB each, one per qtr from 2014 onward)
-for YEAR in 2014 2015 2016 2017 2018 2019 2020 2021 2022 2023 2024; do
-  for QTR in 1 2 3 4; do
-    curl -A "$UA" \
-        -o data/cache/edgar/form_${YEAR}Q${QTR}.idx \
-        "https://www.sec.gov/Archives/edgar/full-index/${YEAR}/QTR${QTR}/form.idx"
-    sleep 0.2   # be nice to SEC
-  done
-done
-```
-
-(The pipeline will re-parse these into per-quarter parquet caches at
-`data/cache/edgar/8k_<YYYY>Q<n>.parquet` on the first `--edgar-events`
-run.)
-
-**Storage**: ~30 KB per quarter parquet × 44 quarters ≈ 1.3 MB on
-disk. RAM impact at backtest: <100 MB peak for 150 tickers × 11 yr.
-
-**Honest expectations**: 8-K events are sparse (most companies file
-2-5 per year). Sharpe lift, if any, will be small. Run the full
-production sweep + bootstrap CI before claiming a result.
-
-**Phase 12 production result** (150 tickers × 11yr): hold Sharpe **−0.376**
-vs baseline −0.158. EDGAR raw counts HURT the strategy. Use
-`--edgar-items` (Phase 13) instead.
-
-### Phase 13 — SEC EDGAR 8-K item-code flags  *(IMPLEMENTED)*
-
-Same SEC data as Phase 12, but extracts the per-filing **item codes**
-(item 2.02 = earnings, item 5.02 = CEO change, item 8.01 = M&A, etc.)
-which carry directional information that raw counts don't.
-
-```bash
-# Quick smoke test (3 min)
-uv run python scripts/run_phase5.py \
-    --start 2014-01-01 --end 2024-12-31 --n-tickers 150 --horizons 5 \
-    --weighting equal --position-sizing hrp \
-    --k-pct 0.15 --sector-cap 0.30 --min-trade-threshold 0.005 \
-    --holdout-years 2 --no-sector --no-regime --no-tier2 \
-    --universe-sampling current --bootstrap-method block \
-    --meta-labelling --meta-threshold 0.55 --ranks-only \
-    --edgar-items
-```
-
-Adds 15 features per (date, ticker) — 5 item families × 3 windows:
-
-- `edgaritem_earnings_today` (int8); `edgaritem_earnings_21d`, `_63d` (int16)
-- `edgaritem_ceo_change_today`, `_21d`, `_63d`
-- `edgaritem_ma_today`, `_21d`, `_63d` (covers item 1.01 + 2.01 + 8.01)
-- `edgaritem_guidance_today`, `_21d`, `_63d`
-- `edgaritem_going_concern_today`, `_21d`, `_63d`
-
-Uses SEC's per-company submissions JSON endpoint:
-
-```bash
-# One-off curl per ticker (Python pipeline does this automatically):
-curl -A "Your Name your-email@example.com" \
-    "https://data.sec.gov/submissions/CIK0000320193.json" \
-    | jq '.filings.recent | {form, filingDate, items}' \
-    | head -20
-```
-
-**Honest result on production smoke** (150 tickers × 11 yr): hold Sharpe
-**+0.173** with 95% CI **[−0.32, +0.58]**. The point estimate is
-positive AND the holdout drawdown is the smallest across all phases
-(−8.2% vs −16% baseline). CI still straddles zero so this is not
-yet a statistically significant edge, but it's the closest the project
-has come.
-
-**Default recommendation**: enable `--edgar-items`, do NOT enable
-`--edgar-events` (Phase 12 raw counts hurt the strategy).
-
-### Phase 14 — GDELT 1.0 daily tone + mention counts  *(IMPLEMENTED)*
-
-GDELT 1.0 publishes one global event/tone CSV per day, free, no API
-key. Coverage from 2013-04 (we honour 2014-01 backtest start).
-Adds 6 features per (date, ticker):
-
-- `gdelt_mention_count`     (int16)   distinct articles mentioning the ticker
-- `gdelt_article_count`     (int32)   sum of NUMARTS across rows that day
-- `gdelt_tone_mean`         (float32) avg article tone (-100 to +100)
-- `gdelt_tone_std`          (float32) tone dispersion within the day
-- `gdelt_mention_{5,21}d`   (int16)   rolling mention sum
-- `gdelt_tone_{5,21}d`      (float32) rolling tone mean
-
-**Setup — overnight bulk fetch** (~2-3 hr, runs once):
-
-```bash
-# Step 1: ensure SEC EDGAR ticker map is populated (Phase 12 / 13 also
-# need this; if you've run either, you're already done).
-uv run python -c "from stockpred.data import edgar; edgar.fetch_ticker_to_cik(refresh=True)"
-
-# Step 2: bulk-fetch all 4018 daily GKG files (2014-2024).
 nohup uv run python scripts/phase14_gdelt_bulk_fetch.py \
-    --tickers-from-edgar \
-    > logs/phase14_bulk.log 2>&1 &
-
-# Monitor progress
-tail -f logs/phase14_bulk.log
-# At default 0.5s rate-limit sleep: ~33 min sleep + ~1-2 hr network.
+    --tickers-from-edgar > logs/phase14_bulk.log 2>&1 &
 ```
 
-**Equivalent `curl` to fetch a single daily file directly** (for
-testing or surgical re-fetch):
-
+**Phase 15 requires a one-time model download** (~440 MB model + ~1.5 GB deps):
 ```bash
-# GDELT 1.0 daily GKG (one zip per day, ~5-15 MB compressed)
-DATE=20241001
-curl -o data/cache/gdelt/raw_${DATE}.zip \
-    http://data.gdeltproject.org/gkg/${DATE}.gkg.csv.zip
-
-# The pipeline does NOT use raw zips at backtest time; only the
-# per-day parquet caches written by phase14_gdelt_bulk_fetch.py.
-```
-
-**Memory profile** (per docs/continue.md constraint #8):
-
-- Each daily zip streamed via `requests.get(stream=True)`; safety
-  cap at 200 MB per response (real files are 5-15 MB).
-- GKG CSV parsed via the `csv` module (streaming), never via
-  `pd.read_csv` on the full file.
-- Per-(ticker, date) aggregation kept as a dict during parse; only
-  the final rows materialise as a DataFrame.
-- Each day cached as snappy parquet: ~10-100 KB after S&P-500 filter
-  (vs ~5-15 MB raw zip = 50-1500× compression).
-- Backtest-time peak RSS adds ~50 MB on top of the Phase 13 baseline.
-
-**Run the pipeline with GDELT enabled** (after bulk fetch completes):
-
-```bash
-uv run python scripts/run_phase5.py \
-    --start 2014-01-01 --end 2024-12-31 --n-tickers 150 --horizons 5 \
-    --weighting equal --position-sizing hrp \
-    --k-pct 0.15 --sector-cap 0.30 --min-trade-threshold 0.005 \
-    --holdout-years 2 --no-sector --no-regime --no-tier2 \
-    --universe-sampling current --bootstrap-method block \
-    --meta-labelling --meta-threshold 0.55 --ranks-only \
-    --edgar-items --gdelt
-```
-
-**Honest caveat on GDELT match quality**: GDELT mentions companies by
-NAME (not ticker). We strip common legal suffixes (INC, CORP, etc.)
-and reject names < 4 characters to avoid false positives like "CAT"
-matching the word "cat". Some signal is lost; this is the free-data
-ceiling. If `data/cache/gdelt/*.parquet` is empty when the pipeline
-runs, the GDELT panel returns empty and the pipeline emits a coverage
-warning but continues.
-
-### Phase 15 — FinBERT live-mode sentiment (DASHBOARD ONLY)  *(IMPLEMENTED)*
-
-ProsusAI/FinBERT is a 110-M-parameter financial-domain BERT classifier
-(positive / neutral / negative) fine-tuned on Financial PhraseBank.
-We use it ONLY for the dashboard's per-ticker news panel — never as a
-backtest feature, because the underlying yfinance news source only
-has ~30 days of history (using it as a feature would create
-catastrophic walk-forward bias).
-
-**Setup — model download** (one-shot, ~440 MB + ~1.5 GB deps):
-
-```bash
-# 1. Install heavy deps (transformers + torch) — ~1.5 GB total
 pip install transformers torch huggingface_hub
-
-# 2. Download the model (~440 MB) once to a local path.
-# Hugging Face CLI (preferred):
-export FINBERT_MODEL_DIR="$PWD/models/finbert"
-huggingface-cli download ProsusAI/finbert --local-dir "$FINBERT_MODEL_DIR"
-
-# OR direct curl (skip CLI):
-mkdir -p models/finbert
-for f in config.json vocab.txt pytorch_model.bin tokenizer.json; do
-    curl -L -o "models/finbert/$f" \
-        "https://huggingface.co/ProsusAI/finbert/resolve/main/$f"
-done
+huggingface-cli download ProsusAI/finbert --local-dir models/finbert
 ```
-
-**Env vars**:
-
-- `FINBERT_MODEL_DIR=models/finbert` — path to local model (default:
-  `ProsusAI/finbert`, which triggers a one-time HF Hub download to
-  `~/.cache/huggingface/...` on first use).
-- `FINBERT_BATCH_SIZE=32` — CPU inference batch size; reduce on
-  RAM-constrained boxes.
-- `FINBERT_ENABLED=auto` — `off` to globally disable scoring even
-  when the model is available.
-
-**Use it via the news endpoint**:
-
-```bash
-# Returns 20 most recent headlines for AAPL, each with
-# sentiment_label / sentiment_net / sentiment_{positive,neutral,negative}
-# fields if FinBERT is installed. Otherwise those fields are null and
-# the rest of the payload is unchanged.
-curl http://localhost:8000/tickers/AAPL/news?limit=20&with_sentiment=true
-
-# Skip sentiment scoring (faster + no model needed):
-curl http://localhost:8000/tickers/AAPL/news?with_sentiment=false
-```
-
-**Graceful degradation**: if `transformers`/`torch` aren't installed,
-the news endpoint still returns headlines (without sentiment fields)
-and a `WARNING` is logged. Operators who don't want the heavy deps
-can leave them out — the backend stays lightweight.
-
-**Cache**: each headline scored is cached on disk by sha256(title) at
-`data/cache/sentiment/{xx}/{full_hash}.json`. Repeat lookups for the
-same headline don't re-invoke the model. Cache is bucketed to avoid
-one mega-directory.
+Set `FINBERT_ENABLED=off` to disable it globally. Graceful degradation: news
+endpoint returns headlines without sentiment fields if model is not installed.
 
 ---
 
@@ -1042,113 +658,21 @@ Responses are always JSON. NaN and Infinity values are serialised as `null`
 
 ---
 
-## 9. Recommended parameters for production (Railway / 8 GB)
+## 9. Recommended parameters for production
 
-> **Updated for Phase 13** — the config below reflects the highest documented
-> holdout Sharpe (+0.173, DD −8.2%) across all research phases. It supersedes
-> the pre-Phase-8 config that was here previously.
->
-> **Honest context**: the 95% bootstrap CI is [−0.32, +0.58] — it straddles
-> zero, so this is not a statistically proven edge. It is the best result
-> the research has produced so far. A simple S&P 500 buy-and-hold has a
-> long-run Sharpe of ~0.5–0.6, so do not treat +0.17 as a finished product.
+The current best-known config is **Phase 13** (SEC EDGAR 8-K item codes),
+confirmed optimal across all 19 research phases. See
+[`docs/OPTIMAL.md`](OPTIMAL.md) for:
 
-### Queue the job (no auth required)
+- The complete `curl` for `POST /jobs/refresh`
+- The `scripts/run_phase5.py` CLI equivalent  
+- Parameter-by-parameter rationale from 19 phases of research
+- Honest expectations: Sharpe **+0.17**, CI **[−0.32, +0.58]**, DD **−8.2%**
+- Memory / runtime estimates (8 GB / 8 vCPU box)
 
-```bash
-curl -X POST \
-     -H "Content-Type: application/json" \
-     -d '{
-       "phase": 5,
-       "start_date": "2014-01-01",
-       "n_tickers": null,
-       "universe_sampling": "current",
-       "horizons": [5],
-
-       "use_sector_features": false,
-       "use_tier2_features": false,
-       "use_regime_features": false,
-       "beta_neutralise": false,
-
-       "ensemble_weighting": "equal",
-       "position_sizing": "hrp",
-       "k_per_side_pct": 0.15,
-       "leverage_per_side": 1.0,
-       "sector_cap_gross": 0.30,
-       "min_trade_threshold": 0.005,
-       "holdout_years": 2,
-
-       "ranks_only": true,
-       "use_meta_labelling": true,
-       "meta_threshold": 0.55,
-       "meta_mode": "binary",
-       "meta_walk_forward_folds": 1,
-
-       "use_edgar_features": false,
-       "use_edgar_item_features": true,
-
-       "bootstrap_n": 200,
-       "cv": {
-         "train_years": 5,
-         "test_months": 6,
-         "embargo_days": 25,
-         "min_train_obs": 1000
-       },
-       "gbm": {
-         "num_leaves": 63,
-         "learning_rate": 0.05,
-         "n_estimators": 600,
-         "min_data_in_leaf": 500,
-         "feature_fraction": 0.7,
-         "bagging_fraction": 0.8,
-         "bagging_freq": 5,
-         "reg_lambda": 2.0,
-         "early_stopping_rounds": 30
-       }
-     }' \
-     https://stock-predictor-production-d4d4.up.railway.app/jobs/queue
-```
-
-This returns a `{"id": "<queue_id>", ...}`. Then launch it with your password:
-
-```bash
-curl -X POST \
-     -H "X-Password: $STOCKPRED_PW" \
-     https://stock-predictor-production-d4d4.up.railway.app/jobs/run/<queue_id>
-```
-
-### Why each choice (Phase 13 research findings)
-
-| Parameter | Value | Reason |
-|---|---|---|
-| `horizons` | `[5]` | h=5d has IC IR 1.18 in live data; h=1d (IR 0.61) adds noise and turnover; h=21d adds little when running walk-forward cadence at 5d |
-| `position_sizing` | `hrp` | Hierarchical Risk Parity (Phase 7) beat vol_scaled in holdout |
-| `ensemble_weighting` | `equal` | Single horizon → weighting is moot; matches documented Phase 13 config |
-| `use_*_features` | all `false` | **Counter-intuitive**: Phase 13 found that stripping sector/regime/tier2 features and keeping only price-derived cross-sectional ranks improved holdout Sharpe. The additional features were adding noise and overfitting surface for the walk-forward folds |
-| `ranks_only` | `true` | Phase 8 finding: cross-sectional rank columns carry the durable signal; raw feature values add regime-level dependence that doesn't generalise |
-| `use_meta_labelling` | `true` (binary @ 0.55) | Phase 8/13 best config; binary gate outperformed confidence mode (Phase 10 confidence gave +0.08 vs +0.17 binary) |
-| `use_edgar_item_features` | `true` | Phase 13: per-item 8-K codes (CEO change 5.02, earnings 2.02, M&A 1.01/2.01/8.01) carry directional signal raw counts don't |
-| `use_edgar_features` | `false` | **Do NOT enable** — Phase 12 raw 8-K event counts hurt the strategy |
-| `start_date` | `2014-01-01` | Walk-forward burn-in means 2010–2013 produce zero positions anyway; dropping them cuts memory ~25% |
-| `min_data_in_leaf` | `500` | Scaled up from 200 (research used 150 tickers); with ~500 tickers you have ~3× more rows per fold — higher floor prevents overfitting |
-| `learning_rate` | `0.05` | Slightly higher for larger dataset; early stopping at 30 rounds handles convergence |
-| `bootstrap_n` | `200` | Reduced from 500 — stress test is informative but not the bottleneck |
-
-### Memory and runtime (8 vCPU / 8 GB RAM)
-
-| Component | 150 tickers (research) | ~500 tickers (this run) |
-|---|---|---|
-| Prices + features | ~0.4 GB | ~1.3 GB |
-| EDGAR item fetch | ~0.1 GB | ~0.3 GB |
-| LightGBM training | ~0.3 GB | ~0.9 GB |
-| Python + OS | ~0.3 GB | ~0.3 GB |
-| **Peak total** | **~1.0 GB** | **~2.5–3 GB** |
-
-8 GB RAM: ✅ comfortable headroom.
-
-LightGBM uses all available threads — 8 vCPUs makes training ~5× faster than
-the 1–2 vCPU baseline. Expected runtime: **1–2 hours** (warm cache) or
-**1.5–2.5 hours** on first run including EDGAR and price fetches for 500 tickers.
+**TL;DR**: `use_edgar_item_features: true`, `position_sizing: hrp`,
+`meta_labelling: true` (binary @ 0.55), `ranks_only: true`,
+all tier2/regime/sector features OFF.
 
 ---
 
@@ -1320,10 +844,9 @@ Rough timings on a 2024-vintage laptop (Apple M2 / 16 GB):
 
 ## 14. Where to read more
 
-- [`CONCEPTS.md`](CONCEPTS.md) — every metric, term, and design decision
-  explained.
+- [`CONCEPTS.md`](CONCEPTS.md) — every metric, term, and design decision explained.
+- [`OPTIMAL.md`](OPTIMAL.md) — single source of truth for the best config + rationale.
+- [`NEWS.md`](NEWS.md) — news-features deep dive (Phases 12–15): setup, results, caveats.
 - [`DEPLOYMENT.md`](DEPLOYMENT.md) — Docker, Fly.io, Render, VM with Caddy.
-- [`PROJECT_LOG.md`](PROJECT_LOG.md) — chronological history of every
-  change and why.
-- [`HANDOFF.md`](HANDOFF.md) — protocol for a future agent picking the
-  project up mid-stream.
+- [`PROJECT_LOG.md`](PROJECT_LOG.md) — chronological history of every change and why.
+- [`continue.md`](continue.md) — session resume protocol; phase ledger through Phase 19.

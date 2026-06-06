@@ -165,45 +165,19 @@ sentiment fields) and a `WARNING` is logged.
 
 ### Daily runs
 
-Once setup is done, the **best honest config** is one HTTP call:
+Once setup is done, trigger the best honest config with one HTTP call.
+The complete curl command with all parameters is in
+[`docs/OPTIMAL.md §2`](OPTIMAL.md) — copy it from there to avoid
+parameter drift. Runtime: ~3–7 min on warm cache.
 
 ```bash
-curl -X POST \
-  -H "X-API-Key: $STOCKPRED_API_KEY" \
-  -H "Content-Type: application/json" \
-  --max-time 1800 \
-  -d '{
-    "phase": 5,
-    "start_date": "2014-01-01",
-    "n_tickers": 150,
-    "universe_sampling": "current",
-    "horizons": [5],
-    "model": "gbm",
-    "use_sector_features":     false,
-    "use_tier2_features":      false,
-    "use_regime_features":     false,
-    "beta_neutralise":         false,
-    "bootstrap_method":        "block",
-    "holdout_years":           2,
-    "position_sizing":         "hrp",
-    "k_per_side_pct":          0.15,
-    "sector_cap_gross":        0.30,
-    "min_trade_threshold":     0.005,
-    "ensemble_weighting":      "equal",
-    "bootstrap_n":             500,
-    "use_meta_labelling":      true,
-    "meta_threshold":          0.55,
-    "ranks_only":              true,
-    "meta_mode":               "binary",
-    "use_edgar_item_features": true
-  }' \
-  http://localhost:8000/jobs/refresh
-```
+# Short form — see OPTIMAL.md for the full body
+curl -X POST -H "X-API-Key: $STOCKPRED_API_KEY" \
+     -H "Content-Type: application/json" \
+     -d '{"phase": 5, "use_edgar_item_features": true, ...}' \
+     http://localhost:8000/jobs/refresh
 
-Runtime: ~3–7 min on warm cache. Returns `{"job_id": "<uuid>",
-"status": "queued"}`. Poll progress:
-
-```bash
+# Poll progress
 curl http://localhost:8000/jobs/<uuid> | jq '{status, elapsed_s, error}'
 ```
 

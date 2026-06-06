@@ -1,31 +1,53 @@
 import { useState, useRef, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useSearchParams } from "react-router-dom";
 import {
   Play, Trash2, XCircle, Plus, RefreshCw, ChevronDown, ChevronUp,
   Clock, CheckCircle, AlertCircle, Loader2, Copy, ExternalLink, Zap,
+  RotateCcw,
 } from "lucide-react";
 import { api } from "@/api/client";
-import type { HypersearchRun, HypersearchTrial, JobDetail, QueuedJob } from "@/api/types";
+import type { HypersearchRun, HypersearchTrial, QueuedJob } from "@/api/types";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { cn } from "@/lib/cn";
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── Shared helpers ───────────────────────────────────────────────────────────
 
 function fmtDuration(s: number | null | undefined) {
   if (s == null) return "—";
   const m = Math.floor(s / 60), sec = Math.floor(s % 60);
   return m > 0 ? `${m}m ${sec}s` : `${sec}s`;
 }
-function fmtTs(ts: string | null | undefined) { return ts ? new Date(ts).toLocaleString() : "—"; }
+function fmtElapsed(startedAt: string | null | undefined) {
+  if (!startedAt) return "—";
+  return fmtDuration((Date.now() - new Date(startedAt).getTime()) / 1000);
+}
+function fmtTs(ts: string | null | undefined) {
+  return ts ? new Date(ts).toLocaleString() : "—";
+}
 function fmtSharpe(v: number | null | undefined) {
-  if (v == null || !isFinite(v)) return "—";
+  if (v == null || !isFinite(v) || v <= -9) return "—";
   return (v >= 0 ? "+" : "") + v.toFixed(3);
 }
 function fmtPct(v: number | null | undefined) {
   if (v == null || !isFinite(v)) return "—";
   return (v >= 0 ? "+" : "") + (v * 100).toFixed(1) + "%";
 }
+
+// Estimate seconds remaining for a running hypersearch.
+// ~3 min/trial × n_tickers/25 scaling factor, minus elapsed.
+function estimateSecondsRemaining(run: HypersearchRun, elapsedS: number): number | null {
+  const nTickers = (run.config.n_tickers as number | null) ?? 25;
+  const secsPerTrial = 180 * (nTickers / 25);
+  const remaining = run.n_trials_requested - run.n_trials_done;
+  return Math.max(0, remaining * secsPerTrial - elapsedS);
+}
+
+const ACTIVE_STATUSES = new Set(["running", "queued", "cancelling"]);
+const RESTARTABLE_STATUSES = new Set(["failed", "cancelled", "crashed"]);
+
+// ─── Status badge ─────────────────────────────────────────────────────────────
 
 function statusBadge(status: string) {
   const map: Record<string, { cls: string; icon: React.ReactNode; label: string }> = {
@@ -42,6 +64,32 @@ function statusBadge(status: string) {
   return (
     <span className={cn("inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium", s.cls)}>
       {s.icon}{s.label}
+    </span>
+  );
+}
+
+// ─── RunIdCell: copy + external link ─────────────────────────────────────────
+
+function RunIdCell({ runId, jobId, onClick }: { runId: number; jobId: string | null; onClick?: () => void }) {
+  const [copied, setCopied] = useState(false);
+  const label = `run-${runId}`;
+  function copy(e: React.MouseEvent) {
+    e.stopPropagation();
+    const text = jobId ?? label;
+    navigator.clipboard.writeText(text).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500); });
+  }
+  return (
+    <span className="flex items-center gap-1 font-mono text-xs">
+      <button onClick={onClick} className="hover:underline" title={jobId ?? label}>{label}</button>
+      <button onClick={copy} title="Copy job ID" className="text-muted-foreground hover:text-foreground">
+        {copied ? <CheckCircle className="h-3 w-3 text-green-500" /> : <Copy className="h-3 w-3" />}
+      </button>
+      {jobId && (
+        <a href={`/jobs/${jobId}`} target="_blank" rel="noopener noreferrer" title="Open raw job JSON"
+          onClick={e => e.stopPropagation()} className="text-muted-foreground hover:text-foreground">
+          <ExternalLink className="h-3 w-3" />
+        </a>
+      )}
     </span>
   );
 }
@@ -93,30 +141,18 @@ function Field({ label, hint, children }: { label: string; hint?: string; childr
 const inp = "w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-primary";
 const sel = inp;
 
-function NewHypersearchForm({ onClose }: { onClose: () => void }) {
+function NewHypersearchForm({ onClose, onQueued }: { onClose: () => void; onQueued: () => void }) {
   const qc = useQueryClient();
   const [cfg, setCfg] = useState({
-    n_trials: 50,
-    n_tickers: 25,
-    start_date: "2015-01-01",
-    end_date: "" as string,
-    holdout_years: 2,
-    bootstrap_n: 50,
-    universe_sampling: "current" as "current" | "first" | "random",
-    seed: 42,
+    n_trials: 50, n_tickers: 25, start_date: "2015-01-01",
+    end_date: "" as string, holdout_years: 2, bootstrap_n: 50,
+    universe_sampling: "current" as "current" | "first" | "random", seed: 42,
   });
   const [error, setError] = useState<string | null>(null);
-  const [queued, setQueued] = useState<QueuedJob | null>(null);
 
   const mutate = useMutation({
-    mutationFn: () => api.queueHypersearch({
-      ...cfg,
-      end_date: cfg.end_date || null,
-    }),
-    onSuccess: (qj) => {
-      setQueued(qj);
-      qc.invalidateQueries({ queryKey: ["queued"] });
-    },
+    mutationFn: () => api.queueHypersearch({ ...cfg, end_date: cfg.end_date || null }),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ["queued"] }); onQueued(); },
     onError: (e: Error) => setError(e.message),
   });
 
@@ -124,45 +160,26 @@ function NewHypersearchForm({ onClose }: { onClose: () => void }) {
     setCfg(c => ({ ...c, [k]: v }));
   }
 
-  const estimatedHours = Math.round(cfg.n_trials * (cfg.n_tickers / 25) * 3 / 60 * 10) / 10;
-
-  if (queued) {
-    return (
-      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
-        <div className="w-full max-w-md rounded-xl border border-border bg-card p-6 shadow-xl">
-          <div className="mb-3 flex items-center gap-2">
-            <CheckCircle className="h-5 w-5 text-green-500" />
-            <h2 className="text-lg font-semibold">Queued</h2>
-          </div>
-          <p className="mb-1 text-sm text-muted-foreground">
-            Hypersearch job queued. Launch it with your <code className="text-xs font-mono">STOCKPRED_PW</code> from the queue below.
-          </p>
-          <p className="mb-4 font-mono text-xs text-muted-foreground">ID: {queued.id}</p>
-          <div className="flex justify-end">
-            <Button size="sm" onClick={onClose}>Done</Button>
-          </div>
-        </div>
-      </div>
-    );
-  }
+  const estHours = Math.max(0.5, Math.round(cfg.n_trials * (cfg.n_tickers / 25) * 3 / 60 * 10) / 10);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-black/50 p-4">
       <div className="w-full max-w-lg rounded-xl border border-border bg-card shadow-xl">
         <div className="flex items-center justify-between border-b border-border px-6 py-4">
           <div>
-            <h2 className="flex items-center gap-2 text-lg font-semibold"><Zap className="h-5 w-5 text-primary" />New Hypersearch Job</h2>
-            <p className="text-xs text-muted-foreground">Bayesian search over 20 parameters · optimises holdout Sharpe</p>
+            <h2 className="flex items-center gap-2 text-lg font-semibold">
+              <Zap className="h-5 w-5 text-primary" /> New Hypersearch
+            </h2>
+            <p className="text-xs text-muted-foreground">Bayesian TPE search over 20 parameters · objective: holdout Sharpe</p>
           </div>
         </div>
-
         <div className="space-y-4 px-6 py-4">
           <div className="rounded-md bg-muted/50 px-3 py-2 text-xs text-muted-foreground">
-            Estimated runtime: <strong>~{estimatedHours}h</strong> ({cfg.n_trials} trials × {cfg.n_tickers} tickers)
+            Estimated runtime: <strong>~{estHours}h</strong> ({cfg.n_trials} trials × {cfg.n_tickers} tickers).
+            Password required to launch.
           </div>
-
           <div className="grid grid-cols-2 gap-4">
-            <Field label="Trials" hint="More = better, slower">
+            <Field label="Trials" hint="50 = good balance; 100+ = overnight">
               <input type="number" className={inp} value={cfg.n_trials} min={5} max={500}
                 onChange={e => set("n_trials", Number(e.target.value))} />
             </Field>
@@ -182,7 +199,7 @@ function NewHypersearchForm({ onClose }: { onClose: () => void }) {
               <input type="number" className={inp} value={cfg.holdout_years} min={1} max={5}
                 onChange={e => set("holdout_years", Number(e.target.value))} />
             </Field>
-            <Field label="Bootstrap samples" hint="50=fast CI, 500=honest CI">
+            <Field label="Bootstrap samples" hint="50 = fast CI, 500 = honest CI">
               <input type="number" className={inp} value={cfg.bootstrap_n} min={10} max={500}
                 onChange={e => set("bootstrap_n", Number(e.target.value))} />
             </Field>
@@ -199,15 +216,13 @@ function NewHypersearchForm({ onClose }: { onClose: () => void }) {
                 onChange={e => set("seed", Number(e.target.value))} />
             </Field>
           </div>
-
           {error && <p className="rounded-md bg-red-50 px-3 py-2 text-xs text-red-700 dark:bg-red-900/30 dark:text-red-300">{error}</p>}
         </div>
-
         <div className="flex justify-end gap-2 border-t border-border px-6 py-4">
           <Button variant="ghost" size="sm" onClick={onClose}>Cancel</Button>
           <Button size="sm" onClick={() => { setError(null); mutate.mutate(); }} disabled={mutate.isPending}>
             {mutate.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
-            Queue Job
+            Queue Search
           </Button>
         </div>
       </div>
@@ -218,239 +233,297 @@ function NewHypersearchForm({ onClose }: { onClose: () => void }) {
 // ─── Trial results table ──────────────────────────────────────────────────────
 
 function TrialTable({ trials, limit = 10 }: { trials: HypersearchTrial[]; limit?: number }) {
-  const sorted = [...trials].sort((a, b) => (b.hold_sharpe ?? -99) - (a.hold_sharpe ?? -99));
+  const sorted = [...trials]
+    .filter(t => !t.error || t.hold_sharpe != null)
+    .sort((a, b) => (b.hold_sharpe ?? -99) - (a.hold_sharpe ?? -99));
   const rows = sorted.slice(0, limit);
-  if (rows.length === 0) return <p className="text-sm text-muted-foreground">No trials yet.</p>;
+  if (rows.length === 0) return <p className="text-sm text-muted-foreground">No successful trials yet.</p>;
 
   return (
     <div className="overflow-x-auto">
       <table className="w-full text-xs">
         <thead>
           <tr className="border-b border-border text-left text-muted-foreground">
-            {["#", "Sharpe", "CI lo", "CI hi", "Max DD", "Ann Ret", "Dev Sh", "Sizing", "Horizons", "Meta", "Ranks", "s"].map(h => (
-              <th key={h} className="px-2 py-1.5 font-medium whitespace-nowrap">{h}</th>
+            {["#", "Sharpe", "CI lo", "CI hi", "Max DD", "Ann Ret", "Dev Sh", "Sizing", "Hz", "Meta", "Rnk", "s"].map(h => (
+              <th key={h} className="whitespace-nowrap px-2 py-1.5 font-medium">{h}</th>
             ))}
           </tr>
         </thead>
         <tbody>
-          {rows.map((t, i) => {
-            const isTop = i === 0;
-            return (
-              <tr key={t.trial} className={cn("border-b border-border/50", isTop && "bg-green-50 dark:bg-green-900/10")}>
-                <td className="px-2 py-1 font-mono">{t.trial}</td>
-                <td className={cn("px-2 py-1 font-mono font-semibold", (t.hold_sharpe ?? 0) > 0 ? "text-green-600 dark:text-green-400" : "text-red-500")}>
-                  {fmtSharpe(t.hold_sharpe)}
-                </td>
-                <td className="px-2 py-1 font-mono text-muted-foreground">{fmtSharpe(t.hold_ci_lo)}</td>
-                <td className="px-2 py-1 font-mono text-muted-foreground">{fmtSharpe(t.hold_ci_hi)}</td>
-                <td className="px-2 py-1 font-mono">{fmtPct(t.hold_dd)}</td>
-                <td className="px-2 py-1 font-mono">{fmtPct(t.hold_ann_return)}</td>
-                <td className="px-2 py-1 font-mono text-muted-foreground">{fmtSharpe(t.dev_sharpe)}</td>
-                <td className="px-2 py-1">{String(t.params.position_sizing ?? "—")}</td>
-                <td className="px-2 py-1 font-mono">{String(t.params.horizons ?? "—")}</td>
-                <td className="px-2 py-1">{t.params.use_meta_labelling ? "Y" : "N"}</td>
-                <td className="px-2 py-1">{t.params.ranks_only ? "Y" : "N"}</td>
-                <td className="px-2 py-1 font-mono text-muted-foreground">{t.elapsed_s != null ? `${Math.round(t.elapsed_s)}s` : "—"}</td>
-              </tr>
-            );
-          })}
+          {rows.map((t, i) => (
+            <tr key={t.trial} className={cn("border-b border-border/50", i === 0 && "bg-green-50 dark:bg-green-900/10")}>
+              <td className="px-2 py-1 font-mono text-muted-foreground">{t.trial}</td>
+              <td className={cn("px-2 py-1 font-mono font-semibold tabular-nums",
+                (t.hold_sharpe ?? 0) > 0 ? "text-green-600 dark:text-green-400" : "text-red-500")}>
+                {fmtSharpe(t.hold_sharpe)}
+              </td>
+              <td className="px-2 py-1 font-mono text-muted-foreground">{fmtSharpe(t.hold_ci_lo)}</td>
+              <td className="px-2 py-1 font-mono text-muted-foreground">{fmtSharpe(t.hold_ci_hi)}</td>
+              <td className="px-2 py-1 font-mono">{fmtPct(t.hold_dd)}</td>
+              <td className="px-2 py-1 font-mono">{fmtPct(t.hold_ann_return)}</td>
+              <td className="px-2 py-1 font-mono text-muted-foreground">{fmtSharpe(t.dev_sharpe)}</td>
+              <td className="px-2 py-1">{String(t.params.position_sizing ?? "—")}</td>
+              <td className="px-2 py-1 font-mono">{String(t.params.horizons ?? "—")}</td>
+              <td className="px-2 py-1">{t.params.use_meta_labelling ? "Y" : "N"}</td>
+              <td className="px-2 py-1">{t.params.ranks_only ? "Y" : "N"}</td>
+              <td className="px-2 py-1 font-mono text-muted-foreground">
+                {t.elapsed_s != null ? `${Math.round(t.elapsed_s)}s` : "—"}
+              </td>
+            </tr>
+          ))}
         </tbody>
       </table>
     </div>
   );
 }
 
-// ─── Run detail panel ─────────────────────────────────────────────────────────
+// ─── Detail panel (opens inline below the row, like Jobs) ─────────────────────
 
-function RunDetailPanel({ run, jobId }: { run: HypersearchRun; jobId: string | null }) {
-  const [showParams, setShowParams] = useState(false);
-  const [showAllTrials, setShowAllTrials] = useState(false);
+function HypersearchDetailPanel({
+  runId, onClose, onCancel,
+}: { runId: number; onClose: () => void; onCancel: (jobId: string) => void }) {
   const logsEndRef = useRef<HTMLDivElement>(null);
-  const isActive = run.status === "running";
+  const [showAllTrials, setShowAllTrials] = useState(false);
+  const [showParams, setShowParams] = useState(false);
+  const [paramsCopied, setParamsCopied] = useState(false);
 
-  // Poll job logs while running
+  // Poll the HypersearchRun record (updates after every trial)
+  const { data: run } = useQuery({
+    queryKey: ["hs-run", runId],
+    queryFn: () => api.hypersearchRun(runId),
+    refetchInterval: q => ACTIVE_STATUSES.has(q.state.data?.status ?? "") ? 4000 : false,
+  });
+
+  // Fetch the linked job for logs + cancellable status
+  const jobId = run?.job_id ?? null;
   const { data: job } = useQuery({
     queryKey: ["job", jobId],
     queryFn: () => api.jobDetail(jobId!),
     enabled: !!jobId,
-    refetchInterval: isActive ? 3000 : false,
+    refetchInterval: q => ACTIVE_STATUSES.has(q.state.data?.status ?? "") ? 2500 : false,
   });
 
   useEffect(() => { logsEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [job?.logs?.length]);
 
+  if (!run) return <div className="py-6 text-center"><Loader2 className="mx-auto h-5 w-5 animate-spin text-muted-foreground" /></div>;
+
+  const isActive = ACTIVE_STATUSES.has(run.status);
+  const jobIsActive = job ? ACTIVE_STATUSES.has(job.status) : false;
+
+  // Progress
   const progress = run.n_trials_requested > 0
-    ? Math.round((run.n_trials_done / run.n_trials_requested) * 100)
+    ? Math.min(99, Math.round((run.n_trials_done / run.n_trials_requested) * 100))
     : 0;
+  const elapsedS = job?.elapsed_s ?? (job?.started_at ? (Date.now() - new Date(job.started_at).getTime()) / 1000 : null);
+  const remainS = isActive && elapsedS != null ? estimateSecondsRemaining(run, elapsedS) : null;
+
+  // Trials
+  const validTrials = (run.trials ?? []).filter(t => !t.error || t.hold_sharpe != null);
+  const nPosCI = validTrials.filter(t => (t.hold_ci_lo ?? 0) > 0).length;
+
+  // Best params JSON
+  const bestParamsJson = run.best_params ? JSON.stringify(run.best_params, null, 2) : null;
+
+  function copyParams() {
+    if (!bestParamsJson) return;
+    navigator.clipboard.writeText(bestParamsJson).then(() => {
+      setParamsCopied(true);
+      setTimeout(() => setParamsCopied(false), 1500);
+    });
+  }
 
   return (
-    <div className="space-y-4">
-      {/* Progress bar */}
+    <div className="mt-4 rounded-xl border border-border bg-card p-4">
+      {/* ── Header row ── */}
+      <div className="mb-3 flex items-center justify-between">
+        <div className="flex items-center gap-2 flex-wrap">
+          {jobId && <RunIdCell runId={run.id} jobId={jobId} />}
+          {statusBadge(run.status)}
+          {job?.elapsed_s != null && (
+            <span className="text-xs text-muted-foreground">Runtime: {fmtDuration(job.elapsed_s)}</span>
+          )}
+        </div>
+        <div className="flex items-center gap-2">
+          {jobIsActive && jobId && (
+            <Button variant="destructive" size="sm" onClick={() => onCancel(jobId)}>
+              <XCircle className="h-4 w-4" /> Cancel
+            </Button>
+          )}
+          <Button variant="ghost" size="sm" onClick={onClose}>Close</Button>
+        </div>
+      </div>
+
+      {/* ── Progress bar ── */}
       {(isActive || run.n_trials_done > 0) && (
-        <div>
+        <div className="mb-4">
           <div className="mb-1 flex justify-between text-xs text-muted-foreground">
             <span>Trials: {run.n_trials_done} / {run.n_trials_requested}</span>
-            <span>{progress}%{isActive ? " · running…" : ""}</span>
+            <span>
+              {progress}%{remainS != null ? ` · ~${fmtDuration(remainS)} remaining` : ""}
+            </span>
           </div>
-          <div className="h-2 w-full overflow-hidden rounded-full bg-muted">
+          <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
             <div
-              className={cn("h-full rounded-full transition-all duration-700", isActive ? "bg-blue-500" : "bg-green-500")}
-              style={{ width: `${progress}%` }}
+              className={cn("h-full rounded-full transition-all duration-700",
+                isActive ? "bg-primary" : "bg-green-500")}
+              style={{ width: `${run.status === "ok" ? 100 : progress}%` }}
             />
           </div>
         </div>
       )}
 
-      {/* Best Sharpe highlight */}
+      {/* ── Best Sharpe callout ── */}
       {run.best_sharpe != null && (
-        <div className="flex items-center gap-3 rounded-lg border border-border bg-card p-3">
+        <div className="mb-4 flex items-center gap-4 rounded-lg border border-border bg-muted/30 px-4 py-3">
           <div>
             <p className="text-xs text-muted-foreground">Best holdout Sharpe</p>
-            <p className={cn("text-2xl font-bold tabular-nums", run.best_sharpe > 0 ? "text-green-600 dark:text-green-400" : "text-red-500")}>
+            <p className={cn("text-3xl font-bold tabular-nums",
+              run.best_sharpe > 0 ? "text-green-600 dark:text-green-400" : "text-red-500")}>
               {fmtSharpe(run.best_sharpe)}
             </p>
           </div>
-          <div className="ml-auto text-right text-xs text-muted-foreground">
-            <p>{run.n_trials_done} trials done</p>
-            <p>{fmtTs(run.started_at)}</p>
-          </div>
+          {validTrials.length > 0 && (
+            <div className="ml-auto text-right text-xs text-muted-foreground space-y-0.5">
+              <p>CI &gt; 0: <strong className={nPosCI > 0 ? "text-green-600 dark:text-green-400" : ""}>{nPosCI}/{validTrials.length}</strong></p>
+              <p>{run.n_trials_done} trials done</p>
+            </div>
+          )}
         </div>
       )}
 
-      {/* Trial table */}
-      {run.trials.length > 0 && (
+      {/* ── Error banner ── */}
+      {job?.error && (
+        <div className="mb-4 rounded-md bg-red-50 p-3 text-xs text-red-700 dark:bg-red-900/30 dark:text-red-300">
+          <strong>Error:</strong> {job.error}
+        </div>
+      )}
+
+      {/* ── Main content grid: config + logs ── */}
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+        {/* Config */}
         <div>
+          <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">Search Config</p>
+          <dl className="space-y-1 text-xs">
+            {Object.entries(run.config)
+              .filter(([k]) => !["job_type"].includes(k))
+              .map(([k, v]) => (
+                <div key={k} className="flex justify-between gap-2">
+                  <dt className="text-muted-foreground">{k}</dt>
+                  <dd className="font-mono text-right">{String(v ?? "null")}</dd>
+                </div>
+              ))}
+          </dl>
+        </div>
+
+        {/* Logs */}
+        <div className="lg:col-span-2">
+          <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+            Logs{" "}
+            {(job?.logs?.length ?? 0) > 0 && (
+              <span className="text-muted-foreground/60">({job!.logs.length} lines)</span>
+            )}
+          </p>
+          <pre className="h-64 overflow-y-auto rounded-md bg-muted p-2 font-mono text-xs leading-relaxed text-foreground/80 scrollbar-thin">
+            {!job
+              ? (isActive ? "Waiting for job to start…" : "No job data.")
+              : (job.logs.length === 0
+                ? (jobIsActive ? "Waiting for output…" : "No logs captured.")
+                : job.logs.join("\n"))}
+            <div ref={logsEndRef} />
+          </pre>
+        </div>
+      </div>
+
+      {/* ── Trial results ── */}
+      {run.trials.length > 0 && (
+        <div className="mt-4">
           <div className="mb-2 flex items-center justify-between">
             <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-              Top {Math.min(10, run.trials.length)} Results
+              Trial Results — top {Math.min(10, validTrials.length)}
             </p>
-            {run.trials.length > 10 && (
+            {validTrials.length > 10 && (
               <button className="text-xs text-primary hover:underline"
                 onClick={() => setShowAllTrials(v => !v)}>
-                {showAllTrials ? "Show top 10" : `Show all ${run.trials.length}`}
+                {showAllTrials ? "Show top 10" : `Show all ${validTrials.length}`}
               </button>
             )}
           </div>
           <TrialTable trials={run.trials} limit={showAllTrials ? run.trials.length : 10} />
+
+          {/* Honest interpretation */}
+          {run.status === "ok" && (
+            <div className="mt-3 rounded-md bg-muted/50 px-3 py-2 text-xs space-y-1">
+              <p className="font-semibold">Honest interpretation</p>
+              <p className="text-muted-foreground">
+                Configs with 95% CI strictly &gt; 0 (statistically real edge):{" "}
+                <span className={cn("font-semibold", nPosCI > 0 ? "text-green-600 dark:text-green-400" : "text-red-500")}>
+                  {nPosCI} / {validTrials.length}
+                </span>
+                {nPosCI === 0 && " — no statistically proven edge found yet."}
+              </p>
+              <p className="text-muted-foreground/70">
+                CIs are computed on a {(run.config.n_tickers as number | null) ?? 25}-ticker fast-mode universe.
+                Validate the best config on the full universe before drawing conclusions.
+              </p>
+            </div>
+          )}
         </div>
       )}
 
-      {/* Honest interpretation */}
-      {run.status === "ok" && run.trials.length > 0 && (() => {
-        const valid = run.trials.filter(t => !t.error && t.hold_ci_lo != null);
-        const nPosCI = valid.filter(t => (t.hold_ci_lo ?? 0) > 0).length;
-        return (
-          <div className="rounded-md bg-muted/50 p-3 text-xs space-y-1">
-            <p className="font-semibold text-foreground">Honest interpretation</p>
-            <p className="text-muted-foreground">
-              Configs with CI strictly &gt; 0 (statistically real edge):
-              <span className={cn("ml-1 font-semibold", nPosCI > 0 ? "text-green-600 dark:text-green-400" : "text-red-500")}>
-                {nPosCI} / {valid.length}
-              </span>
-            </p>
-            <p className="text-muted-foreground/80">
-              Sharpe CIs are computed on a {(run.config.n_tickers as number | null) ?? 25}-ticker fast-mode universe.
-              Validate the best config on the full universe before trading.
-            </p>
-          </div>
-        );
-      })()}
-
-      {/* Best params */}
-      {run.best_params && (
-        <div>
-          <button className="flex items-center gap-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground hover:text-foreground"
+      {/* ── Best params ── */}
+      {bestParamsJson && (
+        <div className="mt-4">
+          <button
+            className="flex items-center gap-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground hover:text-foreground"
             onClick={() => setShowParams(v => !v)}>
             {showParams ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
             Best Config Parameters
           </button>
           {showParams && (
-            <pre className="mt-2 overflow-x-auto rounded-md bg-muted p-3 font-mono text-xs leading-relaxed">
-              {JSON.stringify(run.best_params, null, 2)}
-            </pre>
+            <div className="relative mt-2">
+              <pre className="overflow-x-auto rounded-md bg-muted p-3 font-mono text-xs leading-relaxed">
+                {bestParamsJson}
+              </pre>
+              <button
+                onClick={copyParams}
+                className="absolute right-2 top-2 rounded-md border border-border bg-card px-2 py-1 text-xs text-muted-foreground hover:text-foreground">
+                {paramsCopied ? "Copied!" : "Copy"}
+              </button>
+            </div>
           )}
-        </div>
-      )}
-
-      {/* Logs */}
-      {job && (
-        <div>
-          <p className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-            Logs {job.logs.length > 0 && <span className="text-muted-foreground/60">({job.logs.length} lines)</span>}
-          </p>
-          <pre className="h-48 overflow-y-auto rounded-md bg-muted p-2 font-mono text-xs leading-relaxed text-foreground/80 scrollbar-thin">
-            {job.logs.length === 0
-              ? (isActive ? "Waiting for output…" : "No logs captured.")
-              : job.logs.join("\n")}
-            <div ref={logsEndRef} />
-          </pre>
         </div>
       )}
     </div>
   );
 }
 
-// ─── Run list row ─────────────────────────────────────────────────────────────
-
-function RunRow({ run, selected, onClick }: {
-  run: HypersearchRun; selected: boolean; onClick: () => void;
-}) {
-  const progress = run.n_trials_requested > 0
-    ? Math.round((run.n_trials_done / run.n_trials_requested) * 100) : 0;
-  return (
-    <>
-      <tr onClick={onClick}
-        className={cn("cursor-pointer border-b border-border/50 transition-colors hover:bg-accent/50", selected && "bg-accent")}>
-        <td className="px-4 py-2 font-mono text-xs">{run.id}</td>
-        <td className="px-4 py-2">{statusBadge(run.status)}</td>
-        <td className="px-4 py-2 text-xs">{run.n_trials_done}/{run.n_trials_requested}</td>
-        <td className="px-4 py-2">
-          <div className="flex items-center gap-2">
-            <div className="h-1.5 w-20 overflow-hidden rounded-full bg-muted">
-              <div className={cn("h-full rounded-full", run.status === "ok" ? "bg-green-500" : "bg-blue-500")}
-                style={{ width: `${progress}%` }} />
-            </div>
-            <span className="text-xs text-muted-foreground">{progress}%</span>
-          </div>
-        </td>
-        <td className="px-4 py-2 font-mono text-xs">
-          <span className={cn(run.best_sharpe != null && run.best_sharpe > 0 ? "text-green-600 dark:text-green-400 font-semibold" : "text-red-500")}>
-            {fmtSharpe(run.best_sharpe)}
-          </span>
-        </td>
-        <td className="px-4 py-2 text-xs text-muted-foreground">{run.config.n_tickers as number | null}</td>
-        <td className="px-4 py-2 text-xs text-muted-foreground">{fmtTs(run.started_at)}</td>
-        <td className="px-4 py-2">{selected ? <ChevronUp className="h-4 w-4 text-muted-foreground" /> : <ChevronDown className="h-4 w-4 text-muted-foreground" />}</td>
-      </tr>
-      {selected && (
-        <tr className="bg-card">
-          <td colSpan={8} className="px-6 py-4">
-            <RunResultLoader runId={run.id} jobId={run.job_id} />
-          </td>
-        </tr>
-      )}
-    </>
-  );
-}
-
-function RunResultLoader({ runId, jobId }: { runId: number; jobId: string | null }) {
-  const { data: run } = useQuery({
-    queryKey: ["hs-run", runId],
-    queryFn: () => api.hypersearchRun(runId),
-    refetchInterval: q => {
-      const status = q.state.data?.status;
-      return status === "running" ? 5000 : false;
-    },
-  });
-  if (!run) return <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />;
-  return <RunDetailPanel run={run} jobId={jobId} />;
-}
-
 // ─── Main page ────────────────────────────────────────────────────────────────
 
 export function Hypersearch() {
   const qc = useQueryClient();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const deepLinked = searchParams.get("run");
+  const [selectedRunId, setSelectedRunId] = useState<number | null>(
+    deepLinked ? Number(deepLinked) : null,
+  );
+
+  useEffect(() => {
+    if (deepLinked && Number(deepLinked) !== selectedRunId) {
+      setSelectedRunId(Number(deepLinked));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [deepLinked]);
+
+  function selectRun(id: number | null) {
+    setSelectedRunId(id);
+    setSearchParams(prev => {
+      const p = new URLSearchParams(prev);
+      if (id != null) p.set("run", String(id)); else p.delete("run");
+      return p;
+    }, { replace: true });
+  }
+
   const [showNewForm, setShowNewForm] = useState(false);
-  const [selectedRunId, setSelectedRunId] = useState<number | null>(null);
   const [pwAction, setPwAction] = useState<
     | { type: "launch"; queueId: string }
     | { type: "delete"; queueId: string }
@@ -459,56 +532,56 @@ export function Hypersearch() {
   >(null);
   const [pwError, setPwError] = useState<string | null>(null);
   const [pwLoading, setPwLoading] = useState(false);
+  const [restartError, setRestartError] = useState<string | null>(null);
+  const [restartingRunId, setRestartingRunId] = useState<number | null>(null);
 
-  // All jobs — filtered to hypersearch type
-  const { data: allJobs = [] } = useQuery({
-    queryKey: ["jobs"],
-    queryFn: () => api.listJobs(50),
-    refetchInterval: q => {
-      const active = (q.state.data ?? []).some(
-        j => j.job_type === "hypersearch" && ["running","queued","cancelling"].includes(j.status)
-      );
-      return active ? 4000 : 15000;
-    },
+  // All hypersearch runs (list — no trials, fast)
+  const { data: runs = [] } = useQuery({
+    queryKey: ["hs-runs"],
+    queryFn: () => api.listHypersearchRuns(50),
+    refetchInterval: q => (q.state.data ?? []).some(r => ACTIVE_STATUSES.has(r.status)) ? 4000 : 20000,
   });
-  const hsJobs = allJobs.filter(j => j.job_type === "hypersearch");
 
-  // Queued jobs — filtered to hypersearch
+  // Queue — filter to hypersearch entries only
   const { data: allQueued = [] } = useQuery({
     queryKey: ["queued"],
     queryFn: () => api.listQueued(),
     refetchInterval: 10000,
   });
-  const hsQueued = allQueued.filter(q => (q.config as any)?.job_type === "hypersearch" || (q.config as any)?.n_trials != null);
+  const hsQueued = allQueued.filter(q =>
+    (q.config as any)?.job_type === "hypersearch" || (q.config as any)?.n_trials != null
+  );
 
-  // Completed hypersearch runs
-  const { data: runs = [] } = useQuery({
-    queryKey: ["hs-runs"],
-    queryFn: () => api.listHypersearchRuns(25),
-    refetchInterval: q => {
-      const hasRunning = (q.state.data ?? []).some(r => r.status === "running");
-      return hasRunning ? 5000 : 20000;
+  // Restart: re-queue with same config, then immediately open launch modal
+  const restartMut = useMutation({
+    mutationFn: (run: HypersearchRun) =>
+      api.queueHypersearch(run.config as any),
+    onMutate: (run) => setRestartingRunId(run.id),
+    onSuccess: (qj) => {
+      qc.invalidateQueries({ queryKey: ["queued"] });
+      setPwError(null);
+      setPwAction({ type: "launch", queueId: qj.id });
     },
+    onError: (e: Error) => setRestartError(e.message),
+    onSettled: () => setRestartingRunId(null),
   });
 
   async function handlePwConfirm(pw: string) {
     if (!pwAction) return;
     setPwLoading(true); setPwError(null);
     try {
-      if (pwAction.type === "launch") {
-        const result = await api.launchQueued(pwAction.queueId, pw);
-        qc.invalidateQueries({ queryKey: ["queued"] });
+      if (pwAction.type === "cancel") {
+        await api.cancelJob(pwAction.jobId, pw);
         qc.invalidateQueries({ queryKey: ["jobs"] });
         qc.invalidateQueries({ queryKey: ["hs-runs"] });
-        // Select the new run when it appears
+      } else if (pwAction.type === "launch") {
+        await api.launchQueued(pwAction.queueId, pw);
+        qc.invalidateQueries({ queryKey: ["queued"] });
+        qc.invalidateQueries({ queryKey: ["hs-runs"] });
         setTimeout(() => qc.invalidateQueries({ queryKey: ["hs-runs"] }), 2000);
       } else if (pwAction.type === "delete") {
         await api.deleteQueued(pwAction.queueId, pw);
         qc.invalidateQueries({ queryKey: ["queued"] });
-      } else if (pwAction.type === "cancel") {
-        await api.cancelJob(pwAction.jobId, pw);
-        qc.invalidateQueries({ queryKey: ["jobs"] });
-        qc.invalidateQueries({ queryKey: ["hs-runs"] });
       }
       setPwAction(null);
     } catch (e: any) {
@@ -520,131 +593,106 @@ export function Hypersearch() {
 
   return (
     <div className="space-y-6">
-      {/* Header */}
+      {/* ── Header ── */}
       <div className="flex items-center justify-between">
         <div>
           <h1 className="flex items-center gap-2 text-2xl font-bold">
             <Zap className="h-6 w-6 text-primary" /> Hyperparameter Search
           </h1>
           <p className="text-sm text-muted-foreground">
-            Bayesian optimisation over 20 pipeline parameters · objective: holdout Sharpe
+            Bayesian TPE over 20 parameters · objective: holdout Sharpe · password required to launch
           </p>
         </div>
-        <Button onClick={() => setShowNewForm(true)}><Plus className="h-4 w-4" /> New Search</Button>
+        <Button onClick={() => setShowNewForm(true)}>
+          <Plus className="h-4 w-4" /> New Search
+        </Button>
       </div>
 
-      {showNewForm && <NewHypersearchForm onClose={() => { setShowNewForm(false); qc.invalidateQueries({ queryKey: ["queued"] }); }} />}
-
-      {pwAction && (
-        <PasswordModal
-          title={pwAction.type === "launch" ? "Launch hypersearch" : pwAction.type === "cancel" ? "Cancel job" : "Delete queued job"}
-          description={pwAction.type === "launch" ? "Enter STOCKPRED_PW to start the search. This may run for several hours." : "Enter STOCKPRED_PW to confirm."}
-          confirmLabel={pwAction.type === "launch" ? "Launch" : pwAction.type === "cancel" ? "Cancel Job" : "Delete"}
-          confirmVariant={pwAction.type === "delete" || pwAction.type === "cancel" ? "destructive" : "default"}
-          onConfirm={handlePwConfirm}
-          onClose={() => setPwAction(null)}
-          isLoading={pwLoading}
-          error={pwError}
-        />
+      {restartError && (
+        <div className="rounded-lg border border-red-300 bg-red-50 p-3 text-sm text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300">
+          <strong>Restart failed:</strong> {restartError}{" "}
+          <button onClick={() => setRestartError(null)} className="ml-2 underline">dismiss</button>
+        </div>
       )}
 
-      {/* Queue */}
+      {/* ── Queue ── */}
       {hsQueued.length > 0 && (
         <Card>
           <CardHeader>
-            <CardTitle className="text-base">Pending (awaiting launch)</CardTitle>
+            <CardTitle className="flex items-center justify-between text-base">
+              <span>
+                Queue
+                {hsQueued.filter(j => j.status === "pending").length > 0 && (
+                  <span className="ml-2 rounded-full bg-yellow-100 px-2 py-0.5 text-xs text-yellow-800 dark:bg-yellow-900/40 dark:text-yellow-300">
+                    {hsQueued.filter(j => j.status === "pending").length} pending
+                  </span>
+                )}
+              </span>
+              <button onClick={() => qc.invalidateQueries({ queryKey: ["queued"] })} className="text-muted-foreground hover:text-foreground">
+                <RefreshCw className="h-4 w-4" />
+              </button>
+            </CardTitle>
           </CardHeader>
           <CardContent className="p-0">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b border-border text-left text-xs text-muted-foreground">
-                  <th className="px-4 py-2">ID</th>
-                  <th className="px-4 py-2">Status</th>
-                  <th className="px-4 py-2">Trials</th>
-                  <th className="px-4 py-2">Tickers</th>
-                  <th className="px-4 py-2">Queued</th>
-                  <th className="px-4 py-2">Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {hsQueued.map(q => (
-                  <tr key={q.id} className="border-b border-border/50">
-                    <td className="px-4 py-2 font-mono text-xs">{q.id.slice(0, 8)}…</td>
-                    <td className="px-4 py-2">{statusBadge(q.status)}</td>
-                    <td className="px-4 py-2 text-xs">{(q.config as any).n_trials ?? "—"}</td>
-                    <td className="px-4 py-2 text-xs">{(q.config as any).n_tickers ?? "—"}</td>
-                    <td className="px-4 py-2 text-xs text-muted-foreground">{fmtTs(q.created_at)}</td>
-                    <td className="px-4 py-2">
-                      <div className="flex gap-1">
-                        {q.status === "pending" && (
-                          <>
-                            <Button size="sm" variant="default" className="h-6 px-2 text-xs"
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-border text-left text-xs text-muted-foreground">
+                    <th className="px-4 py-2">ID</th>
+                    <th className="px-4 py-2">Status</th>
+                    <th className="px-4 py-2">Summary</th>
+                    <th className="px-4 py-2">Created</th>
+                    <th className="px-4 py-2">Job</th>
+                    <th className="px-4 py-2 text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {hsQueued.map(q => (
+                    <tr key={q.id} className="border-b border-border/50">
+                      <td className="px-4 py-2 font-mono text-xs">{q.id.slice(0, 8)}…</td>
+                      <td className="px-4 py-2">{statusBadge(q.status)}</td>
+                      <td className="px-4 py-2 text-xs text-muted-foreground">
+                        {(q.config as any).n_trials ?? "?"} trials ·{" "}
+                        {(q.config as any).n_tickers ?? "?"} tickers ·{" "}
+                        {(q.config as any).start_date ?? "?"}
+                      </td>
+                      <td className="px-4 py-2 text-xs">{fmtTs(q.created_at)}</td>
+                      <td className="px-4 py-2 text-xs">
+                        {q.job_id ? (
+                          <span className="font-mono text-muted-foreground">{q.job_id.slice(0, 8)}…</span>
+                        ) : <span className="text-muted-foreground">—</span>}
+                      </td>
+                      <td className="px-4 py-2">
+                        {q.status === "pending" ? (
+                          <div className="flex items-center justify-end gap-1">
+                            <Button variant="default" size="sm"
                               onClick={() => { setPwError(null); setPwAction({ type: "launch", queueId: q.id }); }}>
                               <Play className="h-3 w-3" /> Launch
                             </Button>
-                            <Button size="sm" variant="ghost" className="h-6 px-2 text-xs text-destructive"
+                            <Button variant="ghost" size="sm"
                               onClick={() => { setPwError(null); setPwAction({ type: "delete", queueId: q.id }); }}>
                               <Trash2 className="h-3 w-3" />
                             </Button>
-                          </>
+                          </div>
+                        ) : (
+                          <div className="text-right text-xs text-muted-foreground">—</div>
                         )}
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           </CardContent>
         </Card>
       )}
 
-      {/* Active jobs */}
-      {hsJobs.filter(j => ["running","queued","cancelling"].includes(j.status)).length > 0 && (
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-base">Running</CardTitle>
-          </CardHeader>
-          <CardContent className="p-0">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b border-border text-left text-xs text-muted-foreground">
-                  <th className="px-4 py-2">Job ID</th>
-                  <th className="px-4 py-2">Status</th>
-                  <th className="px-4 py-2">Started</th>
-                  <th className="px-4 py-2">Elapsed</th>
-                  <th className="px-4 py-2">Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {hsJobs.filter(j => ["running","queued","cancelling"].includes(j.status)).map(j => (
-                  <tr key={j.job_id} className="border-b border-border/50">
-                    <td className="px-4 py-2 font-mono text-xs">{j.job_id.slice(0, 8)}…</td>
-                    <td className="px-4 py-2">{statusBadge(j.status)}</td>
-                    <td className="px-4 py-2 text-xs text-muted-foreground">{fmtTs(j.started_at)}</td>
-                    <td className="px-4 py-2 text-xs">{fmtDuration(j.elapsed_s)}</td>
-                    <td className="px-4 py-2">
-                      {j.status === "running" && (
-                        <Button size="sm" variant="ghost" className="h-6 px-2 text-xs text-destructive"
-                          onClick={() => { setPwError(null); setPwAction({ type: "cancel", jobId: j.job_id }); }}>
-                          <XCircle className="h-3 w-3" /> Cancel
-                        </Button>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </CardContent>
-        </Card>
-      )}
-
-      {/* Results */}
+      {/* ── Active & History (unified) ── */}
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center justify-between text-base">
-            Search Results
-            <button onClick={() => qc.invalidateQueries({ queryKey: ["hs-runs"] })}
-              className="text-muted-foreground hover:text-foreground">
+            Active &amp; History
+            <button onClick={() => qc.invalidateQueries({ queryKey: ["hs-runs"] })} className="text-muted-foreground hover:text-foreground">
               <RefreshCw className="h-4 w-4" />
             </button>
           </CardTitle>
@@ -652,7 +700,7 @@ export function Hypersearch() {
         <CardContent className="p-0">
           {runs.length === 0 ? (
             <p className="px-4 py-8 text-center text-sm text-muted-foreground">
-              No searches yet. Queue and launch a new hypersearch above.
+              No searches yet. Click <strong>New Search</strong> to queue one.
             </p>
           ) : (
             <div className="overflow-x-auto">
@@ -666,24 +714,115 @@ export function Hypersearch() {
                     <th className="px-4 py-2">Best Sharpe</th>
                     <th className="px-4 py-2">Tickers</th>
                     <th className="px-4 py-2">Started</th>
-                    <th className="px-4 py-2 w-6"></th>
+                    <th className="px-4 py-2">Runtime</th>
+                    <th className="px-4 py-2 text-right">Actions</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {runs.map(r => (
-                    <RunRow
-                      key={r.id}
-                      run={r}
-                      selected={selectedRunId === r.id}
-                      onClick={() => setSelectedRunId(selectedRunId === r.id ? null : r.id)}
-                    />
-                  ))}
+                  {runs.map(r => {
+                    const isSelected = selectedRunId === r.id;
+                    const isActive = ACTIVE_STATUSES.has(r.status);
+                    const canRestart = RESTARTABLE_STATUSES.has(r.status) && Object.keys(r.config).length > 0;
+                    const pct = r.n_trials_requested > 0
+                      ? Math.min(100, Math.round((r.n_trials_done / r.n_trials_requested) * 100))
+                      : 0;
+
+                    return (
+                      <>
+                        <tr key={r.id}
+                          onClick={() => selectRun(isSelected ? null : r.id)}
+                          className={cn("cursor-pointer border-b border-border/50 transition-colors hover:bg-accent/50", isSelected && "bg-accent")}>
+                          <td className="px-4 py-2">
+                            <RunIdCell runId={r.id} jobId={r.job_id} onClick={() => selectRun(isSelected ? null : r.id)} />
+                          </td>
+                          <td className="px-4 py-2">{statusBadge(r.status)}</td>
+                          <td className="px-4 py-2 text-xs">{r.n_trials_done}/{r.n_trials_requested}</td>
+                          <td className="px-4 py-2">
+                            <div className="flex items-center gap-2">
+                              <div className="h-1.5 w-16 overflow-hidden rounded-full bg-muted">
+                                <div className={cn("h-full rounded-full", r.status === "ok" ? "bg-green-500" : isActive ? "bg-primary" : "bg-muted-foreground/40")}
+                                  style={{ width: `${r.status === "ok" ? 100 : pct}%` }} />
+                              </div>
+                              <span className="text-xs text-muted-foreground">{r.status === "ok" ? 100 : pct}%</span>
+                            </div>
+                          </td>
+                          <td className="px-4 py-2 font-mono text-xs">
+                            <span className={cn("font-semibold tabular-nums",
+                              r.best_sharpe != null && r.best_sharpe > 0 ? "text-green-600 dark:text-green-400" :
+                              r.best_sharpe != null ? "text-red-500" : "text-muted-foreground")}>
+                              {fmtSharpe(r.best_sharpe)}
+                            </span>
+                          </td>
+                          <td className="px-4 py-2 text-xs">{String((r.config.n_tickers as number | null) ?? "—")}</td>
+                          <td className="px-4 py-2 text-xs">
+                            {isActive ? fmtElapsed(r.started_at) + " ago" : fmtTs(r.started_at)}
+                          </td>
+                          <td className="px-4 py-2 text-xs">{fmtTs(r.completed_at) !== "—" && !isActive ? fmtDuration((new Date(r.completed_at!).getTime() - new Date(r.started_at).getTime()) / 1000) : isActive ? fmtElapsed(r.started_at) : "—"}</td>
+                          <td className="px-4 py-2">
+                            <div className="flex items-center justify-end gap-1">
+                              {canRestart && (
+                                <Button size="sm" variant="ghost"
+                                  disabled={restartingRunId === r.id || restartMut.isPending}
+                                  title="Re-queue with same parameters"
+                                  onClick={e => { e.stopPropagation(); setRestartError(null); restartMut.mutate(r); }}>
+                                  {restartingRunId === r.id
+                                    ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                    : <RotateCcw className="h-3.5 w-3.5" />}
+                                  Restart
+                                </Button>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                        {isSelected && (
+                          <tr key={`detail-${r.id}`} className="bg-card">
+                            <td colSpan={9} className="px-4 pb-4">
+                              <HypersearchDetailPanel
+                                runId={r.id}
+                                onClose={() => selectRun(null)}
+                                onCancel={jobId => { setPwError(null); setPwAction({ type: "cancel", jobId }); }}
+                              />
+                            </td>
+                          </tr>
+                        )}
+                      </>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
           )}
         </CardContent>
       </Card>
+
+      {showNewForm && (
+        <NewHypersearchForm
+          onClose={() => setShowNewForm(false)}
+          onQueued={() => setShowNewForm(false)}
+        />
+      )}
+
+      {pwAction && (
+        <PasswordModal
+          title={
+            pwAction.type === "cancel" ? "Cancel Search" :
+            pwAction.type === "launch" ? "Launch Search" : "Delete Queued Search"
+          }
+          description={
+            pwAction.type === "cancel"
+              ? "The search will be interrupted. Partial results are already saved."
+              : pwAction.type === "launch"
+              ? "Enter STOCKPRED_PW to start the search. It may run for several hours."
+              : "Enter STOCKPRED_PW to permanently delete this queued search."
+          }
+          confirmLabel={pwAction.type === "launch" ? "Launch" : pwAction.type === "cancel" ? "Cancel Search" : "Delete"}
+          confirmVariant={pwAction.type !== "launch" ? "destructive" : "default"}
+          onConfirm={handlePwConfirm}
+          onClose={() => { setPwAction(null); setPwError(null); }}
+          isLoading={pwLoading}
+          error={pwError}
+        />
+      )}
     </div>
   );
 }
