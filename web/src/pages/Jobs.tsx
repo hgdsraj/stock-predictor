@@ -577,7 +577,7 @@ function NewJobForm({ onClose, onQueued }: { onClose: () => void; onQueued: () =
 // ─── Job detail panel ─────────────────────────────────────────────────────────
 
 function JobDetailPanel({ jobId, onClose, onCancel }: { jobId: string; onClose: () => void; onCancel: (id: string) => void }) {
-  const logsEndRef = useRef<HTMLDivElement>(null);
+  const logsContainerRef = useRef<HTMLPreElement>(null);
   const { data: job } = useQuery({
     queryKey: ["job", jobId],
     queryFn: () => api.jobDetail(jobId),
@@ -587,7 +587,10 @@ function JobDetailPanel({ jobId, onClose, onCancel }: { jobId: string; onClose: 
     },
   });
 
-  useEffect(() => { logsEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [job?.logs?.length]);
+  useEffect(() => {
+    const el = logsContainerRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [job?.logs?.length]);
 
   if (!job) return null;
 
@@ -649,9 +652,8 @@ function JobDetailPanel({ jobId, onClose, onCancel }: { jobId: string; onClose: 
           <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
             Logs {job.logs.length > 0 && <span className="text-muted-foreground/60">({job.logs.length} lines)</span>}
           </p>
-          <pre className="h-64 overflow-y-auto rounded-md bg-muted p-2 font-mono text-xs leading-relaxed text-foreground/80 scrollbar-thin">
+          <pre ref={logsContainerRef} className="h-64 overflow-y-auto rounded-md bg-muted p-2 font-mono text-xs leading-relaxed text-foreground/80 scrollbar-thin">
             {job.logs.length === 0 ? (isActive ? "Waiting for output…" : "No logs captured.") : job.logs.join("\n")}
-            <div ref={logsEndRef} />
           </pre>
         </div>
       </div>

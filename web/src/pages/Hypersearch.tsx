@@ -282,7 +282,7 @@ function TrialTable({ trials, limit = 10 }: { trials: HypersearchTrial[]; limit?
 function HypersearchDetailPanel({
   runId, onClose, onCancel,
 }: { runId: number; onClose: () => void; onCancel: (jobId: string) => void }) {
-  const logsEndRef = useRef<HTMLDivElement>(null);
+  const logsContainerRef = useRef<HTMLPreElement>(null);
   const [showAllTrials, setShowAllTrials] = useState(false);
   const [showParams, setShowParams] = useState(false);
   const [paramsCopied, setParamsCopied] = useState(false);
@@ -303,7 +303,10 @@ function HypersearchDetailPanel({
     refetchInterval: q => ACTIVE_STATUSES.has(q.state.data?.status ?? "") ? 2500 : false,
   });
 
-  useEffect(() => { logsEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [job?.logs?.length]);
+  useEffect(() => {
+    const el = logsContainerRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [job?.logs?.length]);
 
   if (!run) return <div className="py-6 text-center"><Loader2 className="mx-auto h-5 w-5 animate-spin text-muted-foreground" /></div>;
 
@@ -423,13 +426,12 @@ function HypersearchDetailPanel({
               <span className="text-muted-foreground/60">({job!.logs.length} lines)</span>
             )}
           </p>
-          <pre className="h-64 overflow-y-auto rounded-md bg-muted p-2 font-mono text-xs leading-relaxed text-foreground/80 scrollbar-thin">
+          <pre ref={logsContainerRef} className="h-64 overflow-y-auto rounded-md bg-muted p-2 font-mono text-xs leading-relaxed text-foreground/80 scrollbar-thin">
             {!job
               ? (isActive ? "Waiting for job to start…" : "No job data.")
               : (job.logs.length === 0
                 ? (jobIsActive ? "Waiting for output…" : "No logs captured.")
                 : job.logs.join("\n"))}
-            <div ref={logsEndRef} />
           </pre>
         </div>
       </div>
