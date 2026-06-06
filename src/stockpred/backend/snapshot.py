@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -148,6 +149,19 @@ def snapshot_run(
         "elapsed_s": pipeline_result.get("elapsed_s"),
     }
     store.complete_run(s, run, summary=summary)
+
+    # --- Tearsheet HTML: read from disk and store in DB ------------------
+    # Storing in the DB means the report survives container restarts and is
+    # accessible via GET /runs/{id}/report on any server that has the DB.
+    tearsheet_path = pipeline_result.get("tearsheet_path")
+    if tearsheet_path:
+        try:
+            html = Path(tearsheet_path).read_text(encoding="utf-8")
+            run.report_html = html
+            s.add(run)
+            log.info("snapshot: stored tearsheet HTML (%d bytes) for run %d", len(html), run.id)
+        except Exception as e:  # noqa: BLE001
+            log.warning("snapshot: could not read tearsheet HTML from %s: %s", tearsheet_path, e)
 
     # --- Optional: persist prices and fundamentals -----------------------
     if persist_prices:

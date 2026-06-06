@@ -79,6 +79,8 @@ export interface RunSummary {
   job_id: string | null;
   /** True if this run is the server-side default data source. */
   is_active: boolean;
+  /** True if a tearsheet HTML report was stored for this run. */
+  has_report: boolean;
 }
 
 export interface BacktestSummary {

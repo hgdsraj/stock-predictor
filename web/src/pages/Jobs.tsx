@@ -4,7 +4,7 @@ import { Link, useSearchParams } from "react-router-dom";
 import {
   Play, Trash2, XCircle, Plus, ChevronDown, ChevronUp, RefreshCw,
   Clock, CheckCircle, AlertCircle, Loader2, ExternalLink, Copy,
-  RotateCcw, History,
+  RotateCcw, History, FileText,
 } from "lucide-react";
 import { api } from "@/api/client";
 import type { JobDetail, QueuedJob } from "@/api/types";
@@ -820,14 +820,26 @@ export function Jobs() {
                         <td className="px-4 py-2 text-xs">{fmtDuration(j.elapsed_s)}</td>
                         <td className="px-4 py-2 text-xs">
                           {j.run_id != null ? (
-                            <Link
-                              to={`/runs?expanded=${j.run_id}`}
-                              onClick={(e) => e.stopPropagation()}
-                              className="inline-flex items-center gap-1 text-primary hover:underline"
-                              title="Open this run in the Runs history page"
-                            >
-                              <History className="h-3 w-3" /> #{j.run_id}
-                            </Link>
+                            <span className="inline-flex items-center gap-1.5">
+                              <Link
+                                to={`/runs?expanded=${j.run_id}`}
+                                onClick={(e) => e.stopPropagation()}
+                                className="inline-flex items-center gap-1 text-primary hover:underline"
+                                title="Open this run in the Runs history page"
+                              >
+                                <History className="h-3 w-3" /> #{j.run_id}
+                              </Link>
+                              <a
+                                href={`/runs/${j.run_id}/report`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                onClick={(e) => e.stopPropagation()}
+                                className="text-muted-foreground hover:text-foreground"
+                                title="Open tearsheet report"
+                              >
+                                <FileText className="h-3 w-3" />
+                              </a>
+                            </span>
                           ) : (
                             <span className="text-muted-foreground">—</span>
                           )}

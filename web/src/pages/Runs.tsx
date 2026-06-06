@@ -30,6 +30,7 @@ import {
   PinOff,
   Eye,
   Briefcase,
+  FileText,
   CheckCircle2,
   ChevronDown,
   ChevronRight,
@@ -717,6 +718,18 @@ export function Runs() {
                               <Button size="sm" variant="ghost" onClick={() => viewRun(r.id)} title="Pin this run for your tab & go Home">
                                 <Eye className="h-3.5 w-3.5" /> View
                               </Button>
+                              {r.has_report && (
+                                <a
+                                  href={`/runs/${r.id}/report`}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  title="Open standalone tearsheet report"
+                                  onClick={e => e.stopPropagation()}
+                                  className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-muted-foreground hover:bg-accent hover:text-accent-foreground transition-colors"
+                                >
+                                  <FileText className="h-3.5 w-3.5" /> Report
+                                </a>
+                              )}
                               {r.status === "ok" && (
                                 <Button
                                   size="sm"

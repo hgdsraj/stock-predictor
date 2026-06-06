@@ -451,6 +451,12 @@ def run_hypersearch_job(
                     best_params=best_p,
                     trials=list(_trial_rows),
                 )
+                # Flush logs to DB after every trial so they survive a crash.
+                store.upsert_job_record(
+                    s, job_id, "running",
+                    started_at=started_at, updated_at=_now(), config=cfg_dict,
+                    logs=_current_logs(),
+                )
         except Exception:  # noqa: BLE001
             pass
 

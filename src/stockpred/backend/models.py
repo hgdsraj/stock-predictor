@@ -27,6 +27,7 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
+    Text,
     UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -44,6 +45,7 @@ class Run(Base):
     config_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     summary_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     note: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    report_html: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
 
     # When True, this run is the server-side default data source for /predictions/latest,
     # /backtest/summary, etc. Only one row should have is_active=True at a time;

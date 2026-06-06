@@ -49,7 +49,7 @@ import pandas as pd
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from sqlalchemy import func, select
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 
@@ -236,9 +236,8 @@ def _run_to_summary(s: Session, run) -> "schemas.RunSummary":
         note=run.note,
         config=run.config_json or {},
         job_id=_job_id_for_run(s, run.id),
-        # is_active may not exist on rows from very old DBs that predate the
-        # migration; getattr-with-default keeps the API forward-compatible.
         is_active=bool(getattr(run, "is_active", False)),
+        has_report=bool(getattr(run, "report_html", None)),
     )
 
 
@@ -605,6 +604,18 @@ def register_routes(app: FastAPI) -> None:
     @app.get("/runs/{run_id}/equity", response_model=list[schemas.EquityPoint], tags=["runs"])
     def equity_curve(run_id: int, s: Session = Depends(get_db)):
         return _equity_to_payload(store.equity_for_run(s, run_id))
+
+    @app.get("/runs/{run_id}/report", tags=["runs"])
+    def run_report(run_id: int, s: Session = Depends(get_db)):
+        """Serve the tearsheet HTML for a run. Returns 404 if no report was
+        stored (old runs, or run produced no tearsheet)."""
+        run = store.get_run(s, run_id)
+        if run is None:
+            raise HTTPException(404, f"run {run_id} not found")
+        html = getattr(run, "report_html", None)
+        if not html:
+            raise HTTPException(404, f"no report stored for run {run_id}")
+        return HTMLResponse(content=html)
 
     @app.get(
         "/runs/{run_id}/backtest",

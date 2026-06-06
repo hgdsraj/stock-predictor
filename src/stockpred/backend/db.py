@@ -33,6 +33,8 @@ _LIGHTWEIGHT_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("runs", "is_active", "BOOLEAN NOT NULL DEFAULT 0"),
     # 2026-06: persist pipeline logs across server restarts.
     ("job_records", "logs_json", "JSON"),
+    # 2026-06: persist tearsheet HTML in DB so it survives container restarts.
+    ("runs", "report_html", "TEXT"),
 )
 
 

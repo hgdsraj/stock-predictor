@@ -110,6 +110,7 @@ class RunSummary(BaseModel):
     config: dict = {}
     job_id: str | None = None
     is_active: bool = False
+    has_report: bool = False
 
 
 class BacktestSummary(BaseModel):

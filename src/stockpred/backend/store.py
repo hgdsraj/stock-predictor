@@ -578,7 +578,9 @@ def list_job_records(s: Session, *, limit: int = 50) -> list[JobRecord]:
 
 def mark_stale_jobs_crashed(s: Session) -> int:
     """On startup, any job_records still in 'running'/'queued' state were
-    interrupted by a server crash/restart. Mark them crashed."""
+    interrupted by a server crash/restart. Mark them crashed.
+    Also reconciles any HypersearchRun rows whose linked job crashed so they
+    don't stay stuck as 'running' in the UI forever."""
     from sqlalchemy import update
 
     result = s.execute(
@@ -586,7 +588,28 @@ def mark_stale_jobs_crashed(s: Session) -> int:
         .where(JobRecord.status.in_(["running", "queued", "cancelling"]))
         .values(status="crashed", updated_at=_now())
     )
-    return result.rowcount
+    n = result.rowcount
+
+    # Find HypersearchRun rows still marked 'running' whose linked JobRecord
+    # is now 'crashed'. Preserve their trial data — just flip the status so
+    # the UI shows the partial results correctly instead of an endless spinner.
+    if n > 0:
+        try:
+            stale_runs = s.execute(
+                select(HypersearchRun).where(HypersearchRun.status == "running")
+            ).scalars().all()
+            for hs_run in stale_runs:
+                if hs_run.job_id is None:
+                    continue
+                job_rec = s.get(JobRecord, hs_run.job_id)
+                if job_rec and job_rec.status == "crashed":
+                    hs_run.status = "crashed"
+                    hs_run.completed_at = _now()
+                    s.add(hs_run)
+        except Exception:  # noqa: BLE001
+            pass
+
+    return n
 
 
 # --------------------------------------------------------------------- #
